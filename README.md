@@ -3,7 +3,7 @@
 ## Predicción de Dosis de Insulina Bolus con Modelos de Machine Learning
 Este repositorio contiene la implementación de modelos de machine learning para predecir dosis de insulina bolus (normal) en pacientes con diabetes tipo 1, utilizando el dataset DiaTrend con datos de 54 sujetos. El objetivo es asistir a los pacientes en la gestión de su glucosa, mejorando la precisión de las dosis frente a métodos tradicionales basados en reglas.
 
-## Contenido
+# Contenido
 * Baseline (Modelo Basado en Reglas): Implementa una regla simple para calcular la dosis de insulina usando carbInput, bgInput, insulinCarbRatio e insulinSensitivityFactor.
 
 * Modelo FNN: Una red neuronal feedforward para predecir dosis, usando lecturas de CGM y otras características (carbInput, bgInput, etc.).
@@ -11,6 +11,13 @@ Este repositorio contiene la implementación de modelos de machine learning para
 * Modelo LSTM: Versión optimizada del LSTM con capas apiladas, BatchNormalization, learning rate ajustado, características adicionales (hour_of_day, insulinSensitivityFactor personalizado) y una función de pérdida personalizada para penalizar sobrepredicciones.
 
 * Modelo TCN: Combina convoluciones causales con redes residuales para procesar secuencias de manera eficiente, capturando patrones locales y globales en las lecturas de CGM con menos riesgo de gradientes que desaparecen, en comparación con los LSTMs.
+
+# Objetivos
+
+- **Minimizar MAE (Error Absoluto Medio)**: Buscamos reducir el MAE lo más posible (idealmente por debajo de 0.5 unidades) para asegurar predicciones precisas de dosis de insulina.
+- **Minimizar RMSE (Raíz del Error Cuadrático Medio)**: Apuntamos a un RMSE inferior a 1.0 unidades para controlar los errores grandes y mejorar la consistencia de las predicciones.
+- **Maximizar R² (Coeficiente de Determinación)**: Nos proponemos alcanzar un R² superior a 0.90, lo que indicaría que el modelo explica más del 90% de la varianza en los datos, reflejando un ajuste excelente.
+- **Estabilidad por Sujeto**: Lograr que las métricas sean consistentes entre sujetos, con especial atención a reducir el MAE y mejorar el R² en casos problemáticos como el Sujeto 49 (MAE < 2.0, R² > 0.85).
 
 # Resumen resultados GPU vs CPU
 
