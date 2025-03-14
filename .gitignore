@@ -1,0 +1,5 @@
+*Subject*
+manifest
+.venv
+/subjects
+/subjects/*
