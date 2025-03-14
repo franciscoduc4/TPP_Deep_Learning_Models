@@ -12,6 +12,16 @@ Este repositorio contiene la implementación de modelos de machine learning para
 
 * Modelo TCN: Combina convoluciones causales con redes residuales para procesar secuencias de manera eficiente, capturando patrones locales y globales en las lecturas de CGM con menos riesgo de gradientes que desaparecen, en comparación con los LSTMs.
 
+# Resumen resultados GPU vs CPU
+
+| Modelo                | Plataforma | MAE (unidades) | RMSE (unidades) | R²   |
+|-----------------------|------------|----------------|-----------------|------|
+| **LSTM Mejorado**     | CPU        | 0.40           | 1.22            | 0.84 |
+| **LSTM Mejorado**     | GPU        | 0.47           | 1.09            | 0.87 |
+| **Transformer con TCN** | CPU      | 0.43           | 0.83            | 0.92 |
+| **Transformer con TCN** | GPU      | 0.95           | 1.61            | 0.71 |
+
+
 # Resumen de Resultados con GPU (March 14, 2025)
 
 ## Métricas Generales
