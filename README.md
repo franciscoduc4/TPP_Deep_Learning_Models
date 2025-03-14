@@ -10,6 +10,8 @@ Este repositorio contiene la implementación de modelos de machine learning para
 
 * Modelo LSTM: Versión optimizada del LSTM con capas apiladas, BatchNormalization, learning rate ajustado, características adicionales (hour_of_day, insulinSensitivityFactor personalizado) y una función de pérdida personalizada para penalizar sobrepredicciones.
 
+* Modelo TCN: Combina convoluciones causales con redes residuales para procesar secuencias de manera eficiente, capturando patrones locales y globales en las lecturas de CGM con menos riesgo de gradientes que desaparecen, en comparación con los LSTMs.
+
 ## Requisitos
 Python 3.8+
 Librerías: pandas, numpy, scikit-learn, tensorflow, matplotlib, joblib
