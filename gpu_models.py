@@ -39,15 +39,17 @@ def check_device():
     print("PyTorch version:", torch.__version__)
     print("CUDA available:", torch.cuda.is_available())
     print("CUDA version:", torch.version.cuda)
-    print("Device count:", torch.cuda.device_count())
-    print("Current device:", torch.cuda.current_device())
-    print("Device name:", torch.cuda.get_device_name(0))
     if torch.cuda.is_available():
+        print("Device count:", torch.cuda.device_count())
+        print("Current device:", torch.cuda.current_device())
+        print("Device name:", torch.cuda.get_device_name(0))
+        # Test GPU operation
         a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], device=CONFIG["device"])
         b = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], device=CONFIG["device"])
         c = torch.matmul(a, b)
         print("Test GPU operation successful:", c)
-
+    else:
+        print("CUDA is not available. Running on CPU.")
 check_device()
 
 # %% CELL: Data Processing Functions
