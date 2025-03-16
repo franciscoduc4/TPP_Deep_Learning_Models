@@ -360,43 +360,45 @@ def create_dataloaders(X_cgm_train, X_cgm_val, X_cgm_test,
 
 # %% CELL: Model Definitions 
 class EnhancedLSTM(nn.Module):
-    """
-    Modelo LSTM mejorado con embeddings de sujetos y capas adicionales.
-    """
     def __init__(self, num_subjects, embedding_dim=16):
         super().__init__()
-        # Capa de embedding para codificar IDs de sujetos
         self.subject_embedding = nn.Embedding(num_subjects, embedding_dim)
+        self.lstm = nn.LSTM(1, 128, num_layers=2, batch_first=True, dropout=0.5)  # Salida de 128
+        self.batch_norm1 = nn.BatchNorm1d(128)  # Asegura que coincide con hidden_size
+        self.dropout1 = nn.Dropout(0.5)
+        self.concat_dense = nn.Linear(128 + 6 + embedding_dim, 128)  # Ajusta la entrada
+        self.batch_norm2 = nn.BatchNorm1d(128)  # Corrige a 128 en lugar de 64
+        self.dropout2 = nn.Dropout(0.5)
+        self.output_layer = nn.Linear(128, 1)
         
-        # LSTM bidireccional con dropout
-        self.lstm = nn.LSTM(1, 128, num_layers=2, batch_first=True, dropout=0.3)
-        
-        # Capas de normalización y regularización
-        self.batch_norm1 = nn.BatchNorm1d(128)
-        self.dropout1 = nn.Dropout(0.3)
-        
-        # Capas fully connected
-        self.concat_dense = nn.Linear(128 + 6 + embedding_dim, 128)
-        self.batch_norm2 = nn.BatchNorm1d(64)
-        self.dropout2 = nn.Dropout(0.3)
-        self.output_layer = nn.Linear(64, 1)
-
         # Inicialización de pesos
         for name, param in self.named_parameters():
             if 'weight' in name and param.dim() > 1:
                 nn.init.xavier_uniform_(param)
 
     def forward(self, cgm_input, other_input, subject_ids):
-        subject_embed = self.subject_embedding(subject_ids)
-        lstm_out, _ = self.lstm(cgm_input)
-        lstm_out = lstm_out[:, -1, :] # Tomar último estado
-        lstm_out = self.batch_norm1(lstm_out)
+        batch_size = cgm_input.size(0)
+        subject_embed = self.subject_embedding(subject_ids)  # [batch_size, embedding_dim]
+        
+        # LSTM espera [batch_size, seq_len, input_size]
+        lstm_out, _ = self.lstm(cgm_input)  # [batch_size, seq_len, hidden_size]
+        lstm_out = lstm_out[:, -1, :]  # Tomar el último timestep: [batch_size, 128]
+        
+        # Normalización de la salida LSTM
+        lstm_out = lstm_out.unsqueeze(2)  # [batch_size, 128, 1] para BatchNorm1d
+        lstm_out = self.batch_norm1(lstm_out)  # [batch_size, 128, 1]
+        lstm_out = lstm_out.squeeze(2)  # Volver a [batch_size, 128]
         lstm_out = self.dropout1(lstm_out)
-        combined = torch.cat((lstm_out, other_input, subject_embed), dim=1)
-        dense_out = torch.relu(self.concat_dense(combined))
-        dense_out = self.batch_norm2(dense_out)
+        
+        # Concatenar con otras entradas
+        combined = torch.cat((lstm_out, other_input, subject_embed), dim=1)  # [batch_size, 128 + 6 + 16]
+        dense_out = torch.relu(self.concat_dense(combined))  # [batch_size, 128]
+        dense_out = dense_out.unsqueeze(2)  # [batch_size, 128, 1] para BatchNorm2d
+        dense_out = self.batch_norm2(dense_out)  # [batch_size, 128, 1]
+        dense_out = dense_out.squeeze(2)  # [batch_size, 128]
         dense_out = self.dropout2(dense_out)
-        return self.output_layer(dense_out)
+        return self.output_layer(dense_out)  # [batch_size, 1]
+
 
 class TCNTransformer(nn.Module):
     """
