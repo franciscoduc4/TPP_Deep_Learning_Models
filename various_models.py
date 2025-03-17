@@ -16,11 +16,12 @@ from joblib import Parallel, delayed
 from datetime import timedelta
 import time
 from tqdm import tqdm
+from sklearn.model_selection import KFold
 
 # Global configuration
 CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "batch_size": 64,
+    "batch_size": 128,
     "epochs": 300,
     "patience": 30,
     "learning_rate": 0.0005,
@@ -241,9 +242,13 @@ def preprocess_data(subject_folder):
     print(df_final.isna().sum())
 
     # Inicializar scalers para normalización
-    scaler_cgm = MinMaxScaler(feature_range=(0, 1))
+    # scaler_cgm = MinMaxScaler(feature_range=(0, 1))
+    # scaler_other = StandardScaler()
+    # scaler_y = MinMaxScaler(feature_range=(0, 1))
+    
+    scaler_cgm = StandardScaler()
     scaler_other = StandardScaler()
-    scaler_y = MinMaxScaler(feature_range=(0, 1))
+    scaler_y = StandardScaler()
 
     # Preparar arrays de características y objetivos
     X_cgm = scaler_cgm.fit_transform(df_final[cgm_columns]).reshape(-1, 24, 1)
@@ -264,6 +269,8 @@ def preprocess_data(subject_folder):
     elapsed_time = time.time() - start_time
     print(f"Preprocesamiento completo en {elapsed_time:.2f} segundos")
     return X_cgm, X_other, X_subject, y, df_final, scaler_cgm, scaler_other, scaler_y
+
+
 
 def split_data(X_cgm, X_other, X_subject, y, df_final):
     """
@@ -365,15 +372,13 @@ class EnhancedLSTM(nn.Module):
     def __init__(self, num_subjects, embedding_dim=16):
         super().__init__()
         self.subject_embedding = nn.Embedding(num_subjects, embedding_dim)
-        self.lstm = nn.LSTM(1, 128, num_layers=2, batch_first=True, dropout=0.5)  # Salida de 128
-        self.batch_norm1 = nn.BatchNorm1d(128)  # Asegura que coincide con hidden_size
+        self.lstm = nn.LSTM(1, 256, num_layers=3, batch_first=True, dropout=0.5)
+        self.batch_norm1 = nn.BatchNorm1d(256)
         self.dropout1 = nn.Dropout(0.5)
-        self.concat_dense = nn.Linear(128 + 6 + embedding_dim, 128)  # Ajusta la entrada
-        self.batch_norm2 = nn.BatchNorm1d(128)  # Corrige a 128 en lugar de 64
+        self.concat_dense = nn.Linear(256 + 6 + embedding_dim, 256)
+        self.batch_norm2 = nn.BatchNorm1d(256)
         self.dropout2 = nn.Dropout(0.5)
-        self.output_layer = nn.Linear(128, 1)
-        
-        # Inicialización de pesos
+        self.output_layer = nn.Linear(256, 1)
         for name, param in self.named_parameters():
             if 'weight' in name and param.dim() > 1:
                 nn.init.xavier_uniform_(param)
@@ -382,25 +387,21 @@ class EnhancedLSTM(nn.Module):
         batch_size = cgm_input.size(0)
         subject_embed = self.subject_embedding(subject_ids)  # [batch_size, embedding_dim]
         
-        # LSTM espera [batch_size, seq_len, input_size]
         lstm_out, _ = self.lstm(cgm_input)  # [batch_size, seq_len, hidden_size]
-        lstm_out = lstm_out[:, -1, :]  # Tomar el último timestep: [batch_size, 128]
+        lstm_out = lstm_out[:, -1, :]  # [batch_size, 256]
         
-        # Normalización de la salida LSTM
-        lstm_out = lstm_out.unsqueeze(2)  # [batch_size, 128, 1] para BatchNorm1d
-        lstm_out = self.batch_norm1(lstm_out)  # [batch_size, 128, 1]
-        lstm_out = lstm_out.squeeze(2)  # Volver a [batch_size, 128]
+        lstm_out = lstm_out.unsqueeze(2)  # [batch_size, 256, 1]
+        lstm_out = self.batch_norm1(lstm_out)  # [batch_size, 256, 1]
+        lstm_out = lstm_out.squeeze(2)  # [batch_size, 256]
         lstm_out = self.dropout1(lstm_out)
         
-        # Concatenar con otras entradas
-        combined = torch.cat((lstm_out, other_input, subject_embed), dim=1)  # [batch_size, 128 + 6 + 16]
-        dense_out = torch.relu(self.concat_dense(combined))  # [batch_size, 128]
-        dense_out = dense_out.unsqueeze(2)  # [batch_size, 128, 1] para BatchNorm2d
-        dense_out = self.batch_norm2(dense_out)  # [batch_size, 128, 1]
-        dense_out = dense_out.squeeze(2)  # [batch_size, 128]
+        combined = torch.cat((lstm_out, other_input, subject_embed), dim=1)  # [batch_size, 256 + 6 + 16]
+        dense_out = torch.relu(self.concat_dense(combined))  # [batch_size, 256]
+        dense_out = dense_out.unsqueeze(2)  # [batch_size, 256, 1]
+        dense_out = self.batch_norm2(dense_out)  # [batch_size, 256, 1]
+        dense_out = dense_out.squeeze(2)  # [batch_size, 256]
         dense_out = self.dropout2(dense_out)
         return self.output_layer(dense_out)  # [batch_size, 1]
-
 
 class TCNTransformer(nn.Module):
     """
@@ -471,23 +472,14 @@ class EnhancedGRU(nn.Module):
     """
     def __init__(self, num_subjects, embedding_dim=16):
         super().__init__()
-        # Capa de embedding
         self.subject_embedding = nn.Embedding(num_subjects, embedding_dim)
-        
-        # GRU simple pero efectiva
-        self.gru = nn.GRU(1, 128, num_layers=2, batch_first=True, dropout=0.2)
-        
-        # Capas de regularización
-        self.batch_norm1 = nn.BatchNorm1d(128)
-        self.dropout1 = nn.Dropout(0.2)
-        
-        # Capas fully connected más pequeñas
-        self.concat_dense = nn.Linear(128 + 6 + embedding_dim, 64)
-        self.batch_norm2 = nn.BatchNorm1d(64)
-        self.dropout2 = nn.Dropout(0.2)
-        self.output_layer = nn.Linear(64, 1)
-
-        # Inicialización de pesos
+        self.gru = nn.GRU(1, 256, num_layers=3, batch_first=True, dropout=0.4)  # Aumentado
+        self.batch_norm1 = nn.BatchNorm1d(256)
+        self.dropout1 = nn.Dropout(0.4)
+        self.concat_dense = nn.Linear(256 + 6 + embedding_dim, 128)
+        self.batch_norm2 = nn.BatchNorm1d(128)
+        self.dropout2 = nn.Dropout(0.4)
+        self.output_layer = nn.Linear(128, 1)
         for name, param in self.named_parameters():
             if 'weight' in name and param.dim() > 1:
                 nn.init.xavier_uniform_(param)
@@ -551,7 +543,7 @@ def train_model(model, train_loader, val_loader, model_name=None):
         lr = 0.001  # Aumentar para el LSTM
         
     # Configuración del optimizador y scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6)
     
     best_val_loss = float('inf')
@@ -687,9 +679,9 @@ def rule_based_prediction(X_other, scaler_other, scaler_y, target_bg=100):
     return prediction
 
 # %% CELL: Visualization Functions
-def plot_training_history(lstm_losses, tcn_losses, gru_losses):
+def plot_training_history(lstm_losses, gru_losses):
     plt.figure(figsize=(12, 5))
-    plt.subplot(1, 3, 1)
+    plt.subplot(1, 2, 1)
     plt.plot(lstm_losses[0], label='Train LSTM')
     plt.plot(lstm_losses[1], label='Val LSTM')
     plt.xlabel('Epoch')
@@ -697,15 +689,15 @@ def plot_training_history(lstm_losses, tcn_losses, gru_losses):
     plt.legend()
     plt.title('LSTM Training History')
 
-    plt.subplot(1, 3, 2)
-    plt.plot(tcn_losses[0], label='Train TCN')
-    plt.plot(tcn_losses[1], label='Val TCN')
-    plt.xlabel('Epoch')
-    plt.ylabel('Custom MSE Loss')
-    plt.legend()
-    plt.title('TCN Training History')
+    # plt.subplot(1, 3, 2)
+    # plt.plot(tcn_losses[0], label='Train TCN')
+    # plt.plot(tcn_losses[1], label='Val TCN')
+    # plt.xlabel('Epoch')
+    # plt.ylabel('Custom MSE Loss')
+    # plt.legend()
+    # plt.title('TCN Training History')
 
-    plt.subplot(1, 3, 3)
+    plt.subplot(1, 2, 2)
     plt.plot(gru_losses[0], label='Train GRU')
     plt.plot(gru_losses[1], label='Val GRU')
     plt.xlabel('Epoch')
@@ -716,14 +708,14 @@ def plot_training_history(lstm_losses, tcn_losses, gru_losses):
     plt.tight_layout()
     plt.show()
 #%%
-def plot_evaluation(y_test, y_pred_lstm, y_pred_tcn, y_pred_gru, y_rule, subject_test, scaler_y):
+def plot_evaluation(y_test, y_pred_lstm,  y_pred_gru, y_rule, subject_test, scaler_y):
     start_time = time.time()
     y_test_denorm = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
 
     plt.figure(figsize=(15, 10))
     plt.subplot(2, 2, 1)
     plt.scatter(y_test_denorm, y_pred_lstm, label='LSTM', alpha=0.5, color='blue')
-    plt.scatter(y_test_denorm, y_pred_tcn, label='TCN', alpha=0.5, color='green')
+    # plt.scatter(y_test_denorm, y_pred_tcn, label='TCN', alpha=0.5, color='green')
     plt.scatter(y_test_denorm, y_pred_gru, label='GRU', alpha=0.5, color='red')
     plt.scatter(y_test_denorm, y_rule, label='Rules', alpha=0.5, color='orange')
     plt.plot([0, 15], [0, 15], 'r--')
@@ -734,7 +726,7 @@ def plot_evaluation(y_test, y_pred_lstm, y_pred_tcn, y_pred_gru, y_rule, subject
 
     plt.subplot(2, 2, 2)
     plt.hist(y_test_denorm - y_pred_lstm, bins=20, label='LSTM', alpha=0.5, color='blue')
-    plt.hist(y_test_denorm - y_pred_tcn, bins=20, label='TCN', alpha=0.5, color='green')
+    # plt.hist(y_test_denorm - y_pred_tcn, bins=20, label='TCN', alpha=0.5, color='green')
     plt.hist(y_test_denorm - y_pred_gru, bins=20, label='GRU', alpha=0.5, color='red')
     plt.hist(y_test_denorm - y_rule, bins=20, label='Rules', alpha=0.5, color='orange')
     plt.xlabel('Residual (units)')
@@ -748,13 +740,13 @@ def plot_evaluation(y_test, y_pred_lstm, y_pred_tcn, y_pred_gru, y_rule, subject
         mask = subject_test == sid
         if np.sum(mask) > 0:
             mae_lstm.append(mean_absolute_error(y_test_denorm[mask], y_pred_lstm[mask]))
-            mae_tcn.append(mean_absolute_error(y_test_denorm[mask], y_pred_tcn[mask]))
+            # mae_tcn.append(mean_absolute_error(y_test_denorm[mask], y_pred_tcn[mask]))
             mae_gru.append(mean_absolute_error(y_test_denorm[mask], y_pred_gru[mask]))
             mae_rule.append(mean_absolute_error(y_test_denorm[mask], y_rule[mask]))
 
     plt.subplot(2, 2, 3)
     plt.bar(np.arange(len(test_subjects)) - 0.3, mae_lstm, width=0.2, label='LSTM', color='blue')
-    plt.bar(np.arange(len(test_subjects)) - 0.1, mae_tcn, width=0.2, label='TCN', color='green')
+    # plt.bar(np.arange(len(test_subjects)) - 0.1, mae_tcn, width=0.2, label='TCN', color='green')
     plt.bar(np.arange(len(test_subjects)) + 0.1, mae_gru, width=0.2, label='GRU', color='red')
     plt.bar(np.arange(len(test_subjects)) + 0.3, mae_rule, width=0.2, label='Rules', color='orange')
     plt.xlabel('Subject')
@@ -783,8 +775,6 @@ Modelos implementados:
 # %% CELL: Main Execution - Preprocess Data
 # Preprocesa los datos y aplica normalización
 X_cgm, X_other, X_subject, y, df_final, scaler_cgm, scaler_other, scaler_y = preprocess_data(CONFIG["data_path"])
-
-
 # %% CELL: Main Execution - Split Data
 # División estratificada de datos en conjuntos de train/val/test manteniendo la distribución de sujetos
 (X_cgm_train, X_cgm_val, X_cgm_test,
@@ -804,7 +794,7 @@ train_loader, val_loader, test_loader = create_dataloaders(X_cgm_train, X_cgm_va
 num_subjects = len(df_final['subject_id'].unique())
 models = {
     "LSTM": EnhancedLSTM(num_subjects).to(CONFIG["device"]),
-    "TCN": TCNTransformer(num_subjects).to(CONFIG["device"]),
+    #"TCN": TCNTransformer(num_subjects).to(CONFIG["device"]),
     "GRU": EnhancedGRU(num_subjects).to(CONFIG["device"])
 }
 
@@ -836,8 +826,11 @@ print(f"Rules - MAE: {mae_rule:.2f}, RMSE: {rmse_rule:.2f}, R²: {r2_rule:.2f}")
 
 # %% CELL: Main Execution - Visualization
 # Genera visualizaciones comparativas del entrenamiento y predicciones
-plot_training_history(losses["LSTM"], losses["TCN"], losses["GRU"])
-plot_evaluation(y_test, y_pred["LSTM"], y_pred["TCN"], y_pred["GRU"], y_rule, subject_test, scaler_y)
+# plot_training_history(losses["LSTM"], losses["TCN"], losses["GRU"])
+plot_training_history(losses["LSTM"], losses["GRU"])
+
+# plot_evaluation(y_test, y_pred["LSTM"], y_pred["TCN"], y_pred["GRU"], y_rule, subject_test, scaler_y)
+plot_evaluation(y_test, y_pred["LSTM"],y_pred["GRU"], y_rule, subject_test, scaler_y)
 
 # %% CELL: Main Execution - Metrics per Subject
 # Analiza el rendimiento individual por sujeto
@@ -852,5 +845,7 @@ for subject_id in np.unique(subject_test):
             print(f"{name} MAE={mae_sub:.2f}, ", end="")
         mae_rule_sub = mean_absolute_error(y_test_sub, y_rule[mask])
         print(f"Rules MAE={mae_rule_sub:.2f}")
+
+
 
 
