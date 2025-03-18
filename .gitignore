@@ -3,3 +3,7 @@ manifest
 .venv
 /subjects
 /subjects/*
+.DS_Store
+build/
+/build/*
+*.so

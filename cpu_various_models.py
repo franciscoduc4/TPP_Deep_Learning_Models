@@ -24,7 +24,8 @@ import matplotlib.pyplot as plt
 
 # %%
 # Los sujetos están en la raíz y cada archivo comienza con "Subject"
-subject_files = [f for f in os.listdir() if os.path.isfile(f) and f.startswith("Subject")]
+subject_folder = os.path.join(os.getcwd(), "subjects")
+subject_files = [f for f in os.listdir(subject_folder) if f.startswith("Subject") and f.endswith(".xlsx")]
 print(f"Total de sujetos: {len(subject_files)}")
 
 # %%
@@ -100,9 +101,12 @@ def process_subject(subject_path, idx):
     return processed_data
 
 # Ejecución en paralelo
-subject_folder = os.getcwd()
-all_processed_data = Parallel(n_jobs=-1)(delayed(process_subject)(os.path.join(subject_folder, f), idx) 
-                                        for idx, f in enumerate(subject_files))
+all_processed_data = Parallel(n_jobs=-1)(
+    delayed(process_subject)(
+        os.path.join(subject_folder, f), 
+        idx
+    ) for idx, f in enumerate(subject_files)
+)
 
 all_processed_data = [item for sublist in all_processed_data for item in sublist]
 
