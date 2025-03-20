@@ -28,6 +28,11 @@ Este repositorio contiene la implementación de modelos de machine learning para
 | **Transformer con TCN** | CPU      | 0.43           | 0.83            | 0.92 |
 | **Transformer con TCN** | GPU      | 0.95           | 1.61            | 0.71 |
 
+# Resumen de Resultados con GPU (March 20, 2025)
+
+LSTM - MAE: 0.54, RMSE: 1.00, R²: 0.89
+GRU - MAE: 0.63, RMSE: 1.08, R²: 0.87
+Rules - MAE: 1.28, RMSE: 2.76, R²: 0.16
 
 # Resumen de Resultados con GPU (March 14, 2025)
 

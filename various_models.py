@@ -93,23 +93,19 @@ def calculate_iob(bolus_time, basal_df, half_life_hours=4):
         return 0.0
         
     iob = 0
-    # Itera sobre cada registro de insulina basal
     for _, row in basal_df.iterrows():
         start_time = row['date']
-        # Convierte duración de milisegundos a horas
         duration_hours = row['duration'] / (1000 * 3600)
         end_time = start_time + timedelta(hours=duration_hours)
-        # Usa tasa de 0.9 si no hay valor
         rate = row['rate'] if pd.notna(row['rate']) else 0.9
+        rate = min(rate, 2.0)  # Cap the rate to avoid unrealistic values
         
-        # Si el tiempo del bolo está dentro del período activo
         if start_time <= bolus_time <= end_time:
-            # Calcula tiempo transcurrido y restante
             time_since_start = (bolus_time - start_time).total_seconds() / 3600
             remaining = rate * (1 - (time_since_start / half_life_hours))
             iob += max(0, remaining)
             
-    return iob
+    return min(iob, 5.0)  # Ensure IOB doesn't exceed the cap
 
 def process_subject(subject_path, idx):
     """
@@ -124,7 +120,6 @@ def process_subject(subject_path, idx):
     """
     start_time = time.time()
     
-    # Carga datos desde Excel
     try:
         excel_file = pd.ExcelFile(subject_path)
         cgm_df = pd.read_excel(excel_file, sheet_name="CGM")
@@ -137,47 +132,51 @@ def process_subject(subject_path, idx):
         print(f"Error al cargar {os.path.basename(subject_path)}: {e}")
         return []
 
-    # Convierte fechas a datetime
     cgm_df['date'] = pd.to_datetime(cgm_df['date'])
     cgm_df = cgm_df.sort_values('date')
     bolus_df['date'] = pd.to_datetime(bolus_df['date'])
     if basal_df is not None:
         basal_df['date'] = pd.to_datetime(basal_df['date'])
 
+    # Calculate median carbInput for imputation
+    non_zero_carbs = bolus_df[bolus_df['carbInput'] > 0]['carbInput']
+    carb_median = non_zero_carbs.median() if not non_zero_carbs.empty else 10.0
+
+    # Calculate median IOB for imputation
+    iob_values = [calculate_iob(row['date'], basal_df) for _, row in bolus_df.iterrows()]
+    non_zero_iob = [iob for iob in iob_values if iob > 0]
+    iob_median = np.median(non_zero_iob) if non_zero_iob else 0.5
+
     processed_data = []
-    # Procesa cada registro de bolo
     for _, row in tqdm(bolus_df.iterrows(), total=len(bolus_df), desc=f"Procesando {os.path.basename(subject_path)}", leave=False):
         bolus_time = row['date']
         cgm_window = get_cgm_window(bolus_time, cgm_df)
         
         if cgm_window is not None:
-            # Calcula características
             iob = calculate_iob(bolus_time, basal_df)
-            hour_of_day = bolus_time.hour / 23.0  # Normaliza hora del día
-            
-            # Usa último valor CGM si no hay bgInput
+            iob = iob_median if iob == 0 else iob  # Impute missing IOB
+            hour_of_day = bolus_time.hour / 23.0
             bg_input = row['bgInput'] if pd.notna(row['bgInput']) else cgm_window[-1]
             
-            # Procesa dosis normal y límites
             normal = row['normal'] if pd.notna(row['normal']) else 0.0
             normal = np.clip(normal, 0, CONFIG["cap_normal"])
             
-            # Calcula factor de sensibilidad personalizado
-            isf_custom = 50.0 if normal <= 0 or bg_input <= 100 else (bg_input - 100) / normal
+            bg_input = max(bg_input, 50.0)
+            isf_custom = 50.0 if normal <= 0 else (bg_input - 100) / normal
+            isf_custom = np.clip(isf_custom, 10, 100)
             
-            # Aplica límites a variables
             bg_input = np.clip(bg_input, 0, CONFIG["cap_bg"])
             iob = np.clip(iob, 0, CONFIG["cap_iob"])
             carb_input = row['carbInput'] if pd.notna(row['carbInput']) else 0.0
+            carb_input = carb_median if carb_input == 0 else carb_input
             carb_input = np.clip(carb_input, 0, CONFIG["cap_carb"])
             
-            # Crea diccionario de características
             features = {
                 'subject_id': idx,
                 'cgm_window': cgm_window,
                 'carbInput': carb_input,
                 'bgInput': bg_input,
-                'insulinCarbRatio': row['insulinCarbRatio'] if pd.notna(row['insulinCarbRatio']) else 10.0,
+                'insulinCarbRatio': np.clip(row['insulinCarbRatio'] if pd.notna(row['insulinCarbRatio']) else 10.0, 5, 20),
                 'insulinSensitivityFactor': isf_custom,
                 'insulinOnBoard': iob,
                 'hour_of_day': hour_of_day,
@@ -231,10 +230,22 @@ def preprocess_data(subject_folder):
         subject_data = df_processed[df_processed['subject_id'] == subject_id]['normal']
         print(f"Sujeto {subject_id}: min={subject_data.min():.2f}, max={subject_data.max():.2f}, mean={subject_data.mean():.2f}, std={subject_data.std():.2f}")
 
-    # Expandir columna de ventana CGM en múltiples columnas
+
+    # Apply log-transformation to skewed features
+    df_processed['normal'] = np.log1p(df_processed['normal'])
+    df_processed['carbInput'] = np.log1p(df_processed['carbInput'])
+    df_processed['insulinOnBoard'] = np.log1p(df_processed['insulinOnBoard'])
+    df_processed['bgInput'] = np.log1p(df_processed['bgInput'])
     cgm_columns = [f'cgm_{i}' for i in range(24)]
+    df_processed['cgm_window'] = df_processed['cgm_window'].apply(lambda x: np.log1p(x))
+
     df_cgm = pd.DataFrame(df_processed['cgm_window'].tolist(), columns=cgm_columns, index=df_processed.index)
     df_final = pd.concat([df_cgm, df_processed.drop(columns=['cgm_window'])], axis=1)
+    
+    # Expandir columna de ventana CGM en múltiples columnas
+    #cgm_columns = [f'cgm_{i}' for i in range(24)]
+    #df_cgm = pd.DataFrame(df_processed['cgm_window'].tolist(), columns=cgm_columns, index=df_processed.index)
+    #df_final = pd.concat([df_cgm, df_processed.drop(columns=['cgm_window'])], axis=1)
 
     # Eliminar filas con valores faltantes
     df_final = df_final.dropna()
@@ -678,6 +689,135 @@ def rule_based_prediction(X_other, scaler_other, scaler_y, target_bg=100):
     print(f"Predicción basada en reglas completa en {elapsed_time:.2f} segundos")
     return prediction
 
+
+# %% Data Analysis
+def analyze_preprocessed_data(df_final, scaler_cgm, scaler_other, scaler_y):
+    """
+    Analyzes the preprocessed data to provide insights into distributions, correlations, and outliers.
+    
+    Args:
+        df_final: DataFrame with preprocessed data
+        scaler_cgm: Scaler used for CGM data
+        scaler_other: Scaler used for other features
+        scaler_y: Scaler used for target (normal)
+    """
+    start_time = time.time()
+    print("\n=== Data Analysis of Preprocessed Data ===")
+
+    # 1. Summary Statistics
+    print("\n1. Summary Statistics:")
+    # Select numerical columns (CGM columns + other features + target)
+    cgm_columns = [f'cgm_{i}' for i in range(24)]
+    other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
+                      'insulinSensitivityFactor', 'hour_of_day', 'normal']
+    numerical_cols = cgm_columns + other_features
+    summary_stats = df_final[numerical_cols].describe()
+    print(summary_stats)
+
+    # 2. Distribution Plots
+    print("\n2. Generating Distribution Plots...")
+    plt.figure(figsize=(15, 10))
+    
+    # CGM Values (average across the window for simplicity)
+    df_final['cgm_mean'] = df_final[cgm_columns].mean(axis=1)
+    plt.subplot(2, 3, 1)
+    plt.hist(df_final['cgm_mean'], bins=30, color='blue', alpha=0.7)
+    plt.title('Distribution of Mean CGM Values')
+    plt.xlabel('Mean CGM (mg/dL)')
+    plt.ylabel('Frequency')
+
+    # Insulin Dose (normal)
+    plt.subplot(2, 3, 2)
+    plt.hist(df_final['normal'], bins=30, color='green', alpha=0.7)
+    plt.title('Distribution of Insulin Doses (normal)')
+    plt.xlabel('Insulin Dose (units)')
+    plt.ylabel('Frequency')
+
+    # Carbs
+    plt.subplot(2, 3, 3)
+    plt.hist(df_final['carbInput'], bins=30, color='orange', alpha=0.7)
+    plt.title('Distribution of Carb Intake')
+    plt.xlabel('Carbs (g)')
+    plt.ylabel('Frequency')
+
+    # Insulin on Board (IOB)
+    plt.subplot(2, 3, 4)
+    plt.hist(df_final['insulinOnBoard'], bins=30, color='red', alpha=0.7)
+    plt.title('Distribution of Insulin on Board (IOB)')
+    plt.xlabel('IOB (units)')
+    plt.ylabel('Frequency')
+
+    # Blood Glucose (bgInput)
+    plt.subplot(2, 3, 5)
+    plt.hist(df_final['bgInput'], bins=30, color='purple', alpha=0.7)
+    plt.title('Distribution of Blood Glucose (bgInput)')
+    plt.xlabel('BG (mg/dL)')
+    plt.ylabel('Frequency')
+
+    # Hour of Day
+    plt.subplot(2, 3, 6)
+    plt.hist(df_final['hour_of_day'] * 23.0, bins=24, color='cyan', alpha=0.7)  # Denormalize for plotting
+    plt.title('Distribution of Hour of Day')
+    plt.xlabel('Hour of Day')
+    plt.ylabel('Frequency')
+
+    plt.tight_layout()
+    plt.show()
+
+    # 3. Correlation Analysis
+    print("\n3. Correlation Analysis:")
+    correlation_matrix = df_final[numerical_cols].corr()
+    plt.figure(figsize=(12, 8))
+    plt.imshow(correlation_matrix, cmap='coolwarm', interpolation='nearest')
+    plt.colorbar()
+    plt.xticks(np.arange(len(numerical_cols)), numerical_cols, rotation=45, ha='right')
+    plt.yticks(np.arange(len(numerical_cols)), numerical_cols)
+    plt.title('Correlation Matrix of Numerical Features')
+    plt.tight_layout()
+    plt.show()
+
+    # Highlight significant correlations
+    print("Significant correlations (|corr| > 0.5):")
+    corr_pairs = correlation_matrix.unstack()
+    significant_pairs = corr_pairs[(abs(corr_pairs) > 0.5) & (abs(corr_pairs) < 1.0)]
+    print(significant_pairs)
+
+    # 4. Outlier Detection (using IQR method)
+    print("\n4. Outlier Detection (IQR Method):")
+    def detect_outliers_iqr(data, column):
+        Q1 = data[column].quantile(0.25)
+        Q3 = data[column].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 2.0 * IQR  # Adjusted threshold
+        upper_bound = Q3 + 2.0 * IQR  # Adjusted threshold
+        outliers = data[(data[column] < lower_bound) | (data[column] > upper_bound)]
+        return len(outliers)
+
+    key_features = ['cgm_mean', 'normal', 'carbInput', 'insulinOnBoard', 'bgInput']
+    for feature in key_features:
+        num_outliers = detect_outliers_iqr(df_final, feature)
+        print(f"Number of outliers in {feature}: {num_outliers} ({num_outliers/len(df_final)*100:.2f}%)")
+
+    # 5. Subject-Specific Analysis
+    print("\n5. Subject-Specific Analysis:")
+    for subject_id in df_final['subject_id'].unique():
+        subject_data = df_final[df_final['subject_id'] == subject_id]
+        print(f"\nSubject {subject_id}:")
+        print(f"Number of samples: {len(subject_data)}")
+        print(f"Mean Insulin Dose: {subject_data['normal'].mean():.2f} (std: {subject_data['normal'].std():.2f})")
+        print(f"Mean CGM: {subject_data['cgm_mean'].mean():.2f} (std: {subject_data['cgm_mean'].std():.2f})")
+        print(f"Mean Carbs: {subject_data['carbInput'].mean():.2f} (std: {subject_data['carbInput'].std():.2f})")
+        print(f"Mean IOB: {subject_data['insulinOnBoard'].mean():.2f} (std: {subject_data['insulinOnBoard'].std():.2f})")
+
+    # 6. Missing Data Check
+    print("\n6. Missing Data Check:")
+    missing_data = df_final.isna().sum()
+    print("Missing values per column:")
+    print(missing_data)
+
+    elapsed_time = time.time() - start_time
+    print(f"\nData Analysis completed in {elapsed_time:.2f} seconds")
+
 # %% CELL: Visualization Functions
 def plot_training_history(lstm_losses, gru_losses):
     plt.figure(figsize=(12, 5))
@@ -775,6 +915,13 @@ Modelos implementados:
 # %% CELL: Main Execution - Preprocess Data
 # Preprocesa los datos y aplica normalización
 X_cgm, X_other, X_subject, y, df_final, scaler_cgm, scaler_other, scaler_y = preprocess_data(CONFIG["data_path"])
+
+
+# %% CELL: Main Execution - Analyze Preprocessed Data
+# Analiza los datos preprocesados para obtener insights
+analyze_preprocessed_data(df_final, scaler_cgm, scaler_other, scaler_y)
+
+
 # %% CELL: Main Execution - Split Data
 # División estratificada de datos en conjuntos de train/val/test manteniendo la distribución de sujetos
 (X_cgm_train, X_cgm_val, X_cgm_test,
