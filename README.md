@@ -19,6 +19,8 @@ Este repositorio contiene la implementación de modelos de machine learning para
 - **Maximizar R² (Coeficiente de Determinación)**: Nos proponemos alcanzar un R² superior a 0.90, lo que indicaría que el modelo explica más del 90% de la varianza en los datos, reflejando un ajuste excelente.
 - **Estabilidad por Sujeto**: Lograr que las métricas sean consistentes entre sujetos, con especial atención a reducir el MAE y mejorar el R² en casos problemáticos como el Sujeto 49 (MAE < 2.0, R² > 0.85).
 
+
+
 # Resumen resultados GPU vs CPU
 
 | Modelo                | Plataforma | MAE (unidades) | RMSE (unidades) | R²   |
@@ -28,6 +30,13 @@ Este repositorio contiene la implementación de modelos de machine learning para
 | **Transformer con TCN** | CPU      | 0.43           | 0.83            | 0.92 |
 | **Transformer con TCN** | GPU      | 0.95           | 1.61            | 0.71 |
 
+# Resumen de Resultados con GPU (March 20, 2025)
+
+### GPU a 85 grados con tweaks 
+
+LSTM - MAE: 0.67, RMSE: 1.93, R²: 0.57
+GRU - MAE: 0.87, RMSE: 2.00, R²: 0.54
+Rules - MAE: 1.26, RMSE: 2.72, R²: 0.15
 
 # Resumen de Resultados con GPU (March 14, 2025)
 

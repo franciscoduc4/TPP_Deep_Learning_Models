@@ -21,12 +21,12 @@ from sklearn.model_selection import KFold
 # Global configuration
 CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "batch_size": 256 if torch.cuda.is_available() else 64,
-    "epochs": 500,
-    "patience": 30,
+    "batch_size": 128 if torch.cuda.is_available() else 64,
+    "epochs": 300,
+    "patience": 50,
     "learning_rate": 0.0008,
     "embedding_dim": 32,
-    "window_hours": 4,
+    "window_hours": 3,
     "cap_normal": 30,
     "cap_bg": 300,
     "cap_iob": 5,
@@ -376,11 +376,11 @@ class EnhancedLSTM(nn.Module):
     def __init__(self, num_subjects, embedding_dim=CONFIG["embedding_dim"]):
         super().__init__()
         self.subject_embedding = nn.Embedding(num_subjects, embedding_dim)
-        self.lstm = nn.LSTM(1, 512, num_layers=3, batch_first=True, dropout=0.3)  # Increased hidden units, reduced dropout
-        self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8, dropout=0.3)
-        self.batch_norm1 = nn.BatchNorm1d(512)
+        self.lstm = nn.LSTM(1, 384, num_layers=3, batch_first=True, dropout=0.3)  # Increased hidden units, reduced dropout
+        self.attention = nn.MultiheadAttention(embed_dim=384, num_heads=8, dropout=0.3)
+        self.batch_norm1 = nn.BatchNorm1d(384)
         self.dropout1 = nn.Dropout(0.3)
-        self.concat_dense1 = nn.Linear(512 + 8 + embedding_dim, 256)  # Updated for new features
+        self.concat_dense1 = nn.Linear(384 + 8 + embedding_dim, 256)  # Updated for new features
         self.batch_norm2 = nn.BatchNorm1d(256)
         self.dropout2 = nn.Dropout(0.3)
         self.concat_dense2 = nn.Linear(256, 128)  # Additional dense layer
@@ -480,11 +480,11 @@ class EnhancedGRU(nn.Module):
     def __init__(self, num_subjects, embedding_dim=CONFIG["embedding_dim"]):
         super().__init__()
         self.subject_embedding = nn.Embedding(num_subjects, embedding_dim)
-        self.gru = nn.GRU(1, 512, num_layers=3, batch_first=True, dropout=0.3)  # Increased hidden units, reduced dropout
-        self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8, dropout=0.3)
-        self.batch_norm1 = nn.BatchNorm1d(512)
+        self.gru = nn.GRU(1, 384, num_layers=3, batch_first=True, dropout=0.3)  # Increased hidden units, reduced dropout
+        self.attention = nn.MultiheadAttention(embed_dim=384, num_heads=8, dropout=0.3)
+        self.batch_norm1 = nn.BatchNorm1d(384)
         self.dropout1 = nn.Dropout(0.3)
-        self.concat_dense1 = nn.Linear(512 + 8 + embedding_dim, 256)  # Updated for new features
+        self.concat_dense1 = nn.Linear(384 + 8 + embedding_dim, 256)  # Updated for new features
         self.batch_norm2 = nn.BatchNorm1d(256)
         self.dropout2 = nn.Dropout(0.3)
         self.concat_dense2 = nn.Linear(256, 128)  # Additional dense layer
