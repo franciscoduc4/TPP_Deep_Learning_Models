@@ -21,12 +21,12 @@ from sklearn.model_selection import KFold
 # Global configuration
 CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "batch_size": 128,
-    "epochs": 300,
+    "batch_size": 256 if torch.cuda.is_available() else 64,
+    "epochs": 500,
     "patience": 30,
-    "learning_rate": 0.0005,
-    "embedding_dim": 16,
-    "window_hours": 2,
+    "learning_rate": 0.0008,
+    "embedding_dim": 32,
+    "window_hours": 4,
     "cap_normal": 30,
     "cap_bg": 300,
     "cap_iob": 5,
@@ -54,6 +54,7 @@ def check_device():
 check_device()
 
 # %% CELL: Data Processing Functions
+# Update get_cgm_window to dynamically calculate the number of points
 def get_cgm_window(bolus_time, cgm_df, window_hours=CONFIG["window_hours"]):
     """
     Obtiene una ventana de datos CGM alrededor del tiempo del bolo de insulina.
@@ -64,18 +65,29 @@ def get_cgm_window(bolus_time, cgm_df, window_hours=CONFIG["window_hours"]):
         window_hours: Tamaño de la ventana en horas
     
     Returns:
-        Array numpy con los últimos 24 valores CGM o None si no hay suficientes datos
+        Array numpy con los valores CGM o None si no hay suficientes datos
     """
-    # Calcula inicio de la ventana
+    # Calculate the number of points based on window_hours (5-minute intervals: 12 points/hour)
+    num_points = int(window_hours * 12)  # e.g., 4 hours * 12 points/hour = 48 points
+    
+    # Calculate the start of the window
     window_start = bolus_time - timedelta(hours=window_hours)
     
-    # Obtiene datos CGM dentro de la ventana de tiempo
+    # Get CGM data within the time window
     window = cgm_df[(cgm_df['date'] >= window_start) & (cgm_df['date'] <= bolus_time)]
     
-    # Ordena y toma los últimos 24 valores
-    window = window.sort_values('date').tail(24)
+    # Sort by date and take the last num_points values
+    window = window.sort_values('date').tail(num_points)
     
-    return window['mg/dl'].values if len(window) >= 24 else None
+    # Check if we have enough data points
+    if len(window) < num_points:
+        # Option 1: Return None if not enough data (conservative approach)
+        return None
+        # Option 2: Pad with the last available value (alternative approach)
+        # padding = np.full(num_points - len(window), window['mg/dl'].iloc[-1] if not window.empty else 0)
+        # return np.concatenate([window['mg/dl'].values, padding]) if not window.empty else None
+    
+    return window['mg/dl'].values
 
 def calculate_iob(bolus_time, basal_df, half_life_hours=4):
     """
@@ -208,57 +220,50 @@ def preprocess_data(subject_folder):
     """
     start_time = time.time()
     
-    # Obtener lista de archivos Excel de sujetos
     subject_files = [f for f in os.listdir(subject_folder) if f.startswith("Subject") and f.endswith(".xlsx")]
     print(f"\nFound Subject files ({len(subject_files)}):")
     for f in subject_files:
         print(f)
 
-    # Procesar datos de cada sujeto en paralelo
     all_processed_data = Parallel(n_jobs=-1)(delayed(process_subject)(os.path.join(subject_folder, f), idx) 
                                             for idx, f in enumerate(subject_files))
     all_processed_data = [item for sublist in all_processed_data for item in sublist]
 
-    # Crear DataFrame con todos los datos procesados
     df_processed = pd.DataFrame(all_processed_data)
     print("Muestra de datos procesados combinados:")
     print(df_processed.head())
     print(f"Total de muestras: {len(df_processed)}")
 
-    # Mostrar estadísticas de dosis de insulina por sujeto
-    print("\nEstadísticas de 'normal' por sujeto (antes de normalización):")
-    for subject_id in df_processed['subject_id'].unique():
-        subject_data = df_processed[df_processed['subject_id'] == subject_id]['normal']
-        print(f"Sujeto {subject_id}: min={subject_data.min():.2f}, max={subject_data.max():.2f}, mean={subject_data.mean():.2f}, std={subject_data.std():.2f}")
-
-    # Expandir columna de ventana CGM en múltiples columnas
-    cgm_columns = [f'cgm_{i}' for i in range(24)]
-    df_cgm = pd.DataFrame(df_processed['cgm_window'].tolist(), columns=cgm_columns, index=df_processed.index)
-    df_final = pd.concat([df_cgm, df_processed.drop(columns=['cgm_window'])], axis=1)
-
-    # Eliminar filas con valores faltantes
-    df_final = df_final.dropna()
-    print("Verificación de NaN en df_final:")
-    print(df_final.isna().sum())
-
-    # Inicializar scalers para normalización
-    # scaler_cgm = MinMaxScaler(feature_range=(0, 1))
-    # scaler_other = StandardScaler()
-    # scaler_y = MinMaxScaler(feature_range=(0, 1))
+    # Add new features: CGM trend and variance
+    num_points = int(CONFIG["window_hours"] * 12)  # Dynamically calculate based on window_hours
+    cgm_columns = [f'cgm_{i}' for i in range(num_points)]  # e.g., 48 columns for 4 hours
     
+    # Create DataFrame from cgm_window
+    df_cgm = pd.DataFrame(df_processed['cgm_window'].tolist(), columns=cgm_columns, index=df_processed.index)
+    
+    # Compute CGM trend (slope) and variance
+    df_processed['cgm_trend'] = df_cgm[cgm_columns].apply(lambda x: np.polyfit(range(len(x)), x, 1)[0], axis=1)
+    df_processed['cgm_variance'] = df_cgm[cgm_columns].var(axis=1)
+    
+    df_final = pd.concat([df_cgm, df_processed.drop(columns=['cgm_window'])], axis=1)
+    df_final = df_final.dropna()
+
+    # Outlier detection: Clip CGM values beyond 3 standard deviations
+    cgm_mean = df_final[cgm_columns].mean().mean()
+    cgm_std = df_final[cgm_columns].std().mean()
+    df_final[cgm_columns] = df_final[cgm_columns].clip(lower=cgm_mean - 3*cgm_std, upper=cgm_mean + 3*cgm_std)
+
     scaler_cgm = StandardScaler()
     scaler_other = StandardScaler()
     scaler_y = StandardScaler()
 
-    # Preparar arrays de características y objetivos
-    X_cgm = scaler_cgm.fit_transform(df_final[cgm_columns]).reshape(-1, 24, 1)
+    X_cgm = scaler_cgm.fit_transform(df_final[cgm_columns]).reshape(-1, num_points, 1)
     X_subject = df_final['subject_id'].values
     other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
-                        'insulinSensitivityFactor', 'hour_of_day']
+                      'insulinSensitivityFactor', 'hour_of_day', 'cgm_trend', 'cgm_variance']
     X_other = scaler_other.fit_transform(df_final[other_features])
     y = scaler_y.fit_transform(df_final['normal'].values.reshape(-1, 1)).flatten()
 
-    # Verificar que no hay valores NaN
     print("NaN en X_cgm:", np.isnan(X_cgm).sum())
     print("NaN en X_other:", np.isnan(X_other).sum())
     print("NaN en X_subject:", np.isnan(X_subject).sum())
@@ -269,7 +274,6 @@ def preprocess_data(subject_folder):
     elapsed_time = time.time() - start_time
     print(f"Preprocesamiento completo en {elapsed_time:.2f} segundos")
     return X_cgm, X_other, X_subject, y, df_final, scaler_cgm, scaler_other, scaler_y
-
 
 
 def split_data(X_cgm, X_other, X_subject, y, df_final):
@@ -369,39 +373,45 @@ def create_dataloaders(X_cgm_train, X_cgm_val, X_cgm_test,
 
 # %% CELL: Model Definitions 
 class EnhancedLSTM(nn.Module):
-    def __init__(self, num_subjects, embedding_dim=16):
+    def __init__(self, num_subjects, embedding_dim=CONFIG["embedding_dim"]):
         super().__init__()
         self.subject_embedding = nn.Embedding(num_subjects, embedding_dim)
-        self.lstm = nn.LSTM(1, 256, num_layers=3, batch_first=True, dropout=0.5)
-        self.batch_norm1 = nn.BatchNorm1d(256)
-        self.dropout1 = nn.Dropout(0.5)
-        self.concat_dense = nn.Linear(256 + 6 + embedding_dim, 256)
+        self.lstm = nn.LSTM(1, 512, num_layers=3, batch_first=True, dropout=0.3)  # Increased hidden units, reduced dropout
+        self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8, dropout=0.3)
+        self.batch_norm1 = nn.BatchNorm1d(512)
+        self.dropout1 = nn.Dropout(0.3)
+        self.concat_dense1 = nn.Linear(512 + 8 + embedding_dim, 256)  # Updated for new features
         self.batch_norm2 = nn.BatchNorm1d(256)
-        self.dropout2 = nn.Dropout(0.5)
-        self.output_layer = nn.Linear(256, 1)
+        self.dropout2 = nn.Dropout(0.3)
+        self.concat_dense2 = nn.Linear(256, 128)  # Additional dense layer
+        self.batch_norm3 = nn.BatchNorm1d(128)
+        self.dropout3 = nn.Dropout(0.3)
+        self.output_layer = nn.Linear(128, 1)
         for name, param in self.named_parameters():
             if 'weight' in name and param.dim() > 1:
                 nn.init.xavier_uniform_(param)
 
     def forward(self, cgm_input, other_input, subject_ids):
         batch_size = cgm_input.size(0)
-        subject_embed = self.subject_embedding(subject_ids)  # [batch_size, embedding_dim]
+        subject_embed = self.subject_embedding(subject_ids)
         
-        lstm_out, _ = self.lstm(cgm_input)  # [batch_size, seq_len, hidden_size]
-        lstm_out = lstm_out[:, -1, :]  # [batch_size, 256]
+        lstm_out, _ = self.lstm(cgm_input)  # [batch_size, seq_len, 512]
+        lstm_out = lstm_out.permute(1, 0, 2)  # [seq_len, batch_size, 512] for attention
+        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)  # Apply attention
+        attn_out = attn_out.permute(1, 0, 2)  # [batch_size, seq_len, 512]
+        attn_out = attn_out[:, -1, :]  # Take last timestep
         
-        lstm_out = lstm_out.unsqueeze(2)  # [batch_size, 256, 1]
-        lstm_out = self.batch_norm1(lstm_out)  # [batch_size, 256, 1]
-        lstm_out = lstm_out.squeeze(2)  # [batch_size, 256]
-        lstm_out = self.dropout1(lstm_out)
+        attn_out = self.batch_norm1(attn_out.unsqueeze(2)).squeeze(2)
+        attn_out = self.dropout1(attn_out)
         
-        combined = torch.cat((lstm_out, other_input, subject_embed), dim=1)  # [batch_size, 256 + 6 + 16]
-        dense_out = torch.relu(self.concat_dense(combined))  # [batch_size, 256]
-        dense_out = dense_out.unsqueeze(2)  # [batch_size, 256, 1]
-        dense_out = self.batch_norm2(dense_out)  # [batch_size, 256, 1]
-        dense_out = dense_out.squeeze(2)  # [batch_size, 256]
+        combined = torch.cat((attn_out, other_input, subject_embed), dim=1)
+        dense_out = torch.relu(self.concat_dense1(combined))
+        dense_out = self.batch_norm2(dense_out.unsqueeze(2)).squeeze(2)
         dense_out = self.dropout2(dense_out)
-        return self.output_layer(dense_out)  # [batch_size, 1]
+        dense_out = torch.relu(self.concat_dense2(dense_out))
+        dense_out = self.batch_norm3(dense_out.unsqueeze(2)).squeeze(2)
+        dense_out = self.dropout3(dense_out)
+        return self.output_layer(dense_out)
 
 class TCNTransformer(nn.Module):
     """
@@ -467,18 +477,19 @@ class TCNTransformer(nn.Module):
         return self.output_layer(dense_out)
 
 class EnhancedGRU(nn.Module):
-    """
-    Modelo GRU mejorado con regularización y embeddings de sujetos.
-    """
-    def __init__(self, num_subjects, embedding_dim=16):
+    def __init__(self, num_subjects, embedding_dim=CONFIG["embedding_dim"]):
         super().__init__()
         self.subject_embedding = nn.Embedding(num_subjects, embedding_dim)
-        self.gru = nn.GRU(1, 256, num_layers=3, batch_first=True, dropout=0.4)  # Aumentado
-        self.batch_norm1 = nn.BatchNorm1d(256)
-        self.dropout1 = nn.Dropout(0.4)
-        self.concat_dense = nn.Linear(256 + 6 + embedding_dim, 128)
-        self.batch_norm2 = nn.BatchNorm1d(128)
-        self.dropout2 = nn.Dropout(0.4)
+        self.gru = nn.GRU(1, 512, num_layers=3, batch_first=True, dropout=0.3)  # Increased hidden units, reduced dropout
+        self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8, dropout=0.3)
+        self.batch_norm1 = nn.BatchNorm1d(512)
+        self.dropout1 = nn.Dropout(0.3)
+        self.concat_dense1 = nn.Linear(512 + 8 + embedding_dim, 256)  # Updated for new features
+        self.batch_norm2 = nn.BatchNorm1d(256)
+        self.dropout2 = nn.Dropout(0.3)
+        self.concat_dense2 = nn.Linear(256, 128)  # Additional dense layer
+        self.batch_norm3 = nn.BatchNorm1d(128)
+        self.dropout3 = nn.Dropout(0.3)
         self.output_layer = nn.Linear(128, 1)
         for name, param in self.named_parameters():
             if 'weight' in name and param.dim() > 1:
@@ -487,13 +498,21 @@ class EnhancedGRU(nn.Module):
     def forward(self, cgm_input, other_input, subject_ids):
         subject_embed = self.subject_embedding(subject_ids)
         gru_out, _ = self.gru(cgm_input)
-        gru_out = gru_out[:, -1, :] # Último estado
-        gru_out = self.batch_norm1(gru_out)
-        gru_out = self.dropout1(gru_out)
-        combined = torch.cat((gru_out, other_input, subject_embed), dim=1)
-        dense_out = torch.relu(self.concat_dense(combined))
-        dense_out = self.batch_norm2(dense_out)
+        gru_out = gru_out.permute(1, 0, 2)  # [seq_len, batch_size, 512] for attention
+        attn_out, _ = self.attention(gru_out, gru_out, gru_out)
+        attn_out = attn_out.permute(1, 0, 2)  # [batch_size, seq_len, 512]
+        attn_out = attn_out[:, -1, :]
+        
+        attn_out = self.batch_norm1(attn_out.unsqueeze(2)).squeeze(2)
+        attn_out = self.dropout1(attn_out)
+        
+        combined = torch.cat((attn_out, other_input, subject_embed), dim=1)
+        dense_out = torch.relu(self.concat_dense1(combined))
+        dense_out = self.batch_norm2(dense_out.unsqueeze(2)).squeeze(2)
         dense_out = self.dropout2(dense_out)
+        dense_out = torch.relu(self.concat_dense2(dense_out))
+        dense_out = self.batch_norm3(dense_out.unsqueeze(2)).squeeze(2)
+        dense_out = self.dropout3(dense_out)
         return self.output_layer(dense_out)
 
 # %% CELL: Training Functions
@@ -501,7 +520,7 @@ class EnhancedGRU(nn.Module):
 Funciones de entrenamiento y evaluación de modelos de aprendizaje profundo.
 """
 
-def custom_mse(y_true, y_pred, subject_ids, problem_subject=49, weight_reduction=0.5):
+def custom_mse(y_true, y_pred, subject_ids, problem_subject=49, weight_reduction=0.5, l1_lambda=1e-5):    
     """
     Error cuadrático medio personalizado con penalización por sobrepredicción.
     
@@ -516,12 +535,21 @@ def custom_mse(y_true, y_pred, subject_ids, problem_subject=49, weight_reduction
         Error medio ponderado con penalización
     """
     error = y_true - y_pred
-    # Penaliza más las sobrepredicciones (2x) que las subpredicciones
     overprediction_penalty = torch.where(error < 0, 2 * error**2, error**2)
-    # Asigna pesos reducidos al sujeto problemático
+    
+    # Clinical penalty: Higher penalty for predictions leading to hypoglycemia
+    glucose_pred = 100 - (y_pred * 50)  # Simplified mapping (adjust based on actual glucose prediction)
+    hypo_penalty = torch.where(glucose_pred < 70, (70 - glucose_pred)**2, torch.zeros_like(glucose_pred))
+    
     weights = torch.ones_like(y_true)
     weights[subject_ids == problem_subject] = weight_reduction
-    return torch.mean(overprediction_penalty * weights)
+    mse_loss = torch.mean((overprediction_penalty + hypo_penalty) * weights)
+    
+    # L1 regularization
+    l1_loss = 0
+    for param in model.parameters():
+        l1_loss += torch.norm(param, p=1)
+    return mse_loss + l1_lambda * l1_loss
 
 def train_model(model, train_loader, val_loader, model_name=None):
     """
@@ -537,14 +565,8 @@ def train_model(model, train_loader, val_loader, model_name=None):
     """
     start_time = time.time()
     
-    
-    lr = CONFIG["learning_rate"]
-    if model_name == "LSTM":
-        lr = 0.001  # Aumentar para el LSTM
-        
-    # Configuración del optimizador y scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6)
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"], weight_decay=1e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"], eta_min=1e-6)
     
     best_val_loss = float('inf')
     best_model_state = None
@@ -552,9 +574,7 @@ def train_model(model, train_loader, val_loader, model_name=None):
 
     train_losses, val_losses = [], []
     
-    # Bucle principal de entrenamiento
     for epoch in tqdm(range(CONFIG["epochs"]), desc="Entrenamiento", unit="época"):
-        # Fase de entrenamiento
         model.train()
         train_loss = 0
         for cgm_batch, other_batch, subject_batch, y_batch in train_loader:
@@ -562,14 +582,12 @@ def train_model(model, train_loader, val_loader, model_name=None):
             y_pred = model(cgm_batch, other_batch, subject_batch).squeeze()
             loss = custom_mse(y_batch, y_pred, subject_batch)
             loss.backward()
-            # Clip de gradientes para estabilidad
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Increased
             optimizer.step()
             train_loss += loss.item() * len(y_batch)
         train_loss /= len(train_loader.dataset)
         train_losses.append(train_loss)
 
-        # Fase de validación
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -580,9 +598,8 @@ def train_model(model, train_loader, val_loader, model_name=None):
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
 
-        # Actualización de learning rate y early stopping
-        scheduler.step(val_loss)
-        print(f"Epoch {epoch+1}/{CONFIG['epochs']}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+        scheduler.step()
+        print(f"Epoch {epoch+1}/{CONFIG['epochs']}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -594,7 +611,6 @@ def train_model(model, train_loader, val_loader, model_name=None):
                 print("Early stopping triggered")
                 break
 
-    # Restaurar mejor modelo
     model.load_state_dict(best_model_state)
     elapsed_time = time.time() - start_time
     print(f"Entrenamiento completo en {elapsed_time:.2f} segundos")
