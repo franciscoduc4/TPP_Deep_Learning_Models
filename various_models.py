@@ -764,23 +764,23 @@ def analyze_preprocessed_data(df_final, scaler_cgm, scaler_other, scaler_y):
     plt.tight_layout()
     plt.show()
 
-    # 3. Correlation Analysis
-    print("\n3. Correlation Analysis:")
-    correlation_matrix = df_final[numerical_cols].corr()
-    plt.figure(figsize=(12, 8))
-    plt.imshow(correlation_matrix, cmap='coolwarm', interpolation='nearest')
-    plt.colorbar()
-    plt.xticks(np.arange(len(numerical_cols)), numerical_cols, rotation=45, ha='right')
-    plt.yticks(np.arange(len(numerical_cols)), numerical_cols)
-    plt.title('Correlation Matrix of Numerical Features')
-    plt.tight_layout()
-    plt.show()
+    # # 3. Correlation Analysis
+    # print("\n3. Correlation Analysis:")
+    # correlation_matrix = df_final[numerical_cols].corr()
+    # plt.figure(figsize=(12, 8))
+    # plt.imshow(correlation_matrix, cmap='coolwarm', interpolation='nearest')
+    # plt.colorbar()
+    # plt.xticks(np.arange(len(numerical_cols)), numerical_cols, rotation=45, ha='right')
+    # plt.yticks(np.arange(len(numerical_cols)), numerical_cols)
+    # plt.title('Correlation Matrix of Numerical Features')
+    # plt.tight_layout()
+    # plt.show()
 
-    # Highlight significant correlations
-    print("Significant correlations (|corr| > 0.5):")
-    corr_pairs = correlation_matrix.unstack()
-    significant_pairs = corr_pairs[(abs(corr_pairs) > 0.5) & (abs(corr_pairs) < 1.0)]
-    print(significant_pairs)
+    # # Highlight significant correlations
+    # print("Significant correlations (|corr| > 0.5):")
+    # corr_pairs = correlation_matrix.unstack()
+    # significant_pairs = corr_pairs[(abs(corr_pairs) > 0.5) & (abs(corr_pairs) < 1.0)]
+    # print(significant_pairs)
 
     # 4. Outlier Detection (using IQR method)
     print("\n4. Outlier Detection (IQR Method):")
