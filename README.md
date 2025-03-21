@@ -161,17 +161,6 @@ El uso de GPU (verificado con `torch.cuda.is_available()`) aceleró significativ
   - **TCN**: CPU supera a GPU en todas las métricas (MAE: 0.43 vs. 0.95, RMSE: 0.83 vs. 1.61, R²: 0.92 vs. 0.71), posiblemente por una mejor convergencia con más épocas (53 vs. 40 con GPU).
 - **Sujeto 49**: Mejora notable en CPU, sugiriendo que más épocas o diferencias en optimización (e.g., gradientes) influyeron.
 
-## Conclusiones
-- **Éxito del TCN en CPU**: El TCN con CPU logró un R² sobresaliente (0.92), superando al LSTM y al TCN con GPU, posiblemente por una mejor convergencia con más épocas.
-- **LSTM Sólido**: El LSTM sigue siendo competitivo (R² = 0.84), con mejoras en MAE respecto a GPU, pero menor R².
-- **Impacto de CPU**: Aunque más lento, la CPU permitió más épocas, lo que benefició al TCN y mejoró el Sujeto 49.
-- **Sujeto 49**: Mejora significativa (MAE ~2.03-2.09), pero sigue siendo un desafío.
-
-## Recomendaciones
-1. **Sujeto 49**: Seguir investigando datos crudos; el cap de `normal` podría ajustarse a 40 para capturar mejor patrones.
-2. **TCN**: Aprovechar la mejora en CPU; probar con GPU y más épocas para replicar el R² (0.92).
-3. **Próximos Pasos**: Reentrenar con `batch_size=128` y cap ajustado, comparando CPU y GPU para confirmar tendencias.
-
 
 ## Requisitos
 Python 3.8+

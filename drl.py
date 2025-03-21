@@ -15,10 +15,11 @@ from tqdm import tqdm
 
 # DRL-specific imports
 import gym
-import gymnasium as gym  # Use gymnasium instead of gym
-from gymnasium import spaces  # Update to gymnasium.spaces
-from stable_baselines3 import PPO
+import gymnasium as gym  
+from gymnasium import spaces  
+from stable_baselines3 import PPO, SAC, TD3  
 from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.callbacks import BaseCallback
 
 # Global configuration
 CONFIG = {
@@ -159,6 +160,7 @@ def process_subject(subject_path, idx):
     return processed_data
 
 def preprocess_data(subject_folder):
+    
     """
     Preprocesa los datos de todos los sujetos para el entrenamiento del modelo.
     
@@ -191,11 +193,6 @@ def preprocess_data(subject_folder):
     print(df_processed.head())
     print(f"Total de muestras: {len(df_processed)}")
 
-    print("\nEstadísticas de 'normal' por sujeto (antes de normalización):")
-    for subject_id in df_processed['subject_id'].unique():
-        subject_data = df_processed[df_processed['subject_id'] == subject_id]['normal']
-        print(f"Sujeto {subject_id}: min={subject_data.min():.2f}, max={subject_data.max():.2f}, mean={subject_data.mean():.2f}, std={subject_data.std():.2f}")
-
     df_processed['normal'] = np.log1p(df_processed['normal'])
     df_processed['carbInput'] = np.log1p(df_processed['carbInput'])
     df_processed['insulinOnBoard'] = np.log1p(df_processed['insulinOnBoard'])
@@ -210,37 +207,14 @@ def preprocess_data(subject_folder):
     print("Verificación de NaN en df_final:")
     print(df_final.isna().sum())
 
-    scaler_cgm = StandardScaler()
-    scaler_other = StandardScaler()
-    scaler_y = StandardScaler()
-
-    X_cgm = scaler_cgm.fit_transform(df_final[cgm_columns]).reshape(-1, 24, 1)
-    X_subject = df_final['subject_id'].values
-    other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
-                      'insulinSensitivityFactor', 'hour_of_day']
-    X_other = scaler_other.fit_transform(df_final[other_features])
-    y = scaler_y.fit_transform(df_final['normal'].values.reshape(-1, 1)).flatten()
-
-    print("NaN en X_cgm:", np.isnan(X_cgm).sum())
-    print("NaN en X_other:", np.isnan(X_other).sum())
-    print("NaN en X_subject:", np.isnan(X_subject).sum())
-    print("NaN in y:", np.isnan(y).sum())
-    if np.isnan(X_cgm).sum() > 0 or np.isnan(X_other).sum() > 0 or np.isnan(X_subject).sum() > 0 or np.isnan(y).sum() > 0:
-        raise ValueError("Valores NaN detectados")
-
     elapsed_time = time.time() - start_time
     print(f"Preprocesamiento completo en {elapsed_time:.2f} segundos")
-    return X_cgm, X_other, X_subject, y, df_final, scaler_cgm, scaler_other, scaler_y
-
-def split_data(X_cgm, X_other, X_subject, y, df_final):
+    return df_final
+def split_data(df_final):
     """
-    Divide los datos en conjuntos de entrenamiento, validación y prueba.
+    Divide los datos en conjuntos de entrenamiento, validación y prueba, asegurando distribuciones similares.
     
     Args:
-        X_cgm: Array de datos CGM
-        X_other: Array de otras características
-        X_subject: Array de IDs de sujetos
-        y: Array de objetivos
         df_final: DataFrame con todos los datos
         
     Returns:
@@ -248,19 +222,73 @@ def split_data(X_cgm, X_other, X_subject, y, df_final):
     """
     start_time = time.time()
     
+    # Discretize the continuous target into bins
+    bins = pd.cut(df_final['normal'], bins=5, labels=False)
+    # Group by subject_id and compute the mean bin for each subject
+    subject_bins = bins.groupby(df_final['subject_id']).mean()
     subject_ids = df_final['subject_id'].unique()
-    train_subjects, temp_subjects = train_test_split(subject_ids, test_size=0.2, random_state=42)
-    val_subjects, test_subjects = train_test_split(temp_subjects, test_size=0.5, random_state=42)
 
+    # Sort subjects by their mean bin
+    sorted_subjects = subject_bins.sort_values().index
+    n_subjects = len(sorted_subjects)
+
+    # Aim for 80%-10%-10% split
+    train_size = int(0.8 * n_subjects)  # 80% for training
+    val_size = int(0.1 * n_subjects)    # 10% for validation
+    test_size = n_subjects - train_size - val_size  # 10% for test
+
+    # Distribute subjects across splits to balance distributions
+    train_subjects = []
+    val_subjects = []
+    test_subjects = []
+
+    # Assign subjects in a round-robin fashion to balance bins
+    for i, subject in enumerate(sorted_subjects):
+        if i % 10 < 8:  # First 8 out of 10 go to train (80%)
+            train_subjects.append(subject)
+        elif i % 10 == 8:  # 9th goes to val (10%)
+            val_subjects.append(subject)
+        else:  # 10th goes to test (10%)
+            test_subjects.append(subject)
+
+    # Create masks for splitting
     train_mask = df_final['subject_id'].isin(train_subjects)
     val_mask = df_final['subject_id'].isin(val_subjects)
     test_mask = df_final['subject_id'].isin(test_subjects)
 
-    X_cgm_train, X_cgm_val, X_cgm_test = X_cgm[train_mask], X_cgm[val_mask], X_cgm[test_mask]
-    X_other_train, X_other_val, X_other_test = X_other[train_mask], X_other[val_mask], X_other[test_mask]
-    X_subject_train, X_subject_val, X_subject_test = X_subject[train_mask], X_subject[val_mask], X_subject[test_mask]
-    y_train, y_val, y_test = y[train_mask], y[val_mask], y[test_mask]
-    subject_test = df_final[test_mask]['subject_id'].values
+    # Check distributions after splitting
+    y_train_temp = df_final.loc[train_mask, 'normal']
+    y_val_temp = df_final.loc[val_mask, 'normal']
+    y_test_temp = df_final.loc[test_mask, 'normal']
+    print("Post-split Train y: mean =", y_train_temp.mean(), "std =", y_train_temp.std())
+    print("Post-split Val y: mean =", y_val_temp.mean(), "std =", y_val_temp.std())
+    print("Post-split Test y: mean =", y_test_temp.mean(), "std =", y_test_temp.std())
+
+    # Initialize scalers
+    scaler_cgm = StandardScaler()
+    scaler_other = StandardScaler()
+    scaler_y = StandardScaler()
+    cgm_columns = [f'cgm_{i}' for i in range(24)]
+    other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
+                      'insulinSensitivityFactor', 'hour_of_day']
+
+    # Scale only on training data
+    X_cgm_train = scaler_cgm.fit_transform(df_final.loc[train_mask, cgm_columns]).reshape(-1, 24, 1)
+    X_cgm_val = scaler_cgm.transform(df_final.loc[val_mask, cgm_columns]).reshape(-1, 24, 1)
+    X_cgm_test = scaler_cgm.transform(df_final.loc[test_mask, cgm_columns]).reshape(-1, 24, 1)
+    
+    X_other_train = scaler_other.fit_transform(df_final.loc[train_mask, other_features])
+    X_other_val = scaler_other.transform(df_final.loc[val_mask, other_features])
+    X_other_test = scaler_other.transform(df_final.loc[test_mask, other_features])
+    
+    y_train = scaler_y.fit_transform(df_final.loc[train_mask, 'normal'].values.reshape(-1, 1)).flatten()
+    y_val = scaler_y.transform(df_final.loc[val_mask, 'normal'].values.reshape(-1, 1)).flatten()
+    y_test = scaler_y.transform(df_final.loc[test_mask, 'normal'].values.reshape(-1, 1)).flatten()
+
+    X_subject_train = df_final.loc[train_mask, 'subject_id'].values
+    X_subject_val = df_final.loc[val_mask, 'subject_id'].values
+    X_subject_test = df_final.loc[test_mask, 'subject_id'].values
+    subject_test = X_subject_test
 
     print(f"Entrenamiento CGM: {X_cgm_train.shape}, Validación CGM: {X_cgm_val.shape}, Prueba CGM: {X_cgm_test.shape}")
     print(f"Entrenamiento Otros: {X_other_train.shape}, Validación Otros: {X_other_val.shape}, Prueba Otros: {X_other_test.shape}")
@@ -272,7 +300,8 @@ def split_data(X_cgm, X_other, X_subject, y, df_final):
     return (X_cgm_train, X_cgm_val, X_cgm_test,
             X_other_train, X_other_val, X_other_test,
             X_subject_train, X_subject_val, X_subject_test,
-            y_train, y_val, y_test, subject_test)
+            y_train, y_val, y_test, subject_test,
+            scaler_cgm, scaler_other, scaler_y)
 
 def rule_based_prediction(X_other, scaler_other, scaler_y, target_bg=100):
     """
@@ -308,6 +337,113 @@ def rule_based_prediction(X_other, scaler_other, scaler_y, target_bg=100):
     elapsed_time = time.time() - start_time
     print(f"Predicción basada en reglas completa en {elapsed_time:.2f} segundos")
     return prediction
+# %% CELL: Visualization Functions
+def compute_metrics(y_true, y_pred, scaler_y):
+    y_true_denorm = scaler_y.inverse_transform(y_true.reshape(-1, 1)).flatten()
+    y_pred_denorm = y_pred  # Already denormalized
+    mae = mean_absolute_error(y_true_denorm, y_pred_denorm)
+    rmse = np.sqrt(mean_squared_error(y_true_denorm, y_pred_denorm))
+    r2 = r2_score(y_true_denorm, y_pred_denorm)
+    return mae, rmse, r2
+
+
+def plot_evaluation(y_test, y_pred_ppo, y_pred_sac, y_pred_td3, y_rule, subject_test, scaler_y):
+    start_time = time.time()
+    y_test_denorm = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
+
+    colors = {'PPO': 'green', 'SAC': 'blue', 'TD3': 'purple', 'Rules': 'orange'}
+    offset = 1e-2
+
+    # 1. Predictions vs Real (Separate Density Scatter Plots)
+    plt.figure(figsize=(18, 5))
+
+    plt.subplot(1, 3, 1)
+    sns.kdeplot(x=y_test_denorm + offset, y=y_pred_ppo + offset, cmap="viridis", fill=True, levels=5, thresh=.05)
+    plt.plot([offset, 15], [offset, 15], 'k--', label='Perfect Prediction')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.xticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
+    plt.yticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
+    plt.xlabel('Real Dose (units)', fontsize=10)
+    plt.ylabel('Predicted Dose (units)', fontsize=10)
+    plt.title('PPO: Predictions vs Real (Density)', fontsize=12)
+    plt.legend()
+
+    plt.subplot(1, 3, 2)
+    sns.kdeplot(x=y_test_denorm + offset, y=y_pred_sac + offset, cmap="viridis", fill=True, levels=5, thresh=.05)
+    plt.plot([offset, 15], [offset, 15], 'k--', label='Perfect Prediction')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.xticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
+    plt.yticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
+    plt.xlabel('Real Dose (units)', fontsize=10)
+    plt.ylabel('Predicted Dose (units)', fontsize=10)
+    plt.title('SAC: Predictions vs Real (Density)', fontsize=12)
+    plt.legend()
+
+    plt.subplot(1, 3, 3)
+    sns.kdeplot(x=y_test_denorm + offset, y=y_pred_td3 + offset, cmap="viridis", fill=True, levels=5, thresh=.05)
+    plt.plot([offset, 15], [offset, 15], 'k--', label='Perfect Prediction')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.xticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
+    plt.yticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
+    plt.xlabel('Real Dose (units)', fontsize=10)
+    plt.ylabel('Predicted Dose (units)', fontsize=10)
+    plt.title('TD3: Predictions vs Real (Density)', fontsize=12)
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    # 2. Residual Distribution (KDE Plots)
+    plt.figure(figsize=(18, 5))
+    residuals_ppo = y_test_denorm - y_pred_ppo
+    residuals_sac = y_test_denorm - y_pred_sac
+    residuals_td3 = y_test_denorm - y_pred_td3
+
+    sns.kdeplot(residuals_ppo, label='PPO', color=colors['PPO'], fill=True, alpha=0.3)
+    sns.kdeplot(residuals_sac, label='SAC', color=colors['SAC'], fill=True, alpha=0.3)
+    sns.kdeplot(residuals_td3, label='TD3', color=colors['TD3'], fill=True, alpha=0.3)
+    # sns.kdeplot(residuals_rule, label='Rules', color=colors['Rules'], fill=True, alpha=0.3)
+    plt.xlabel('Residual (units)', fontsize=10)
+    plt.ylabel('Density', fontsize=10)
+    plt.title('Residual Distribution (KDE)', fontsize=12)
+    plt.legend(fontsize=8)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 3. MAE by Subject
+    plt.figure(figsize=(18, 5))
+    test_subjects = np.unique(subject_test)
+    mae_ppo, mae_sac, mae_td3 =[],[],[]
+    for sid in test_subjects:
+        mask = subject_test == sid
+        if np.sum(mask) > 0:
+            mae_ppo.append(mean_absolute_error(y_test_denorm[mask], y_pred_ppo[mask]))
+            mae_sac.append(mean_absolute_error(y_test_denorm[mask], y_pred_sac[mask]))
+            mae_td3.append(mean_absolute_error(y_test_denorm[mask], y_pred_td3[mask]))
+            # mae_rule.append(mean_absolute_error(y_test_denorm[mask], y_rule[mask]))
+
+    bar_width = 0.2
+    x = np.arange(len(test_subjects))
+    plt.bar(x - bar_width, mae_ppo, width=bar_width, label='PPO', color=colors['PPO'], alpha=0.8)
+    plt.bar(x, mae_sac, width=bar_width, label='SAC', color=colors['SAC'], alpha=0.8)
+    plt.bar(x + bar_width, mae_td3, width=bar_width, label='TD3', color=colors['TD3'], alpha=0.8)
+    # plt.bar(x + 1.5*bar_width, mae_rule, width=bar_width, label='Rules', color=colors['Rules'], alpha=0.8)
+    plt.xlabel('Subject', fontsize=10)
+    plt.ylabel('MAE (units)', fontsize=10)
+    plt.xticks(x, test_subjects, rotation=45, ha='right', fontsize=8)
+    plt.ylim(0, 0.5)
+    plt.title('MAE by Subject', fontsize=12)
+    plt.legend(fontsize=8)
+    plt.grid(True, axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    elapsed_time = time.time() - start_time
+    print(f"Visualización completa en {elapsed_time:.2f} segundos")
 
 # %% CELL: DRL Environment Definition
 class InsulinDoseEnv(gym.Env):
@@ -339,8 +475,10 @@ class InsulinDoseEnv(gym.Env):
     def step(self, action):
         true_dose = self.scaler_y.inverse_transform(self.y[self.current_step].reshape(-1, 1)).flatten()[0]
         predicted_dose = self.scaler_y.inverse_transform(action.reshape(-1, 1)).flatten()[0]
-        reward = -abs(predicted_dose - true_dose)
-        reward = float(reward)  # Explicitly convert reward to a Python float
+        error = predicted_dose - true_dose
+        weight = max(1.0, true_dose / 2.0)  # Increase weight for higher doses
+        reward = -min(abs(error), 2.0) * weight  # Apply weight to clipped absolute error
+        reward = float(reward)
         done = True
         truncated = False
         info = {"true_dose": true_dose, "predicted_dose": predicted_dose}
@@ -350,117 +488,70 @@ class InsulinDoseEnv(gym.Env):
     def render(self, mode='human'):
         pass
 
-# %% CELL: Visualization Functions
-def compute_metrics(y_true, y_pred, scaler_y):
-    y_true_denorm = scaler_y.inverse_transform(y_true.reshape(-1, 1)).flatten()
-    y_pred_denorm = y_pred  # Already denormalized
-    mae = mean_absolute_error(y_true_denorm, y_pred_denorm)
-    rmse = np.sqrt(mean_squared_error(y_true_denorm, y_pred_denorm))
-    r2 = r2_score(y_true_denorm, y_pred_denorm)
-    return mae, rmse, r2
+class RewardCallback(BaseCallback):
+    def __init__(self, val_env, verbose=0):
+        super().__init__(verbose)
+        self.train_rewards = []
+        self.val_rewards = []
+        self.val_env = val_env
 
-def plot_evaluation(y_test, y_pred_ppo, y_rule, subject_test, scaler_y):
-    start_time = time.time()
-    y_test_denorm = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    def _on_step(self):
+        self.train_rewards.append(self.locals['rewards'][0])
+        # Evaluate on validation set every 1000 steps
+        if self.num_timesteps % 1000 == 0:
+            val_reward = self.evaluate_val()
+            self.val_rewards.append(val_reward)
+        return True
 
-    colors = {'PPO': 'green', 'Rules': 'orange'}
-
-    plt.figure(figsize=(15, 12))
-
-    # 1. Predictions vs Real (Separate Hexbin Plots)
-    offset = 1e-2
-    plt.subplot(3, 2, (1, 2))
-    plt.subplot(3, 2, 1)
-    plt.hexbin(y_test_denorm + offset, y_pred_ppo + offset, gridsize=50, cmap='viridis', 
-               mincnt=1, bins='log')
-    plt.plot([offset, 15], [offset, 15], 'k--', label='Perfect Prediction')
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.xticks([0.01, 0.1, 1, 10], ['0.01', '0.1', '1', '10'])
-    plt.yticks([0.01, 0.1, 1, 10], ['0.01', '0.1', '1', '10'])
-    plt.xlabel('Real Dose (units)', fontsize=10)
-    plt.ylabel('Predicted Dose (units)', fontsize=10)
-    plt.title('PPO: Predictions vs Real', fontsize=12)
-    plt.colorbar(label='Number of Predictions (log scale)')
-    plt.legend()
-
-    plt.subplot(3, 2, 2)
-    plt.hexbin(y_test_denorm + offset, y_rule + offset, gridsize=50, cmap='viridis', 
-               mincnt=1, bins='log')
-    plt.plot([offset, 15], [offset, 15], 'k--', label='Perfect Prediction')
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.xticks([0.01, 0.1, 1, 10], ['0.01', '0.1', '1', '10'])
-    plt.yticks([0.01, 0.1, 1, 10], ['0.01', '0.1', '1', '10'])
-    plt.xlabel('Real Dose (units)', fontsize=10)
-    plt.ylabel('Predicted Dose (units)', fontsize=10)
-    plt.title('Rules: Predictions vs Real', fontsize=12)
-    plt.colorbar(label='Number of Predictions (log scale)')
-    plt.legend()
-
-    # 2. Residual Distribution (KDE Plots)
-    plt.subplot(3, 1, 2)
-    residuals_ppo = y_test_denorm - y_pred_ppo
-    residuals_rule = y_test_denorm - y_rule
-
-    sns.kdeplot(residuals_ppo, label='PPO', color=colors['PPO'], fill=True, alpha=0.3)
-    sns.kdeplot(residuals_rule, label='Rules', color=colors['Rules'], fill=True, alpha=0.3)
-    plt.xlabel('Residual (units)', fontsize=10)
-    plt.ylabel('Density', fontsize=10)
-    plt.title('Residual Distribution (KDE)', fontsize=12)
-    plt.legend(fontsize=8)
-    plt.grid(True, alpha=0.3)
-
-    # 3. MAE by Subject
-    test_subjects = np.unique(subject_test)
-    mae_ppo, mae_rule = [], []
-    for sid in test_subjects:
-        mask = subject_test == sid
-        if np.sum(mask) > 0:
-            mae_ppo.append(mean_absolute_error(y_test_denorm[mask], y_pred_ppo[mask]))
-            mae_rule.append(mean_absolute_error(y_test_denorm[mask], y_rule[mask]))
-
-    plt.subplot(3, 1, 3)
-    bar_width = 0.35
-    x = np.arange(len(test_subjects))
-    plt.bar(x - bar_width/2, mae_ppo, width=bar_width, label='PPO', color=colors['PPO'], alpha=0.8)
-    plt.bar(x + bar_width/2, mae_rule, width=bar_width, label='Rules', color=colors['Rules'], alpha=0.8)
-    plt.xlabel('Subject', fontsize=10)
-    plt.ylabel('MAE (units)', fontsize=10)
-    plt.xticks(x, test_subjects, rotation=45, ha='right', fontsize=8)
-    plt.ylim(0, 2.3)
-    plt.title('MAE by Subject', fontsize=12)
-    plt.legend(fontsize=8)
-    plt.grid(True, axis='y', alpha=0.3)
-
-    plt.tight_layout()
-    plt.show()
-
-    elapsed_time = time.time() - start_time
-    print(f"Visualización completa en {elapsed_time:.2f} segundos")
-
+    def evaluate_val(self):
+        total_reward = 0
+        for _ in range(10):  # Evaluate on 10 random validation samples
+            state, _ = self.val_env.reset()
+            action, _ = self.model.predict(state, deterministic=True)
+            _, reward, _, _, _ = self.val_env.step(action)
+            total_reward += reward
+        return total_reward / 10
+    
 # %% CELL: Main Execution - Preprocess Data
-X_cgm, X_other, X_subject, y, df_final, scaler_cgm, scaler_other, scaler_y = preprocess_data(CONFIG["data_path"])
+# df_final = preprocess_data(CONFIG["data_path"])
+# #Save the df_final in a csv
+# df_final.to_csv('df_final.csv', index=False)
 
-# %% CELL: Main Execution - Split Data
+# %%
+#Load the csv
+df_final = pd.read_csv('df_final.csv')
+
 (X_cgm_train, X_cgm_val, X_cgm_test,
  X_other_train, X_other_val, X_other_test,
  X_subject_train, X_subject_val, X_subject_test,
- y_train, y_val, y_test, subject_test) = split_data(X_cgm, X_other, X_subject, y, df_final)
+ y_train, y_val, y_test, subject_test,
+ scaler_cgm, scaler_other, scaler_y) = split_data(df_final)
 
 # %% CELL: Main Execution - DRL (PPO) Training
-# Create the training environment
-train_env = InsulinDoseEnv(X_cgm_train, X_other_train, y_train, scaler_y)
+# Create the training and validation environments
+train_env_ppo = InsulinDoseEnv(X_cgm_train, X_other_train, y_train, scaler_y)
+val_env_ppo = InsulinDoseEnv(X_cgm_val, X_other_val, y_val, scaler_y)
+callback = RewardCallback(val_env=val_env_ppo)
 
 # Verify that the environment is correctly implemented
-check_env(train_env)
+check_env(train_env_ppo)
 
 # Initialize the PPO model
-model_ppo = PPO("MlpPolicy", train_env, verbose=1, learning_rate=3e-4, n_steps=2048, batch_size=64)
-
+model_ppo = PPO("MlpPolicy", train_env_ppo, verbose=1, learning_rate=3e-4, n_steps=2048, batch_size=64,
+                clip_range=0.15,  # Slightly increase clip range
+                ent_coef=0.005)   # Reduce entropy coefficient
 # Train the model
-total_timesteps = 100000  # Adjust based on convergence
-model_ppo.learn(total_timesteps=total_timesteps)
+total_timesteps = 50000  # Adjust based on convergence
+model_ppo.learn(total_timesteps=total_timesteps, callback=callback)
+
+# Plot training and validation rewards
+plt.plot(callback.train_rewards, label='Train Reward')
+plt.plot(np.arange(len(callback.val_rewards)) * 1000, callback.val_rewards, label='Val Reward')
+plt.xlabel('Timestep')
+plt.ylabel('Reward')
+plt.legend()
+plt.title('PPO Training vs Validation Reward')
+plt.show()
 
 # Save the model (optional)
 model_ppo.save("ppo_insulin_dose")
@@ -481,8 +572,11 @@ def predict_with_ppo(model, X_cgm, X_other):
     
     return np.array(predictions)
 
-# Generate predictions on the test set
+# Generate predictions on train, validation, and test sets
+y_pred_ppo_train = predict_with_ppo(model_ppo, X_cgm_train, X_other_train)
+y_pred_ppo_val = predict_with_ppo(model_ppo, X_cgm_val, X_other_val)
 y_pred_ppo = predict_with_ppo(model_ppo, X_cgm_test, X_other_test)
+
 
 # Generate rule-based predictions for comparison
 y_rule = rule_based_prediction(X_other_test, scaler_other, scaler_y)
@@ -492,21 +586,98 @@ y_rule = rule_based_prediction(X_other_test, scaler_other, scaler_y)
 mae_ppo = mean_absolute_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo)
 rmse_ppo = np.sqrt(mean_squared_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo))
 r2_ppo = r2_score(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo)
-print(f"PPO - MAE: {mae_ppo:.2f}, RMSE: {rmse_ppo:.2f}, R²: {r2_ppo:.2f}")
+print(f"PPO Test - MAE: {mae_ppo:.2f}, RMSE: {rmse_ppo:.2f}, R²: {r2_ppo:.2f}")
 
 # Metrics for the Rules-based model
 mae_rule = mean_absolute_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_rule)
 rmse_rule = np.sqrt(mean_squared_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_rule))
 r2_rule = r2_score(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_rule)
-print(f"Rules - MAE: {mae_rule:.2f}, RMSE: {rmse_rule:.2f}, R²: {r2_rule:.2f}")
+print(f"Rules Test - MAE: {mae_rule:.2f}, RMSE: {rmse_rule:.2f}, R²: {r2_rule:.2f}")
+
+# %% CELL: Main Execution - PPO Metrics Across Sets to Check Overfitting
+# Metrics for train
+mae_ppo_train = mean_absolute_error(scaler_y.inverse_transform(y_train.reshape(-1, 1)), y_pred_ppo_train)
+rmse_ppo_train = np.sqrt(mean_squared_error(scaler_y.inverse_transform(y_train.reshape(-1, 1)), y_pred_ppo_train))
+r2_ppo_train = r2_score(scaler_y.inverse_transform(y_train.reshape(-1, 1)), y_pred_ppo_train)
+print(f"PPO Train - MAE: {mae_ppo_train:.2f}, RMSE: {rmse_ppo_train:.2f}, R²: {r2_ppo_train:.2f}")
+
+# Metrics for validation
+mae_ppo_val = mean_absolute_error(scaler_y.inverse_transform(y_val.reshape(-1, 1)), y_pred_ppo_val)
+rmse_ppo_val = np.sqrt(mean_squared_error(scaler_y.inverse_transform(y_val.reshape(-1, 1)), y_pred_ppo_val))
+r2_ppo_val = r2_score(scaler_y.inverse_transform(y_val.reshape(-1, 1)), y_pred_ppo_val)
+print(f"PPO Val - MAE: {mae_ppo_val:.2f}, RMSE: {rmse_ppo_val:.2f}, R²: {r2_ppo_val:.2f}")
+
+# Metrics for test (already computed)
+print(f"PPO Test - MAE: {mae_ppo:.2f}, RMSE: {rmse_ppo:.2f}, R²: {r2_ppo:.2f}")
+
+#%% CELL: Main Execution - Cross-Validation for PPO
+from sklearn.model_selection import KFold
+
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+subject_ids = df_final['subject_id'].unique()
+mae_scores = []
+cgm_columns = [f'cgm_{i}' for i in range(24)]
+other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
+                  'insulinSensitivityFactor', 'hour_of_day']
+
+for train_idx, test_idx in kf.split(subject_ids):
+    train_subs = subject_ids[train_idx]
+    test_subs = subject_ids[test_idx]
+    train_mask = df_final['subject_id'].isin(train_subs)
+    test_mask = df_final['subject_id'].isin(test_subs)
+    
+    X_cgm_train_cv = scaler_cgm.transform(df_final.loc[train_mask, cgm_columns]).reshape(-1, 24, 1)
+    X_other_train_cv = scaler_other.transform(df_final.loc[train_mask, other_features])
+    y_train_cv = scaler_y.transform(df_final.loc[train_mask, 'normal'].values.reshape(-1, 1)).flatten()
+    X_cgm_test_cv = scaler_cgm.transform(df_final.loc[test_mask, cgm_columns]).reshape(-1, 24, 1)
+    X_other_test_cv = scaler_other.transform(df_final.loc[test_mask, other_features])
+    y_test_cv = scaler_y.transform(df_final.loc[test_mask, 'normal'].values.reshape(-1, 1)).flatten()
+    
+    env_cv = InsulinDoseEnv(X_cgm_train_cv, X_other_train_cv, y_train_cv, scaler_y)
+    model_cv = PPO("MlpPolicy", env_cv, verbose=0, learning_rate=3e-4, n_steps=2048, batch_size=64)
+    model_cv.learn(total_timesteps=50000)  # Reduced for speed
+    y_pred_cv = predict_with_ppo(model_cv, X_cgm_test_cv, X_other_test_cv)
+    mae_cv = mean_absolute_error(scaler_y.inverse_transform(y_test_cv.reshape(-1, 1)), y_pred_cv)
+    mae_scores.append(mae_cv)
+
+print(f"Cross-validated PPO MAE: {np.mean(mae_scores):.2f} ± {np.std(mae_scores):.2f}")
+
+# %% CELL: Main Execution - Debug Test Set Distribution
+y_train_denorm = scaler_y.inverse_transform(y_train.reshape(-1, 1)).flatten()
+y_val_denorm = scaler_y.inverse_transform(y_val.reshape(-1, 1)).flatten()
+y_test_denorm = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
+
+print("Train y: mean =", np.mean(y_train_denorm), "std =", np.std(y_train_denorm))
+print("Val y: mean =", np.mean(y_val_denorm), "std =", np.std(y_val_denorm))
+print("Test y: mean =", np.mean(y_test_denorm), "std =", np.std(y_test_denorm))
+
+plt.figure(figsize=(10, 6))
+sns.kdeplot(y_train_denorm, label='Train', color='blue')
+sns.kdeplot(y_val_denorm, label='Val', color='orange')
+sns.kdeplot(y_test_denorm, label='Test', color='green')
+plt.xlabel('Insulin Dose (units)')
+plt.ylabel('Density')
+plt.legend()
+plt.title('Distribution of Target Insulin Doses')
+plt.show()
+
+# Plot predictions vs true values for test set
+plt.figure(figsize=(8, 6))
+plt.scatter(y_test_denorm, y_pred_ppo, alpha=0.5, label='PPO Predictions')
+plt.plot([0, 4], [0, 4], 'k--', label='Perfect Prediction')
+plt.xlabel('True Dose (units)')
+plt.ylabel('Predicted Dose (units)')
+plt.legend()
+plt.title('PPO Predictions vs True Values (Test Set)')
+plt.show()
 
 # %% CELL: Main Execution - Visualization
 # Visualize the results
-plot_evaluation(y_test, y_pred_ppo, y_rule, subject_test, scaler_y)
+# plot_evaluation(y_test, y_pred_ppo, y_pred_sac, y_pred_td3, y_rule, subject_test, scaler_y)
 
 # %% CELL: Main Execution - Metrics per Subject
 # Analyze performance per subject
-print("\nRendimiento por sujeto:")
+print("\nRendimiento por sujeto (Test Set):")
 for subject_id in np.unique(subject_test):
     mask = subject_test == subject_id
     if np.sum(mask) > 0:
@@ -516,4 +687,43 @@ for subject_id in np.unique(subject_test):
         print(f"PPO MAE={mae_ppo_sub:.2f}, ", end="")
         mae_rule_sub = mean_absolute_error(y_test_sub, y_rule[mask])
         print(f"Rules MAE={mae_rule_sub:.2f}")
+
+# Check if subject 49 exists in test set
+if 49 in np.unique(subject_test):
+    mask_49 = subject_test == 49
+    y_test_49 = scaler_y.inverse_transform(y_test[mask_49].reshape(-1, 1)).flatten()
+    print(f"Subject 49 - Mean dose: {y_test_49.mean():.2f}, Std: {y_test_49.std():.2f}")
+    plt.figure(figsize=(8, 6))
+    plt.scatter(y_test_49, y_pred_ppo[mask_49], alpha=0.5, label='PPO Predictions (Subject 49)')
+    plt.plot([0, 4], [0, 4], 'k--', label='Perfect Prediction')
+    plt.xlabel('True Dose (units)')
+    plt.ylabel('Predicted Dose (units)')
+    plt.legend()
+    plt.title('PPO Predictions vs True Values (Subject 49)')
+    plt.show()
+else:
+    print("Subject 49 not found in test set")
+
+# # %% CELL: Main Execution - Tune PPO Training (Optional)
+# # Test different timesteps to check convergence
+# for timesteps in [50000, 200000]:
+#     print(f"\nTraining PPO with {timesteps} timesteps:")
+#     model_ppo_tune = PPO("MlpPolicy", train_env_ppo, verbose=1, learning_rate=3e-4, n_steps=2048, batch_size=64)
+#     callback_tune = RewardCallback(val_env=val_env_ppo)
+#     model_ppo_tune.learn(total_timesteps=timesteps, callback=callback_tune)
+    
+#     y_pred_ppo_test_tune = predict_with_ppo(model_ppo_tune, X_cgm_test, X_other_test)
+#     mae_tune = mean_absolute_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune)
+#     rmse_tune = np.sqrt(mean_squared_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune))
+#     r2_tune = r2_score(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune)
+#     print(f"PPO Test (tuned {timesteps}) - MAE: {mae_tune:.2f}, RMSE: {rmse_tune:.2f}, R²: {r2_tune:.2f}")
+    
+#     plt.plot(callback_tune.train_rewards, label=f'Train Reward ({timesteps})')
+#     plt.plot(np.arange(len(callback_tune.val_rewards)) * 1000, callback_tune.val_rewards, label=f'Val Reward ({timesteps})')
+#     plt.xlabel('Timestep')
+#     plt.ylabel('Reward')
+#     plt.legend()
+#     plt.title(f'PPO Training vs Validation Reward ({timesteps} timesteps)')
+#     plt.show()
+
 # %%
