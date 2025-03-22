@@ -161,6 +161,7 @@ def process_subject(subject_path, idx):
 
 def preprocess_data(subject_folder):
     
+    
     """
     Preprocesa los datos de todos los sujetos para el entrenamiento del modelo.
     
@@ -213,6 +214,7 @@ def preprocess_data(subject_folder):
 def split_data(df_final):
     """
     Divide los datos en conjuntos de entrenamiento, validación y prueba, asegurando distribuciones similares.
+    Forces Subject 49 into the test set for evaluation and balances means and stds across sets.
     
     Args:
         df_final: DataFrame con todos los datos
@@ -222,14 +224,13 @@ def split_data(df_final):
     """
     start_time = time.time()
     
-    # Discretize the continuous target into bins
-    bins = pd.cut(df_final['normal'], bins=5, labels=False)
-    # Group by subject_id and compute the mean bin for each subject
-    subject_bins = bins.groupby(df_final['subject_id']).mean()
+    # Compute the mean and std insulin dose for each subject
+    subject_stats = df_final.groupby('subject_id')['normal'].agg(['mean', 'std']).reset_index()
+    subject_stats.columns = ['subject_id', 'mean_dose', 'std_dose']
     subject_ids = df_final['subject_id'].unique()
 
-    # Sort subjects by their mean bin
-    sorted_subjects = subject_bins.sort_values().index
+    # Sort subjects by their mean insulin dose
+    sorted_subjects = subject_stats.sort_values('mean_dose')['subject_id'].values
     n_subjects = len(sorted_subjects)
 
     # Aim for 80%-10%-10% split
@@ -237,19 +238,73 @@ def split_data(df_final):
     val_size = int(0.1 * n_subjects)    # 10% for validation
     test_size = n_subjects - train_size - val_size  # 10% for test
 
-    # Distribute subjects across splits to balance distributions
+    # Force Subject 49 into the test set
+    test_subjects = [49] if 49 in sorted_subjects else []
+    remaining_subjects = [s for s in sorted_subjects if s != 49]
     train_subjects = []
     val_subjects = []
-    test_subjects = []
 
-    # Assign subjects in a round-robin fashion to balance bins
-    for i, subject in enumerate(sorted_subjects):
-        if i % 10 < 8:  # First 8 out of 10 go to train (80%)
+    # Initialize lists and track stats
+    train_subjects = []
+    val_subjects = []
+    test_subjects = [49] if 49 in sorted_subjects else []
+
+    # Assign subjects to minimize differences in means and stds
+    remaining_subjects_list = list(remaining_subjects)
+    np.random.shuffle(remaining_subjects_list)  # Shuffle to avoid bias in assignment order
+
+    for i, subject in enumerate(remaining_subjects_list):
+        # Compute current means and stds of each set
+        train_mean = df_final[df_final['subject_id'].isin(train_subjects)]['normal'].mean() if train_subjects else 0
+        val_mean = df_final[df_final['subject_id'].isin(val_subjects)]['normal'].mean() if val_subjects else 0
+        test_mean = df_final[df_final['subject_id'].isin(test_subjects)]['normal'].mean() if test_subjects else 0
+        train_std = df_final[df_final['subject_id'].isin(train_subjects)]['normal'].std() if train_subjects else 0
+        val_std = df_final[df_final['subject_id'].isin(val_subjects)]['normal'].std() if val_subjects else 0
+        test_std = df_final[df_final['subject_id'].isin(test_subjects)]['normal'].std() if test_subjects else 0
+
+        # Compute the stats if we add this subject to each set
+        train_temp = train_subjects + [subject]
+        val_temp = val_subjects + [subject]
+        test_temp = test_subjects + [subject]
+
+        train_mean_new = df_final[df_final['subject_id'].isin(train_temp)]['normal'].mean()
+        val_mean_new = df_final[df_final['subject_id'].isin(val_temp)]['normal'].mean()
+        test_mean_new = df_final[df_final['subject_id'].isin(test_temp)]['normal'].mean()
+        train_std_new = df_final[df_final['subject_id'].isin(train_temp)]['normal'].std()
+        val_std_new = df_final[df_final['subject_id'].isin(val_temp)]['normal'].std()
+        test_std_new = df_final[df_final['subject_id'].isin(test_temp)]['normal'].std()
+
+        # Compute the mean and std differences if we add to each set
+        means_if_train = [train_mean_new, val_mean, test_mean]
+        means_if_val = [train_mean, val_mean_new, test_mean]
+        means_if_test = [train_mean, val_mean, test_mean_new]
+        stds_if_train = [train_std_new, val_std, test_std]
+        stds_if_val = [train_std, val_std_new, test_std]
+        stds_if_test = [train_std, val_std, test_std_new]
+
+        # Compute the range of means and stds (max - min) for each option
+        range_means_if_train = max(means_if_train) - min(means_if_train) if all(m != 0 for m in means_if_train) else float('inf')
+        range_means_if_val = max(means_if_val) - min(means_if_val) if all(m != 0 for m in means_if_val) else float('inf')
+        range_means_if_test = max(means_if_test) - min(means_if_test) if all(m != 0 for m in means_if_test) else float('inf')
+        range_stds_if_train = max(stds_if_train) - min(stds_if_train) if all(s != 0 for s in stds_if_train) else float('inf')
+        range_stds_if_val = max(stds_if_val) - min(stds_if_val) if all(s != 0 for s in stds_if_val) else float('inf')
+        range_stds_if_test = max(stds_if_test) - min(stds_if_test) if all(s != 0 for s in stds_if_test) else float('inf')
+
+        # Combine mean and std differences (weighted equally)
+        score_if_train = range_means_if_train + range_stds_if_train
+        score_if_val = range_means_if_val + range_stds_if_val
+        score_if_test = range_means_if_test + range_stds_if_test
+
+        # Respect the target split sizes
+        if len(train_subjects) < train_size and score_if_train <= min(score_if_val, score_if_test):
             train_subjects.append(subject)
-        elif i % 10 == 8:  # 9th goes to val (10%)
+        elif len(val_subjects) < val_size and score_if_val <= min(score_if_train, score_if_test):
             val_subjects.append(subject)
-        else:  # 10th goes to test (10%)
+        elif len(test_subjects) < test_size:
             test_subjects.append(subject)
+        else:
+            # If sizes are exceeded, default to train
+            train_subjects.append(subject)
 
     # Create masks for splitting
     train_mask = df_final['subject_id'].isin(train_subjects)
@@ -346,18 +401,15 @@ def compute_metrics(y_true, y_pred, scaler_y):
     r2 = r2_score(y_true_denorm, y_pred_denorm)
     return mae, rmse, r2
 
-
-def plot_evaluation(y_test, y_pred_ppo, y_pred_sac, y_pred_td3, y_rule, subject_test, scaler_y):
+def plot_evaluation(y_test, y_pred_ppo, y_rule, subject_test, scaler_y):
     start_time = time.time()
     y_test_denorm = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
 
-    colors = {'PPO': 'green', 'SAC': 'blue', 'TD3': 'purple', 'Rules': 'orange'}
+    colors = {'PPO': 'green', 'Rules': 'orange'}
     offset = 1e-2
 
-    # 1. Predictions vs Real (Separate Density Scatter Plots)
-    plt.figure(figsize=(18, 5))
-
-    plt.subplot(1, 3, 1)
+    # 1. Predictions vs Real (Density Scatter Plot for PPO)
+    plt.figure(figsize=(8, 6))
     sns.kdeplot(x=y_test_denorm + offset, y=y_pred_ppo + offset, cmap="viridis", fill=True, levels=5, thresh=.05)
     plt.plot([offset, 15], [offset, 15], 'k--', label='Perfect Prediction')
     plt.xscale('log')
@@ -368,78 +420,43 @@ def plot_evaluation(y_test, y_pred_ppo, y_pred_sac, y_pred_td3, y_rule, subject_
     plt.ylabel('Predicted Dose (units)', fontsize=10)
     plt.title('PPO: Predictions vs Real (Density)', fontsize=12)
     plt.legend()
-
-    plt.subplot(1, 3, 2)
-    sns.kdeplot(x=y_test_denorm + offset, y=y_pred_sac + offset, cmap="viridis", fill=True, levels=5, thresh=.05)
-    plt.plot([offset, 15], [offset, 15], 'k--', label='Perfect Prediction')
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.xticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
-    plt.yticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
-    plt.xlabel('Real Dose (units)', fontsize=10)
-    plt.ylabel('Predicted Dose (units)', fontsize=10)
-    plt.title('SAC: Predictions vs Real (Density)', fontsize=12)
-    plt.legend()
-
-    plt.subplot(1, 3, 3)
-    sns.kdeplot(x=y_test_denorm + offset, y=y_pred_td3 + offset, cmap="viridis", fill=True, levels=5, thresh=.05)
-    plt.plot([offset, 15], [offset, 15], 'k--', label='Perfect Prediction')
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.xticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
-    plt.yticks([0.01, 0.1, 1, 10, 15], ['0.01', '0.1', '1', '10', '15'])
-    plt.xlabel('Real Dose (units)', fontsize=10)
-    plt.ylabel('Predicted Dose (units)', fontsize=10)
-    plt.title('TD3: Predictions vs Real (Density)', fontsize=12)
-    plt.legend()
-
-    plt.tight_layout()
     plt.show()
 
     # 2. Residual Distribution (KDE Plots)
-    plt.figure(figsize=(18, 5))
+    plt.figure(figsize=(10, 6))
     residuals_ppo = y_test_denorm - y_pred_ppo
-    residuals_sac = y_test_denorm - y_pred_sac
-    residuals_td3 = y_test_denorm - y_pred_td3
+    residuals_rule = y_test_denorm - y_rule
 
     sns.kdeplot(residuals_ppo, label='PPO', color=colors['PPO'], fill=True, alpha=0.3)
-    sns.kdeplot(residuals_sac, label='SAC', color=colors['SAC'], fill=True, alpha=0.3)
-    sns.kdeplot(residuals_td3, label='TD3', color=colors['TD3'], fill=True, alpha=0.3)
-    # sns.kdeplot(residuals_rule, label='Rules', color=colors['Rules'], fill=True, alpha=0.3)
+    sns.kdeplot(residuals_rule, label='Rules', color=colors['Rules'], fill=True, alpha=0.3)
     plt.xlabel('Residual (units)', fontsize=10)
     plt.ylabel('Density', fontsize=10)
     plt.title('Residual Distribution (KDE)', fontsize=12)
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.3)
-    plt.tight_layout()
     plt.show()
 
     # 3. MAE by Subject
-    plt.figure(figsize=(18, 5))
+    plt.figure(figsize=(10, 6))
     test_subjects = np.unique(subject_test)
-    mae_ppo, mae_sac, mae_td3 =[],[],[]
+    mae_ppo, mae_rule = [], []
     for sid in test_subjects:
         mask = subject_test == sid
         if np.sum(mask) > 0:
             mae_ppo.append(mean_absolute_error(y_test_denorm[mask], y_pred_ppo[mask]))
-            mae_sac.append(mean_absolute_error(y_test_denorm[mask], y_pred_sac[mask]))
-            mae_td3.append(mean_absolute_error(y_test_denorm[mask], y_pred_td3[mask]))
-            # mae_rule.append(mean_absolute_error(y_test_denorm[mask], y_rule[mask]))
+            mae_rule.append(mean_absolute_error(y_test_denorm[mask], y_rule[mask]))
 
-    bar_width = 0.2
+    bar_width = 0.35
     x = np.arange(len(test_subjects))
-    plt.bar(x - bar_width, mae_ppo, width=bar_width, label='PPO', color=colors['PPO'], alpha=0.8)
-    plt.bar(x, mae_sac, width=bar_width, label='SAC', color=colors['SAC'], alpha=0.8)
-    plt.bar(x + bar_width, mae_td3, width=bar_width, label='TD3', color=colors['TD3'], alpha=0.8)
-    # plt.bar(x + 1.5*bar_width, mae_rule, width=bar_width, label='Rules', color=colors['Rules'], alpha=0.8)
+    plt.bar(x - bar_width/2, mae_ppo, width=bar_width, label='PPO', color=colors['PPO'], alpha=0.8)
+    plt.bar(x + bar_width/2, mae_rule, width=bar_width, label='Rules', color=colors['Rules'], alpha=0.8)
     plt.xlabel('Subject', fontsize=10)
     plt.ylabel('MAE (units)', fontsize=10)
     plt.xticks(x, test_subjects, rotation=45, ha='right', fontsize=8)
-    plt.ylim(0, 0.5)
+    plt.ylim(0, 2.5)  # Adjusted to accommodate Rules MAE
     plt.title('MAE by Subject', fontsize=12)
     plt.legend(fontsize=8)
     plt.grid(True, axis='y', alpha=0.3)
-    plt.tight_layout()
     plt.show()
 
     elapsed_time = time.time() - start_time
@@ -476,7 +493,7 @@ class InsulinDoseEnv(gym.Env):
         true_dose = self.scaler_y.inverse_transform(self.y[self.current_step].reshape(-1, 1)).flatten()[0]
         predicted_dose = self.scaler_y.inverse_transform(action.reshape(-1, 1)).flatten()[0]
         error = predicted_dose - true_dose
-        weight = max(1.0, true_dose / 2.0)  # Increase weight for higher doses
+        weight = 1.0 + (true_dose / 3.0)  # Slightly more aggressive weighting
         reward = -min(abs(error), 2.0) * weight  # Apply weight to clipped absolute error
         reward = float(reward)
         done = True
@@ -537,9 +554,14 @@ callback = RewardCallback(val_env=val_env_ppo)
 check_env(train_env_ppo)
 
 # Initialize the PPO model
-model_ppo = PPO("MlpPolicy", train_env_ppo, verbose=1, learning_rate=3e-4, n_steps=2048, batch_size=64,
-                clip_range=0.15,  # Slightly increase clip range
-                ent_coef=0.005)   # Reduce entropy coefficient
+model_ppo = PPO("MlpPolicy", 
+                train_env_ppo, 
+                verbose=1, 
+                learning_rate=1e-4,  # Reduced learning rate
+                n_steps=2048, 
+                batch_size=64, 
+                clip_range=0.15, 
+                ent_coef=0.01)   # Reduce entropy coefficient
 # Train the model
 total_timesteps = 50000  # Adjust based on convergence
 model_ppo.learn(total_timesteps=total_timesteps, callback=callback)
@@ -673,7 +695,6 @@ plt.show()
 
 # %% CELL: Main Execution - Visualization
 # Visualize the results
-# plot_evaluation(y_test, y_pred_ppo, y_pred_sac, y_pred_td3, y_rule, subject_test, scaler_y)
 
 # %% CELL: Main Execution - Metrics per Subject
 # Analyze performance per subject
@@ -703,6 +724,8 @@ if 49 in np.unique(subject_test):
     plt.show()
 else:
     print("Subject 49 not found in test set")
+
+plot_evaluation(y_test, y_pred_ppo, y_rule, subject_test, scaler_y)
 
 # # %% CELL: Main Execution - Tune PPO Training (Optional)
 # # Test different timesteps to check convergence
