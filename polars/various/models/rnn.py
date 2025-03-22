@@ -2,13 +2,13 @@ import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, SimpleRNN, Dropout, BatchNormalization,
-    Concatenate, Bidirectional
+    Concatenate, Bidirectional, TimeDistributed, MaxPooling1D
 )
 from .config import RNN_CONFIG
 
 def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     """
-    Crea un modelo RNN (Recurrent Neural Network) con capas bidireccionales y skip connections.
+    Crea un modelo RNN optimizado para velocidad con procesamiento temporal distribuido.
     
     Parámetros:
     -----------
@@ -26,16 +26,25 @@ def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     cgm_input = Input(shape=cgm_shape[1:])
     other_input = Input(shape=(other_features_shape[1],))
     
-    # Capas RNN
-    x = cgm_input
-    skip_connections = []
+    # Procesamiento temporal distribuido inicial
+    if RNN_CONFIG['use_time_distributed']:
+        x = TimeDistributed(Dense(32, activation=RNN_CONFIG['activation']))(cgm_input)
+        x = TimeDistributed(BatchNormalization(epsilon=RNN_CONFIG['epsilon']))(x)
+    else:
+        x = cgm_input
     
+    # Reducir secuencia temporal para procesamiento más rápido
+    x = MaxPooling1D(pool_size=2)(x)
+    
+    # Capas RNN con menos unidades pero bidireccionales
     for units in RNN_CONFIG['hidden_units']:
         rnn_layer = SimpleRNN(
             units,
+            activation=RNN_CONFIG['activation'],
             dropout=RNN_CONFIG['dropout_rate'],
             recurrent_dropout=RNN_CONFIG['recurrent_dropout'],
-            return_sequences=True
+            return_sequences=True,
+            unroll=True  # Desenrollar para secuencias cortas
         )
         
         if RNN_CONFIG['bidirectional']:
@@ -43,14 +52,18 @@ def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
         else:
             x = rnn_layer(x)
             
-        x = BatchNormalization(epsilon=RNN_CONFIG['epsilon'])(x)
-        skip_connections.append(x)
+        x = BatchNormalization(
+            epsilon=RNN_CONFIG['epsilon'],
+            momentum=0.9  # Aumentar momentum para actualización más rápida
+        )(x)
     
     # Último RNN sin return_sequences
     final_rnn = SimpleRNN(
         RNN_CONFIG['hidden_units'][-1],
+        activation=RNN_CONFIG['activation'],
         dropout=RNN_CONFIG['dropout_rate'],
-        recurrent_dropout=RNN_CONFIG['recurrent_dropout']
+        recurrent_dropout=RNN_CONFIG['recurrent_dropout'],
+        unroll=True
     )
     
     if RNN_CONFIG['bidirectional']:
@@ -58,11 +71,11 @@ def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     else:
         x = final_rnn(x)
     
-    # Combinar con otras características
+    # Combinar características
     x = Concatenate()([x, other_input])
     
-    # Capas densas finales
-    x = Dense(64, activation='relu')(x)
+    # Reducir capas densas
+    x = Dense(32, activation=RNN_CONFIG['activation'])(x)
     x = BatchNormalization(epsilon=RNN_CONFIG['epsilon'])(x)
     x = Dropout(RNN_CONFIG['dropout_rate'])(x)
     

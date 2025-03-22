@@ -8,35 +8,62 @@ from .config import WAVENET_CONFIG
 
 class WaveNetBlock(tf.keras.layers.Layer):
     """
-    Bloque WaveNet personalizado.
+    Bloque WaveNet mejorado con activaciones gated y escalado adaptativo.
     """
     def __init__(self, filters, kernel_size, dilation_rate, dropout_rate, **kwargs):
         super().__init__(**kwargs)
         self.filters = filters
-        self.conv = Conv1D(
+        
+        # Gated convolutions
+        self.filter_conv = Conv1D(
             filters=filters,
             kernel_size=kernel_size,
             dilation_rate=dilation_rate,
             padding='causal'
         )
-        self.bn = BatchNormalization()
-        self.activation = Activation('relu')
+        self.gate_conv = Conv1D(
+            filters=filters,
+            kernel_size=kernel_size,
+            dilation_rate=dilation_rate,
+            padding='causal'
+        )
+        
+        # Normalization and regularization
+        self.filter_norm = BatchNormalization()
+        self.gate_norm = BatchNormalization()
         self.dropout = Dropout(dropout_rate)
-        self.add = Add()
+        
+        # Projections
         self.residual_proj = Conv1D(filters, 1, padding='same')
+        self.skip_proj = Conv1D(filters, 1, padding='same')
+        
+        # Scaling factors
+        self.residual_scale = WAVENET_CONFIG['use_residual_scale']
+        self.use_skip_scale = WAVENET_CONFIG['use_skip_scale']
 
-    def call(self, inputs):
-        x = self.conv(inputs)
-        x = self.bn(x)
-        x = self.activation(x)
-        x = self.dropout(x)
+    def call(self, inputs, training=None):
+        # Gated activation
+        filter_out = self.filter_conv(inputs)
+        gate_out = self.gate_conv(inputs)
         
-        # Ensure residual has same number of filters
+        filter_out = self.filter_norm(filter_out, training=training)
+        gate_out = self.gate_norm(gate_out, training=training)
+        
+        # tanh(filter) * sigmoid(gate)
+        gated_out = tf.nn.tanh(filter_out) * tf.nn.sigmoid(gate_out)
+        gated_out = self.dropout(gated_out, training=training)
+        
+        # Residual connection
         residual = self.residual_proj(inputs)
+        residual = residual[:, -gated_out.shape[1]:, :]
+        residual_out = (gated_out * self.residual_scale) + residual
         
-        # Match temporal dimension
-        residual = residual[:, -x.shape[1]:, :]
-        return self.add([x, residual])
+        # Skip connection
+        skip_out = self.skip_proj(gated_out)
+        if self.use_skip_scale:
+            skip_out = skip_out * tf.math.sqrt(self.residual_scale)
+        
+        return residual_out, skip_out
 
 def create_wavenet_block(x, filters, kernel_size, dilation_rate, dropout_rate):
     """
@@ -96,11 +123,13 @@ def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> Model
     cgm_input = Input(shape=cgm_shape[1:])
     other_input = Input(shape=(other_features_shape[1],))
     
+    # Proyección inicial
     x = Conv1D(WAVENET_CONFIG['filters'][0], 1, padding='same')(cgm_input)
-    current_filters = WAVENET_CONFIG['filters'][0]
     
+    # Saltar conexiones
     skip_outputs = []
     
+    # WaveNet stack
     for filters in WAVENET_CONFIG['filters']:
         for dilation in WAVENET_CONFIG['dilations']:
             wavenet_block = WaveNetBlock(
@@ -109,28 +138,33 @@ def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> Model
                 dilation_rate=dilation,
                 dropout_rate=WAVENET_CONFIG['dropout_rate']
             )
-            x = wavenet_block(x)
-            
-            # Project skip connection to match final filter size
-            skip_proj = Conv1D(WAVENET_CONFIG['filters'][-1], 1, padding='same')(x)
-            skip_outputs.append(skip_proj)
+            x, skip = wavenet_block(x)
+            skip_outputs.append(skip)
     
     # Combinar skip connections
     if skip_outputs:
         target_len = skip_outputs[-1].shape[1]
-        aligned_skips = [
-            skip[:, -target_len:, :] for skip in skip_outputs
-        ]
-        x = Add()(aligned_skips)
+        aligned_skips = [skip[:, -target_len:, :] for skip in skip_outputs]
+        x = Add()(aligned_skips) / tf.sqrt(float(len(skip_outputs)))
     
-    x = Activation('relu')(x)
+    # Post-procesamiento
+    x = Activation(WAVENET_CONFIG['activation'])(x)
+    x = Conv1D(WAVENET_CONFIG['filters'][-1], 1, padding='same')(x)
+    x = Activation(WAVENET_CONFIG['activation'])(x)
     x = GlobalAveragePooling1D()(x)
+    
+    # Combinación con otras features
     x = Concatenate()([x, other_input])
     
-    # Combinar con otras características
-    x = Dense(128, activation='relu')(x)
+    # Capas densas finales con residual connections
+    skip = x
+    x = Dense(128)(x)
     x = BatchNormalization()(x)
+    x = Activation(WAVENET_CONFIG['activation'])(x)
     x = Dropout(WAVENET_CONFIG['dropout_rate'])(x)
+    x = Dense(128)(x)
+    if skip.shape[-1] == 128:
+        x = Add()([x, skip])
     
     output = Dense(1)(x)
     
