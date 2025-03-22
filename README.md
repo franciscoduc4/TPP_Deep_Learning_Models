@@ -24,58 +24,63 @@ Este repositorio contiene la implementación de modelos de machine learning para
 - **Estabilidad por Sujeto**: Lograr que las métricas sean consistentes entre sujetos, con especial atención a reducir el MAE y mejorar el R² en casos problemáticos como el Sujeto 49 (MAE < 2.0, R² > 0.85).
 
 <details>
-  <summary>Resumen resultados con DRL (modelo PPO) (Marzo 21, 2025)</summary>
+  <summary>Resumen resultados con DRL (modelo PPO) (Marzo 22, 2025)</summary>
 
-  ### Resumen de Resultados
-  Se entrenó un modelo PPO para predecir dosis de insulina utilizando un entorno de aprendizaje por refuerzo. Los datos se dividieron en conjuntos de entrenamiento (35,968 muestras), validación (2,649 muestras) y prueba (6,034 muestras), con Subject 49 (dosis promedio 2.41) forzado en el conjunto de prueba.
+  Se entrenó un modelo PPO para predecir dosis de insulina utilizando un entorno de aprendizaje por refuerzo. Los datos se dividieron en conjuntos de entrenamiento (37,177 muestras), validación (2,971 muestras) y prueba (4,503 muestras), con Subject 49 (dosis promedio 2.41) forzado en el conjunto de prueba.
 
   #### Distribución de Datos
-  - **Entrenamiento**: Media = 1.31, Desv. Est. = 0.65
-  - **Validación**: Media = 0.96, Desv. Est. = 0.69
-  - **Prueba**: Media = 0.97, Desv. Est. = 0.68
-  - Las desviaciones estándar están bien balanceadas, pero las medias están desbalanceadas (diferencia de 0.35 entre Entrenamiento y Validación/Prueba), lo que probablemente contribuye a la subpredicción de dosis altas.
+  - **Entrenamiento**: Media = 1.23, Desv. Est. = 0.65
+  - **Validación**: Media = 1.31, Desv. Est. = 0.70
+  - **Prueba**: Media = 1.35, Desv. Est. = 0.75
+  - Las medias y desviaciones estándar están bien balanceadas (diferencias en medias < 0.12, diferencias en desv. est. < 0.10), una mejora respecto a divisiones anteriores. El conjunto de prueba incluye Subject 49 y refleja una mayor variabilidad (desv. est. 0.75), adecuada para evaluar dosis altas.
+  - La distribución de las dosis objetivo (gráfico) muestra picos similares en 0.5–1.0 unidades para los tres conjuntos, con colas que se extienden hasta 4.0 unidades, más pronunciadas en el conjunto de prueba debido a Subject 49.
+  - ![Distribución de Dosis de Insulina Objetivo](plots/dist_target_insulin_doses.png)
+
+  #### Dinámicas de Entrenamiento
+  - La recompensa de entrenamiento (azul) fluctúa entre -0.5 y -0.7 con alta varianza (picos hasta -3.0), indicando errores grandes en algunas muestras (probablemente dosis altas). La recompensa de validación (naranja) es más estable, oscilando entre -0.5 y -0.7, lo que sugiere un sobreajuste mínimo.
+  - ![PPO Training vs Validation Reward](plots/ppo_training_vs_val_reward.png)
 
   #### Rendimiento General
-  - **Entrenamiento**: MAE = 0.18, RMSE = 0.28, R² = 0.82
-  - **Validación**: MAE = 0.22, RMSE = 0.34, R² = 0.76
-  - **Prueba**: MAE = 0.21, RMSE = 0.30, R² = 0.81
-  - **MAE Validación Cruzada**: 0.16 ± 0.01
-  - El modelo muestra un sobreajuste mínimo (diferencia MAE Entrenamiento-Validación de 0.04) y mejora el rendimiento respecto a la ejecución anterior (MAE de prueba 0.21 vs. 0.23, RMSE de prueba 0.30 vs. 0.34).
+  - **Entrenamiento**: MAE = 0.18, RMSE = 0.27, R² = 0.82
+  - **Validación**: MAE = 0.24, RMSE = 0.35, R² = 0.76
+  - **Prueba**: MAE = 0.23, RMSE = 0.33, R² = 0.80
+  - **MAE Validación Cruzada**: 0.17 ± 0.02, confirmando una buena generalización con baja variabilidad entre pliegues.
+  - El modelo muestra un sobreajuste mínimo (diferencia MAE Entrenamiento-Validación de 0.06) y buena generalización (MAE de prueba 0.23, R² 0.80). El rendimiento es consistente con la ejecución anterior, con una ligera mejora en el RMSE de prueba (0.33 vs. 0.34).
 
   #### Rendimiento por Sujeto (Conjunto de Prueba)
-  - Sujeto 11: PPO MAE = 0.20, Reglas MAE = 0.93
-  - Sujeto 20: PPO MAE = 0.26, Reglas MAE = 1.21
-  - Sujeto 24: PPO MAE = 0.23, Reglas MAE = 0.51
-  - Sujeto 26: PPO MAE = 0.15, Reglas MAE = 1.22
-  - Sujeto 34: PPO MAE = 0.12, Reglas MAE = 1.01
-  - Sujeto 49: PPO MAE = 0.55, Reglas MAE = 2.41
-  - El modelo PPO supera significativamente al modelo basado en reglas para todos los sujetos. Para Subject 49 (dosis altas), el MAE mejoró de 0.67 a 0.55 con el nuevo peso de la recompensa (`weight = 1.0 + (true_dose / 3.0)`), pero sigue siendo más alto que en ejecuciones anteriores (0.22–0.30).
+  - Sujeto 11: PPO MAE = 0.22, Reglas MAE = 0.93
+  - Sujeto 17: PPO MAE = 0.20, Reglas MAE = 1.36
+  - Sujeto 31: PPO MAE = 0.32, Reglas MAE = 1.83
+  - Sujeto 35: PPO MAE = 0.13, Reglas MAE = 0.94
+  - Sujeto 49: PPO MAE = 0.59, Reglas MAE = 2.41
+  - Sujeto 52: PPO MAE = 0.31, Reglas MAE = 2.33
+  - El modelo PPO supera al modelo basado en reglas en todos los sujetos. Subject 49 (dosis altas) tiene el MAE más alto (0.59), ligeramente peor que la ejecución anterior (0.55). El gráfico de MAE por sujeto muestra la superioridad de PPO.
+  - ![MAE por Sujeto](plots/mae_by_subject.png)
 
   #### Análisis de Predicciones
-  - El modelo predice bien las dosis bajas (0–2 unidades), pero subpredice sistemáticamente las dosis altas (>2 unidades), especialmente para Subject 49, como se observa en los gráficos de dispersión y densidad.
-  - La alta varianza en la recompensa de entrenamiento (picos hasta -3.0) indica que la función de recompensa sigue siendo demasiado sensible para muestras de dosis altas.
+  - El gráfico de predicciones PPO vs. valores reales (conjunto de prueba) muestra una buena alineación para dosis bajas (0–2 unidades), pero una subpredicción sistemática para dosis altas (>2 unidades), probablemente afectando el rendimiento en sujetos como Subject 49.
+  - ![PPO Predicciones vs Valores Reales](plots/ppo_pred_vs_true_values.png)
+  - Para Subject 49, el gráfico de predicciones confirma la subpredicción (predicciones de 1.5–2.0 unidades para dosis reales de 2.5–3.0 unidades), consistente con el MAE de 0.59.
+  - ![PPO Predicciones vs Valores Reales (Subject 49)](plots/ppo_pred_subject_49.png)
+  - El gráfico de densidad (escala logarítmica) refuerza la subpredicción para dosis >1.0 unidad, con mayor densidad por debajo de la línea de predicción perfecta.
+  - ![PPO Predicciones vs Valores Reales (Densidad)](plots/ppo_pred_vs_real_density.png)
+  - La distribución de residuos (KDE) muestra que los errores de PPO están más concentrados alrededor de 0 que los del modelo basado en reglas, confirmando su mejor rendimiento general.
+  - ![Distribución de Residuos](plots/residual_dist.png)
 
   ### Conclusiones
-  - El modelo PPO muestra un buen rendimiento general (MAE de prueba 0.21) y mejora respecto a la ejecución anterior, gracias al ajuste en la función de recompensa.
-  - Sin embargo, persiste la subpredicción para dosis altas (Subject 49 MAE 0.55), probablemente debido al desbalance en las medias de los conjuntos de datos (Entrenamiento 1.31 vs. Prueba 0.97).
-  - La función de recompensa actual (`weight = 1.0 + (true_dose / 3.0)`) ha mejorado el rendimiento en dosis altas, pero la alta varianza en la recompensa de entrenamiento sugiere que aún necesita ajustes.
+  - El modelo PPO muestra un buen rendimiento general (MAE de prueba 0.23, R² 0.80) y supera consistentemente al modelo basado en reglas (MAE por sujeto 0.13–0.59 vs. 0.94–2.41).
+  - La división de datos mejorada (diferencias en medias < 0.12) ha equilibrado las distribuciones, pero no ha resuelto completamente la subpredicción para dosis altas, como se observa en Subject 49 (MAE 0.59, peor que 0.55 en la ejecución anterior).
+  - La alta varianza en la recompensa de entrenamiento (picos hasta -3.0) sugiere que la función de recompensa (`weight = 1.0 + (true_dose / 3.0)`) sigue siendo demasiado sensible para dosis altas, contribuyendo a la subpredicción.
 
   ### Próximos Pasos
-  1. **Balancear el Split de Datos**:
-     - Modificar la función `split_data` para priorizar el balance de las medias (e.g., `score_if_train = 2 * range_means_if_train + range_stds_if_train`).
-     - Asegurar que las medias de Entrenamiento, Validación y Prueba estén más alineadas (diferencias < 0.1).
-  2. **Ajustar la Función de Recompensa**:
-     - Probar un peso no lineal (e.g., `weight = 1.0 + np.log1p(true_dose)`) para enfocarse en dosis altas sin aumentar demasiado la varianza.
-  3. **Corregir la Subpredicción**:
-     - Reentrenar el modelo con un split balanceado y verificar si la subpredicción mejora.
-     - Si persiste, considerar agregar un término de sesgo para dosis altas o ajustar el espacio de acciones.
-  4. **Aumentar los Timesteps de Entrenamiento**:
+  1. **Ajustar la Función de Recompensa**:
+     - Probar un peso no lineal (e.g., `weight = 1.0 + np.log1p(true_dose)`) para enfocarse en dosis altas sin aumentar la varianza.
+  2. **Corregir la Subpredicción**:
+     - Considerar agregar un término de sesgo para dosis altas o ajustar el espacio de acciones para permitir predicciones más grandes.
+  3. **Aumentar los Timesteps de Entrenamiento**:
      - Incrementar los timesteps a 200,000 para permitir una mayor convergencia, especialmente para dosis altas.
-  5. **Proporcionar Salidas Faltantes**:
-     - Compartir el gráfico de distribución de residuos y el gráfico de MAE por sujeto para confirmar la subpredicción.
-     - Calcular y compartir las métricas del modelo basado en reglas (MAE, RMSE, R²).
-  6. **Evaluar en un Conjunto de Prueba Balanceado**:
-     - Asegurar que el conjunto de prueba incluya una mezcla de sujetos con dosis bajas, medias y altas para una evaluación más completa.
+  4. **Evaluar en un Conjunto de Prueba Más Diverso**:
+     - Incluir más sujetos con dosis altas en el conjunto de prueba para una evaluación más robusta del rendimiento en este rango.
 
 </details>
 
