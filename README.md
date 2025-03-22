@@ -24,7 +24,7 @@ Este repositorio contiene la implementación de modelos de machine learning para
 - **Estabilidad por Sujeto**: Lograr que las métricas sean consistentes entre sujetos, con especial atención a reducir el MAE y mejorar el R² en casos problemáticos como el Sujeto 49 (MAE < 2.0, R² > 0.85).
 
 <details>
-  <summary>Resumen resultados con DRL (modelo PPO) (Marzo 22, 2025)</summary>
+  <summary>Resumen resultados con DRL (modelo PPO) (Marzo 21, 2025)</summary>
 
   Se entrenó un modelo PPO para predecir dosis de insulina utilizando un entorno de aprendizaje por refuerzo. Los datos se dividieron en conjuntos de entrenamiento (37,177 muestras), validación (2,971 muestras) y prueba (4,503 muestras), con Subject 49 (dosis promedio 2.41) forzado en el conjunto de prueba.
 
@@ -55,13 +55,13 @@ Este repositorio contiene la implementación de modelos de machine learning para
   - Sujeto 49: PPO MAE = 0.59, Reglas MAE = 2.41
   - Sujeto 52: PPO MAE = 0.31, Reglas MAE = 2.33
   - El modelo PPO supera al modelo basado en reglas en todos los sujetos. Subject 49 (dosis altas) tiene el MAE más alto (0.59), ligeramente peor que la ejecución anterior (0.55). El gráfico de MAE por sujeto muestra la superioridad de PPO.
-  - ![MAE por Sujeto](plots/mae_by_subject.png)
+  - ![MAE por Sujeto](plots\mae_by_subject.png)
 
   #### Análisis de Predicciones
   - El gráfico de predicciones PPO vs. valores reales (conjunto de prueba) muestra una buena alineación para dosis bajas (0–2 unidades), pero una subpredicción sistemática para dosis altas (>2 unidades), probablemente afectando el rendimiento en sujetos como Subject 49.
   - ![PPO Predicciones vs Valores Reales](plots/ppo_pred_vs_true_values.png)
   - Para Subject 49, el gráfico de predicciones confirma la subpredicción (predicciones de 1.5–2.0 unidades para dosis reales de 2.5–3.0 unidades), consistente con el MAE de 0.59.
-  - ![PPO Predicciones vs Valores Reales (Subject 49)](plots/ppo_pred_subject_49.png)
+  - ![PPO Predicciones vs Valores Reales (Subject 49)](plots\ppo_pred_subject_49.png)
   - El gráfico de densidad (escala logarítmica) refuerza la subpredicción para dosis >1.0 unidad, con mayor densidad por debajo de la línea de predicción perfecta.
   - ![PPO Predicciones vs Valores Reales (Densidad)](plots/ppo_pred_vs_real_density.png)
   - La distribución de residuos (KDE) muestra que los errores de PPO están más concentrados alrededor de 0 que los del modelo basado en reglas, confirmando su mejor rendimiento general.
