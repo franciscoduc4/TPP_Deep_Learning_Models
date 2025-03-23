@@ -4,3 +4,6 @@ manifest
 /subjects
 /subjects/*
 df_final
+*.zip
+df_final.csv
+data/*
