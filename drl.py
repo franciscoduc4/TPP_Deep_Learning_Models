@@ -211,6 +211,8 @@ def preprocess_data(subject_folder):
     elapsed_time = time.time() - start_time
     print(f"Preprocesamiento completo en {elapsed_time:.2f} segundos")
     return df_final
+
+
 def split_data(df_final):
     """
     Divide los datos en conjuntos de entrenamiento, validación y prueba, asegurando distribuciones similares.
