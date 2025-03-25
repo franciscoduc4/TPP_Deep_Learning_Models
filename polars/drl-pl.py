@@ -223,16 +223,16 @@ def preprocess_data(subject_folder):
 
     # Aplicar transformaciones logarítmicas
     df_final = df_final.with_columns([
-        pl.col('normal').map_elements(lambda x: np.log1p(x)).alias('normal'),
-        pl.col('carbInput').map_elements(lambda x: np.log1p(x)).alias('carbInput'),
-        pl.col('insulinOnBoard').map_elements(lambda x: np.log1p(x)).alias('insulinOnBoard'),
-        pl.col('bgInput').map_elements(lambda x: np.log1p(x)).alias('bgInput')
+        pl.col('normal').log1p().alias('normal'),
+        pl.col('carbInput').log1p().alias('carbInput'),
+        pl.col('insulinOnBoard').log1p().alias('insulinOnBoard'),
+        pl.col('bgInput').log1p().alias('bgInput')
     ])
-    
+
     # Aplicar transformación logarítmica a las columnas CGM
     for col in [f'cgm_{i}' for i in range(24)]:
         df_final = df_final.with_columns(
-            pl.col(col).map_elements(lambda x: np.log1p(x)).alias(col)
+            pl.col(col).log1p().alias(col)
         )
     
     # Eliminar filas con valores nulos
