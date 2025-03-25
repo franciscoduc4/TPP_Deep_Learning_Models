@@ -66,7 +66,7 @@ Este repositorio contiene la implementación de modelos de machine learning para
   - El gráfico de predicciones PPO vs. valores reales (conjunto de prueba) muestra una buena alineación para dosis bajas (0–2 unidades), pero una subpredicción sistemática para dosis altas (>2 unidades), probablemente afectando el rendimiento en sujetos como Subject 49.
   - ![PPO Predicciones vs Valores Reales](plots/ppo_pred_vs_true_values.png)
   - Para Subject 49, el gráfico de predicciones confirma la subpredicción (predicciones de 1.5–2.0 unidades para dosis reales de 2.5–3.0 unidades), consistente con el MAE de 0.59.
-  - ![PPO Predicciones vs Valores Reales (Subject 49)](plots/ppo_pred_subject_49.png)
+  - ![PPO Predicciones vs Valores Reales (Subject 49)](plots/ppo_vs_true_values_49.png)
   - El gráfico de densidad (escala logarítmica) refuerza la subpredicción para dosis >1.0 unidad, con mayor densidad por debajo de la línea de predicción perfecta.
   - ![PPO Predicciones vs Valores Reales (Densidad)](plots/ppo_pred_vs_real_density.png)
   - La distribución de residuos (KDE) muestra que los errores de PPO están más concentrados alrededor de 0 que los del modelo basado en reglas, confirmando su mejor rendimiento general.
