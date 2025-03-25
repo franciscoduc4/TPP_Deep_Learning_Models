@@ -20,7 +20,8 @@ import matplotlib.pyplot as plt
 
 # %%
 # Los sujetos están en la raíz y cada archivo comienza con "Subject"
-subject_files = [f for f in os.listdir() if os.path.isfile(f) and f.startswith("Subject")]
+subject_folder = os.path.join(os.getcwd(), "data", "Subjects")
+subject_files = [f for f in os.listdir(subject_folder) if f.startswith("Subject") and f.endswith(".xlsx")]
 print(f"Total de sujetos: {len(subject_files)}")
 
 # %%
@@ -94,9 +95,12 @@ def process_subject(subject_path, idx):
     return processed_data
 
 # Ejecución en paralelo
-subject_folder = os.getcwd()  # Carpeta raíz
-all_processed_data = Parallel(n_jobs=-1)(delayed(process_subject)(os.path.join(subject_folder, f), idx) 
-                                        for idx, f in enumerate(subject_files))
+all_processed_data = Parallel(n_jobs=-1)(
+    delayed(process_subject)(
+        os.path.join(subject_folder, f), 
+        idx
+    ) for idx, f in enumerate(subject_files)
+)
 
 # Aplanar la lista de listas
 all_processed_data = [item for sublist in all_processed_data for item in sublist]
@@ -243,6 +247,7 @@ def rule_based_prediction(X, target_bg=100):
     bg_input = scaler_other.inverse_transform(X[:, 24:27])[:, 1]
     icr = X[:, 27]
     isf = X[:, 28]
+    print(f"carb_input: {carb_input}, bg_input: {bg_input}, icr: {icr}, isf: {isf}")
     return carb_input / icr + (bg_input - target_bg) / isf
 
 y_rule = rule_based_prediction(X_test)
