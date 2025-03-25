@@ -1,3 +1,8 @@
+<div align="center">
+  <img src="images\logo-fiuba.png" alt="Logo FIUBA" width="600"/>
+</div>
+
+
 # Deep Learning Models
 
 ## Predicción de Dosis de Insulina Bolus con Modelos de Machine Learning
