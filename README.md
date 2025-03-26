@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="images\logo-fiuba.png" alt="Logo FIUBA" width="600"/>
+  <img src="images\logo-fiuba.png" alt="Logo FIUBA" width="800"/>
 </div>
 
 
