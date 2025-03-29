@@ -1032,58 +1032,124 @@ try
         CSV.write(csvFile, dfFinal)
         println("Saved to $csvFile")
     end
-
-    # Split data
-    global XCgmTrain, XCgmVal, XCgmTest,
-           XOtherTrain, XOtherVal, XOtherTest,
-           XSubjectTrain, XSubjectVal, XSubjectTest,
-           yTrain, yVal, yTest, subjectTest,
-           scalerCgm, scalerOther, scalerY = splitData(dfFinal)
-
-    # %% CELL: Main Execution - MLP Training
-    
-    # Definir arquitectura del modelo
-    inputDim = 24 * 1 + size(XOtherTrain, 2)  # CGM (flattened) + other features
-    layerSizes = [inputDim, 64, 32, 16, 1]
-    println("Arquitectura del modelo: $layerSizes")
-    
-    # Inicializar y entrenar modelo
-    global mlpModel = MLPModel(layerSizes, relu, learningRate=1e-3)
-    trainLosses, valLosses, bestEpoch = train!(
-        mlpModel,
-        XCgmTrain, XOtherTrain, yTrain,
-        XCgmVal, XOtherVal, yVal,
-        batchSize=CONFIG["batchSize"],
-        epochs=200,
-        patience=20
-    )
-    
-    # Visualizar curvas de aprendizaje
-    plotLearningCurves(trainLosses, valLosses, bestEpoch)
-    
-    # Generar predicciones desnormalizadas para todos los conjuntos
-    global yPredJuliaTrain = generateDenormalizedPredictions(mlpModel, XCgmTrain, XOtherTrain, scalerY)
-    global yPredJuliaVal = generateDenormalizedPredictions(mlpModel, XCgmVal, XOtherVal, scalerY)
-    global yPredJuliaTest = generateDenormalizedPredictions(mlpModel, XCgmTest, XOtherTest, scalerY)
-    
-    # Generar predicciones basadas en reglas para comparación
-    global yRule = ruleBasedPrediction(XOtherTest, scalerOther, scalerY)
-    
-    # %% CELL: Main Execution - Print Metrics
-    # Métricas para MLP de Julia
-    maeJulia = mean_absolute_error(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yPredJuliaTest)
-    rmseJulia = sqrt(mean_squared_error(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yPredJuliaTest))
-    r2Julia = r2_score(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yPredJuliaTest)
-    println("Julia MLP Test - MAE: $(round(maeJulia, digits=2)), RMSE: $(round(rmseJulia, digits=2)), R²: $(round(r2Julia, digits=2))")
-    
-    # Métricas para el modelo basado en reglas
-    maeRule = mean_absolute_error(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yRule)
-    rmseRule = sqrt(mean_squared_error(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yRule))
-    r2Rule = r2_score(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yRule)
-    println("Rules Test - MAE: $(round(maeRule, digits=2)), RMSE: $(round(rmseRule, digits=2)), R²: $(round(r2Rule, digits=2))")
-    
-    # Visualizar los resultados
-    plotEvaluation(yTest, yPredJuliaTest, yRule, subjectTest, scalerY)
 catch e
     @error "Error executing code" exception=(e, catch_backtrace())
+end
+
+# Split data
+global XCgmTrain, XCgmVal, XCgmTest,
+        XOtherTrain, XOtherVal, XOtherTest,
+        XSubjectTrain, XSubjectVal, XSubjectTest,
+        yTrain, yVal, yTest, subjectTest,
+        scalerCgm, scalerOther, scalerY = splitData(dfFinal)
+
+# %% CELL: Main Execution - MLP Training
+
+# Definir arquitectura del modelo
+inputDim = 24 * 1 + size(XOtherTrain, 2)  # CGM (flattened) + other features
+layerSizes = [inputDim, 64, 32, 16, 1]
+println("Arquitectura del modelo: $layerSizes")
+
+# Inicializar y entrenar modelo
+global mlpModel = MLPModel(layerSizes, relu, learningRate=1e-3)
+trainLosses, valLosses, bestEpoch = train!(
+    mlpModel,
+    XCgmTrain, XOtherTrain, yTrain,
+    XCgmVal, XOtherVal, yVal,
+    batchSize=CONFIG["batchSize"],
+    epochs=200,
+    patience=20
+)
+
+# Visualizar curvas de aprendizaje
+plotLearningCurves(trainLosses, valLosses, bestEpoch)
+
+# Generar predicciones desnormalizadas para todos los conjuntos
+global yPredJuliaTrain = generateDenormalizedPredictions(mlpModel, XCgmTrain, XOtherTrain, scalerY)
+global yPredJuliaVal = generateDenormalizedPredictions(mlpModel, XCgmVal, XOtherVal, scalerY)
+global yPredJuliaTest = generateDenormalizedPredictions(mlpModel, XCgmTest, XOtherTest, scalerY)
+
+# Generar predicciones basadas en reglas para comparación
+global yRule = ruleBasedPrediction(XOtherTest, scalerOther, scalerY)
+
+# %% CELL: Main Execution - Print Metrics
+# Métricas para MLP de Julia
+maeJulia = mean_absolute_error(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yPredJuliaTest)
+rmseJulia = sqrt(mean_squared_error(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yPredJuliaTest))
+r2Julia = r2_score(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yPredJuliaTest)
+println("Julia MLP Test - MAE: $(round(maeJulia, digits=2)), RMSE: $(round(rmseJulia, digits=2)), R²: $(round(r2Julia, digits=2))")
+
+# Métricas para el modelo basado en reglas
+maeRule = mean_absolute_error(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yRule)
+rmseRule = sqrt(mean_squared_error(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yRule))
+r2Rule = r2_score(ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1)), yRule)
+println("Rules Test - MAE: $(round(maeRule, digits=2)), RMSE: $(round(rmseRule, digits=2)), R²: $(round(r2Rule, digits=2))")
+
+# Visualizar los resultados
+plotEvaluation(yTest, yPredJuliaTest, yRule, subjectTest, scalerY)
+
+# %% CELL: Main Execution - Tune Julia MLP Training (Optional)
+# Test different learning rates and architectures
+learningRates = [1e-3, 7e-4, 5e-4, 3e-4, 1e-4]
+architectures = [
+    [inputDim, 64, 32, 16, 1],
+    [inputDim, 128, 64, 32, 1]
+]
+
+results = []
+for lr in learningRates
+    for arch in architectures
+        println("\nTraining Julia MLP with learning rate $lr and architecture $arch:")
+        
+        # Initialize model with current architecture
+        modelTune = MLPModel(arch, relu, learningRate=lr)
+        
+        # Train model with current learning rate
+        trainLosses, valLosses, bestEpoch = train!(
+            modelTune,
+            XCgmTrain, XOtherTrain, yTrain,
+            XCgmVal, XOtherVal, yVal,
+            batchSize=CONFIG["batchSize"],
+            epochs=2048,
+            patience=10
+        )
+        
+        # Generate predictions on test set
+        yPredTestTune = generateDenormalizedPredictions(modelTune, XCgmTest, XOtherTest, scalerY)
+        
+        # Calculate metrics
+        yTestDenorm = ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1))
+        maeTune = mean_absolute_error(yTestDenorm, yPredTestTune)
+        rmseTune = sqrt(mean_squared_error(yTestDenorm, yPredTestTune))
+        r2Tune = r2_score(yTestDenorm, yPredTestTune)
+        
+        println("Julia MLP Test (LR: $lr, Arch: $arch) - MAE: $(round(maeTune, digits=2)), RMSE: $(round(rmseTune, digits=2)), R²: $(round(r2Tune, digits=2))")
+        
+        # Plot learning curves
+        p = plot(trainLosses, label="Train Loss (LR: $lr)")
+        plot!(p, valLosses, label="Val Loss (LR: $lr)")
+        xlabel!(p, "Epoch")
+        ylabel!(p, "Loss (MSE)")
+        title!(p, "Julia MLP Learning Curves (LR: $lr, Architecture: $arch)")
+        display(p)
+        
+        # Store results
+        push!(results, Dict(
+            "learningRate" => lr,
+            "architecture" => arch,
+            "mae" => maeTune,
+            "rmse" => rmseTune,
+            "r2" => r2Tune,
+            "bestEpoch" => bestEpoch
+        ))
+    end
+end
+
+# Print summary of all results
+println("\nSummary of all Julia MLP Tuning Results:")
+sortedResults = sort(results, by=x -> x["mae"])
+for result in sortedResults
+    println("LR: $(result["learningRate"]), Architecture: $(result["architecture"]), " *
+            "MAE: $(round(result["mae"], digits=2)), RMSE: $(round(result["rmse"], digits=2)), " *
+            "R²: $(round(result["r2"], digits=2)), Best Epoch: $(result["bestEpoch"])")
 end

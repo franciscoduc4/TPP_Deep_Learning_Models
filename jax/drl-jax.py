@@ -218,16 +218,16 @@ def preprocess_data(subject_folder):
 
     # Aplicar transformaciones logarítmicas
     df_final = df_final.with_columns([
-        pl.col('normal').map_elements(lambda x: np.log1p(x)).alias('normal'),
-        pl.col('carbInput').map_elements(lambda x: np.log1p(x)).alias('carbInput'),
-        pl.col('insulinOnBoard').map_elements(lambda x: np.log1p(x)).alias('insulinOnBoard'),
-        pl.col('bgInput').map_elements(lambda x: np.log1p(x)).alias('bgInput')
+        pl.col('normal').log1p().alias('normal'),
+        pl.col('carbInput').log1p().alias('carbInput'),
+        pl.col('insulinOnBoard').log1p().alias('insulinOnBoard'),
+        pl.col('bgInput').log1p().alias('bgInput')
     ])
-    
+
     # Aplicar transformación logarítmica a las columnas CGM
     for col in [f'cgm_{i}' for i in range(24)]:
         df_final = df_final.with_columns(
-            pl.col(col).map_elements(lambda x: np.log1p(x)).alias(col)
+            pl.col(col).log1p().alias(col)
         )
     
     df_final = df_final.drop_nulls()
@@ -1030,3 +1030,67 @@ if 49 in np.unique(subject_test):
     plt.show()
 else:
     print("Subject 49 not found in test set")
+    
+# %% CELL: Main Execution - Tune JAX MLP Training (Optional)
+# Test different learning rates and architectures
+learning_rates = [1e-3, 5e-4, 1e-4]
+architectures = [
+    [input_dim, 64, 32, 16, 1],
+    [input_dim, 128, 64, 32, 1]
+]
+
+results = []
+for lr in learning_rates:
+    for arch in architectures:
+        print(f"\nTraining JAX MLP with learning rate {lr} and architecture {arch}:")
+        
+        # Initialize model with current architecture
+        model_tune = MLPModel(arch, activation=jax.nn.relu, key=random.PRNGKey(int(time.time()) % 10000))
+        
+        # Train model with current learning rate
+        train_losses, val_losses, best_epoch = model_tune.train(
+            X_cgm_train, X_other_train, y_train,
+            X_cgm_val, X_other_val, y_val,
+            batch_size=CONFIG["batch_size"],
+            learning_rate=lr,
+            epochs=100,  # Reduced for speed
+            patience=10
+        )
+        
+        # Generate predictions on test set
+        y_pred_jax_test_tune = generate_denormalized_predictions(model_tune, X_cgm_test, X_other_test, scaler_y)
+        
+        # Calculate metrics
+        mae_tune = mean_absolute_error(scaler_y.inverse_transform(np.array(y_test).reshape(-1, 1)), y_pred_jax_test_tune)
+        rmse_tune = np.sqrt(mean_squared_error(scaler_y.inverse_transform(np.array(y_test).reshape(-1, 1)), y_pred_jax_test_tune))
+        r2_tune = r2_score(scaler_y.inverse_transform(np.array(y_test).reshape(-1, 1)), y_pred_jax_test_tune)
+        
+        print(f"JAX MLP Test (LR: {lr}, Arch: {arch}) - MAE: {mae_tune:.2f}, RMSE: {rmse_tune:.2f}, R²: {r2_tune:.2f}")
+        
+        # Plot learning curves
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_losses, label=f'Train Loss (LR: {lr})')
+        plt.plot(val_losses, label=f'Val Loss (LR: {lr})')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (MSE)')
+        plt.legend()
+        plt.title(f'JAX MLP Learning Curves (LR: {lr}, Architecture: {arch})')
+        plt.grid(True, alpha=0.3)
+        plt.show()
+        
+        # Store results
+        results.append({
+            'learning_rate': lr,
+            'architecture': arch,
+            'mae': mae_tune,
+            'rmse': rmse_tune,
+            'r2': r2_tune,
+            'best_epoch': best_epoch
+        })
+
+# Print summary of all results
+print("\nSummary of all JAX MLP Tuning Results:")
+for result in sorted(results, key=lambda x: x['mae']):
+    print(f"LR: {result['learning_rate']}, Architecture: {result['architecture']}, "
+          f"MAE: {result['mae']:.2f}, RMSE: {result['rmse']:.2f}, R²: {result['r2']:.2f}, "
+          f"Best Epoch: {result['best_epoch']}")
