@@ -211,6 +211,8 @@ def preprocess_data(subject_folder):
     elapsed_time = time.time() - start_time
     print(f"Preprocesamiento completo en {elapsed_time:.2f} segundos")
     return df_final
+
+
 def split_data(df_final):
     """
     Divide los datos en conjuntos de entrenamiento, validación y prueba, asegurando distribuciones similares.
@@ -530,19 +532,103 @@ class RewardCallback(BaseCallback):
         return total_reward / 10
     
 # %% CELL: Main Execution - Preprocess Data
-# df_final = preprocess_data(CONFIG["data_path"])
-# #Save the df_final in a csv
-# df_final.to_csv('df_final.csv', index=False)
+df_final = preprocess_data(CONFIG["data_path"])
+#Save the df_final in a csv
+df_final.to_csv('df_final.csv', index=False)
 
 # %%
 #Load the csv
-df_final = pd.read_csv('df_final.csv')
+# df_final = pd.read_csv('df_final.csv')
 
 (X_cgm_train, X_cgm_val, X_cgm_test,
  X_other_train, X_other_val, X_other_test,
  X_subject_train, X_subject_val, X_subject_test,
  y_train, y_val, y_test, subject_test,
  scaler_cgm, scaler_other, scaler_y) = split_data(df_final)
+
+# %% CELL: EDA - Distribución de Dosis
+# Análisis de distribución de dosis
+# Análisis de distribución de dosis
+plt.figure(figsize=(12, 6))
+dosis = scaler_y.inverse_transform(df_final['normal'].values.reshape(-1, 1))
+
+# Histograma con KDE
+sns.histplot(dosis, bins=50, kde=True, color='skyblue')
+plt.title('Distribución de Dosis de Insulina', fontsize=14)
+plt.xlabel('Dosis (unidades)', fontsize=12)
+plt.ylabel('Frecuencia', fontsize=12)
+plt.grid(alpha=0.3)
+
+# Análisis de percentiles
+percentiles = [50, 75, 90, 95, 99, 99.9]
+perc_values = np.percentile(dosis, percentiles)
+for p, v in zip(percentiles, perc_values):
+    plt.axvline(v, color='red', linestyle='--', alpha=0.7)
+    plt.text(v+0.1, plt.ylim()[1]*0.9, f'{p}%: {v:.2f}u', rotation=90)
+
+plt.show()
+
+# Boxplot detallado
+plt.figure(figsize=(10, 6))
+sns.boxplot(x=dosis.flatten(), color='lightgreen', whis=1.5)
+plt.title('Diagrama de Caja de Dosis de Insulina', fontsize=14)
+plt.xlabel('Dosis (unidades)', fontsize=12)
+plt.grid(axis='x', alpha=0.3)
+plt.show()
+
+# Estadísticas descriptivas
+print("Estadísticas descriptivas de las dosis:")
+print(pd.DataFrame(dosis, columns=['Dosis']).describe(percentiles=[.25, .5, .75, .9, .95, .99]))
+# %% CELL: Definición de Umbrales
+# Análisis de densidad de probabilidad
+plt.figure(figsize=(10, 6))
+sns.kdeplot(dosis.flatten(), fill=True, color='purple')
+plt.title('Densidad de Probabilidad de las Dosis', fontsize=14)
+plt.xlabel('Dosis (unidades)', fontsize=12)
+plt.ylabel('Densidad', fontsize=12)
+
+# Criterios clínicos y estadísticos
+umbral_clinico = 7.0  # Basado en guías clínicas para dosis estándar
+umbral_estadistico = np.percentile(dosis, 95)  # Percentil 95
+
+plt.axvline(umbral_clinico, color='green', linestyle='--', label='Umbral Clínico')
+plt.axvline(umbral_estadistico, color='red', linestyle='--', label='Percentil 95%')
+plt.legend()
+plt.show()
+
+print(f"\nRecomendación de umbrales:")
+print(f"- Dosis bajas: < {umbral_clinico:.2f} unidades")
+print(f"- Dosis altas: ≥ {umbral_estadistico:.2f} unidades")
+
+# %% CELL: Análisis de Outliers
+# Identificación de outliers
+outliers_mask = (dosis >= umbral_estadistico).flatten()
+df_outliers = df_final[outliers_mask]
+
+# Visualización multivariada
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+features = ['carbInput', 'bgInput', 'hour_of_day', 'insulinOnBoard']
+
+for ax, feat in zip(axes.flatten(), features):
+    sns.scatterplot(data=df_final, x=feat, y='normal', 
+                    hue=outliers_mask, palette={True: 'blue', False: 'red'}, 
+                    alpha=0.6, ax=ax)
+    ax.set_title(f'Dosis vs {feat}', fontsize=12)
+    ax.set_ylabel('Dosis (normalizada)')
+plt.tight_layout()
+plt.show()
+
+# Análisis temporal
+df_final['hour'] = df_final['hour_of_day'] * 23
+plt.figure(figsize=(12, 6))
+sns.boxplot(x=df_final['hour'].astype(int), y=df_final['normal'], 
+            hue=outliers_mask, palette={True: 'blue', False: 'red'})
+plt.title('Distribución de Dosis por Hora del Día', fontsize=14)
+plt.xlabel('Hora del día', fontsize=12)
+plt.ylabel('Dosis (normalizada)', fontsize=12)
+plt.legend(title='Outlier', labels=['No', 'Sí'], labelcolor=['red', 'blue'])
+plt.show()
+
 
 # %% CELL: Main Execution - DRL (PPO) Training
 # Create the training and validation environments
@@ -575,8 +661,6 @@ plt.legend()
 plt.title('PPO Training vs Validation Reward')
 plt.show()
 
-# Save the model (optional)
-model_ppo.save("ppo_insulin_dose")
 
 # Function to generate predictions with PPO
 def predict_with_ppo(model, X_cgm, X_other):
@@ -598,10 +682,52 @@ def predict_with_ppo(model, X_cgm, X_other):
 y_pred_ppo_train = predict_with_ppo(model_ppo, X_cgm_train, X_other_train)
 y_pred_ppo_val = predict_with_ppo(model_ppo, X_cgm_val, X_other_val)
 y_pred_ppo = predict_with_ppo(model_ppo, X_cgm_test, X_other_test)
-
-
 # Generate rule-based predictions for comparison
 y_rule = rule_based_prediction(X_other_test, scaler_other, scaler_y)
+
+
+# %% CELL: Evaluación de Impacto de Outliers
+def train_without_outliers(umbral):
+    # Filtrar datos
+    mask = (dosis < umbral).flatten()
+    df_filtered = df_final[mask]
+    
+    # Reprocesar datos
+    X_cgm_train, X_cgm_val, X_cgm_test, X_other_train, X_other_val, X_other_test, _, _, _, y_train, y_val, y_test, _, _, _, _ = split_data(df_filtered)
+    
+    # Entrenar modelo
+    train_env = InsulinDoseEnv(X_cgm_train, X_other_train, y_train, scaler_y)
+    model = PPO("MlpPolicy", train_env, verbose=0, 
+                learning_rate=1e-4, n_steps=2048, batch_size=64)
+    model.learn(total_timesteps=30000)
+    
+    # Evaluar
+    y_pred = predict_with_ppo(model, X_cgm_test, X_other_test)
+    mae = mean_absolute_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred)
+    return mae
+
+# Experimentación controlada
+mae_original = mean_absolute_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo)
+mae_filtered = train_without_outliers(umbral_estadistico)
+
+print("\nResultados de exclusión de outliers:")
+print(f"- MAE con todos los datos: {mae_original:.2f}")
+print(f"- MAE sin outliers: {mae_filtered:.2f}")
+print(f"- Mejora relativa: {(mae_original - mae_filtered)/mae_original:.1%}")
+
+# Análisis de sensibilidad
+umbrales_prueba = [5, 7, 9, 11]
+results = []
+for u in umbrales_prueba:
+    results.append(train_without_outliers(u))
+    
+plt.figure(figsize=(10, 6))
+plt.plot(umbrales_prueba, results, marker='o')
+plt.title('Sensibilidad del MAE al Umbral de Exclusión', fontsize=14)
+plt.xlabel('Umbral de Exclusión (unidades)', fontsize=12)
+plt.ylabel('MAE en Test', fontsize=12)
+plt.grid(alpha=0.3)
+plt.show()
 
 # %% CELL: Main Execution - Print Metrics
 # Metrics for PPO
@@ -726,27 +852,5 @@ else:
     print("Subject 49 not found in test set")
 
 plot_evaluation(y_test, y_pred_ppo, y_rule, subject_test, scaler_y)
-
-# # %% CELL: Main Execution - Tune PPO Training (Optional)
-# # Test different timesteps to check convergence
-# for timesteps in [50000, 200000]:
-#     print(f"\nTraining PPO with {timesteps} timesteps:")
-#     model_ppo_tune = PPO("MlpPolicy", train_env_ppo, verbose=1, learning_rate=3e-4, n_steps=2048, batch_size=64)
-#     callback_tune = RewardCallback(val_env=val_env_ppo)
-#     model_ppo_tune.learn(total_timesteps=timesteps, callback=callback_tune)
-    
-#     y_pred_ppo_test_tune = predict_with_ppo(model_ppo_tune, X_cgm_test, X_other_test)
-#     mae_tune = mean_absolute_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune)
-#     rmse_tune = np.sqrt(mean_squared_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune))
-#     r2_tune = r2_score(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune)
-#     print(f"PPO Test (tuned {timesteps}) - MAE: {mae_tune:.2f}, RMSE: {rmse_tune:.2f}, R²: {r2_tune:.2f}")
-    
-#     plt.plot(callback_tune.train_rewards, label=f'Train Reward ({timesteps})')
-#     plt.plot(np.arange(len(callback_tune.val_rewards)) * 1000, callback_tune.val_rewards, label=f'Val Reward ({timesteps})')
-#     plt.xlabel('Timestep')
-#     plt.ylabel('Reward')
-#     plt.legend()
-#     plt.title(f'PPO Training vs Validation Reward ({timesteps} timesteps)')
-#     plt.show()
 
 # %%

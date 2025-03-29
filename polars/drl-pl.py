@@ -21,7 +21,7 @@ from stable_baselines3 import PPO, SAC, TD3
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import BaseCallback
 
-PROJECT_DIR = os.path.join(os.getcwd(), "..", "..")
+PROJECT_DIR = os.getcwd()  # Get current working directory
 
 # Global configuration
 CONFIG = {
@@ -31,7 +31,7 @@ CONFIG = {
     "cap_bg": 300,
     "cap_iob": 5,
     "cap_carb": 150,
-    "data_path": os.path.join(PROJECT_DIR, "data", "subjects")
+    "data_path": os.path.join(PROJECT_DIR, "subjects")  # Assuming 'subjects' folder is in the current directory
 }
 
 # %% CELL: Data Processing Functions
@@ -167,31 +167,53 @@ def process_subject(subject_path, idx):
 
 def process_and_convert_to_polars(all_processed_data):
     """
-    Convierte los datos procesados a un DataFrame de Polars.
+    Converts processed data to a Polars DataFrame.
     
     Args:
-        all_processed_data (list): Lista de diccionarios con características procesadas
+        all_processed_data (list): List of dictionaries with processed features
     
     Returns:
-        pl.DataFrame: DataFrame con todos los datos procesados
+        pl.DataFrame: DataFrame with all processed data
     """
-    # Extraer las ventanas CGM para procesarlas por separado
-    cgm_data = [item.pop('cgm_window') for item in all_processed_data]
-    
-    # Crear el dataframe con los demás datos
-    df_processed = pl.DataFrame(all_processed_data)
-    
-    # Procesar las ventanas CGM y crear columnas individuales
-    cgm_columns = [f'cgm_{i}' for i in range(24)]
-    cgm_arrays = np.array(cgm_data)
-    
-    # Crear un dataframe con las columnas CGM
-    cgm_df = pl.DataFrame({
-        col_name: cgm_arrays[:, i] for i, col_name in enumerate(cgm_columns)
-    })
-    
-    # Unir los dataframes
-    return pl.concat([cgm_df, df_processed], how="horizontal")
+    if not all_processed_data:
+        print("Warning: No processed data to convert")
+        return pl.DataFrame()
+        
+    try:
+        # Extract CGM windows and convert to numpy array
+        cgm_data = [item.pop('cgm_window') for item in all_processed_data if 'cgm_window' in item]
+        
+        if not cgm_data:
+            print("Warning: No CGM data found")
+            return pl.DataFrame()
+            
+        # Create DataFrame with remaining data
+        df_processed = pl.DataFrame(all_processed_data)
+        
+        # Convert CGM data to proper shape
+        cgm_arrays = np.array(cgm_data)
+        if len(cgm_arrays.shape) == 1:
+            print("Warning: Reshaping CGM arrays")
+            cgm_arrays = np.stack(cgm_arrays)
+        
+        # Create CGM columns
+        cgm_columns = [f'cgm_{i}' for i in range(24)]
+        cgm_dict = {
+            col_name: cgm_arrays[:, i] 
+            for i, col_name in enumerate(cgm_columns)
+        }
+        
+        # Create DataFrame with CGM data
+        cgm_df = pl.DataFrame(cgm_dict)
+        
+        # Concatenate CGM data with other features
+        return pl.concat([cgm_df, df_processed], how="horizontal")
+        
+    except Exception as e:
+        print(f"Error in process_and_convert_to_polars: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return pl.DataFrame()
 
 def preprocess_data(subject_folder):
     """
@@ -666,11 +688,11 @@ class RewardCallback(BaseCallback):
 # %% CELL: Main Execution - Preprocess Data
 df_final = preprocess_data(CONFIG["data_path"])
 #Save the df_final in a csv
-df_final.write_csv('df_final.csv')
+# df_final.write_csv('df_final.csv')
 
-# %%
-#Load the csv
-df_final = pl.read_csv('df_final.csv')
+# # %%
+# #Load the csv
+# df_final = pl.read_csv('df_final.csv')
 
 (X_cgm_train, X_cgm_val, X_cgm_test,
  X_other_train, X_other_val, X_other_test,
@@ -709,9 +731,6 @@ plt.legend()
 plt.title('PPO Training vs Validation Reward')
 plt.show()
 
-# Save the model (optional)
-model_ppo.save("ppo_insulin_dose")
-
 # Function to generate predictions with PPO
 def predict_with_ppo(model, X_cgm, X_other):
     """
@@ -744,7 +763,6 @@ y_pred_ppo_train = predict_with_ppo(model_ppo, X_cgm_train, X_other_train)
 y_pred_ppo_val = predict_with_ppo(model_ppo, X_cgm_val, X_other_val)
 y_pred_ppo = predict_with_ppo(model_ppo, X_cgm_test, X_other_test)
 
-
 # Generate rule-based predictions for comparison
 y_rule = rule_based_prediction(X_other_test, scaler_other, scaler_y)
 
@@ -776,57 +794,6 @@ print(f"PPO Val - MAE: {mae_ppo_val:.2f}, RMSE: {rmse_ppo_val:.2f}, R²: {r2_ppo
 
 # Metrics for test (already computed)
 print(f"PPO Test - MAE: {mae_ppo:.2f}, RMSE: {rmse_ppo:.2f}, R²: {r2_ppo:.2f}")
-
-#%% CELL: Main Execution - Cross-Validation for PPO
-from sklearn.model_selection import KFold
-
-def run_cv_fold(train_subs, test_subs, df_final_pd, cgm_columns, other_features):
-    """
-    Ejecuta un fold de validación cruzada para el modelo PPO.
-    
-    Args:
-        train_subs (np.ndarray): IDs de sujetos para entrenamiento
-        test_subs (np.ndarray): IDs de sujetos para prueba
-        df_final_pd (pd.DataFrame): DataFrame con datos procesados
-        cgm_columns (list): Lista de columnas CGM
-        other_features (list): Lista de otras características
-        
-    Returns:
-        float: MAE en el conjunto de prueba
-    """
-    train_mask = df_final_pd['subject_id'].isin(train_subs)
-    test_mask = df_final_pd['subject_id'].isin(test_subs)
-    
-    X_cgm_train_cv = scaler_cgm.transform(df_final_pd.loc[train_mask, cgm_columns]).reshape(-1, 24, 1)
-    X_other_train_cv = scaler_other.transform(df_final_pd.loc[train_mask, other_features])
-    y_train_cv = scaler_y.transform(df_final_pd.loc[train_mask, 'normal'].values.reshape(-1, 1)).flatten()
-    X_cgm_test_cv = scaler_cgm.transform(df_final_pd.loc[test_mask, cgm_columns]).reshape(-1, 24, 1)
-    X_other_test_cv = scaler_other.transform(df_final_pd.loc[test_mask, other_features])
-    y_test_cv = scaler_y.transform(df_final_pd.loc[test_mask, 'normal'].values.reshape(-1, 1)).flatten()
-    
-    env_cv = InsulinDoseEnv(X_cgm_train_cv, X_other_train_cv, y_train_cv, scaler_y)
-    model_cv = PPO("MlpPolicy", env_cv, verbose=0, learning_rate=3e-4, n_steps=2048, batch_size=64)
-    model_cv.learn(total_timesteps=50000)  # Reduced for speed
-    y_pred_cv = predict_with_ppo(model_cv, X_cgm_test_cv, X_other_test_cv)
-    return mean_absolute_error(scaler_y.inverse_transform(y_test_cv.reshape(-1, 1)), y_pred_cv)
-
-kf = KFold(n_splits=5, shuffle=True, random_state=42)
-subject_ids = df_final['subject_id'].unique().to_numpy()
-mae_scores = []
-cgm_columns = [f'cgm_{i}' for i in range(24)]
-other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
-                  'insulinSensitivityFactor', 'hour_of_day']
-
-# Convertir a pandas para KFold
-df_final_pd = df_final.to_pandas()
-
-for train_idx, test_idx in kf.split(subject_ids):
-    train_subs = subject_ids[train_idx]
-    test_subs = subject_ids[test_idx]
-    mae_cv = run_cv_fold(train_subs, test_subs, df_final_pd, cgm_columns, other_features)
-    mae_scores.append(mae_cv)
-
-print(f"Cross-validated PPO MAE: {np.mean(mae_scores):.2f} ± {np.std(mae_scores):.2f}")
 
 # %% CELL: Main Execution - Debug Test Set Distribution
 y_train_denorm = scaler_y.inverse_transform(y_train.reshape(-1, 1)).flatten()
@@ -891,24 +858,75 @@ else:
 
 plot_evaluation(y_test, y_pred_ppo, y_rule, subject_test, scaler_y)
 
-# %% CELL: Main Execution - Tune PPO Training (Optional)
-# Test different timesteps to check convergence
-for timesteps in [50000, 200000]:
-    print(f"\nTraining PPO with {timesteps} timesteps:")
-    model_ppo_tune = PPO("MlpPolicy", train_env_ppo, verbose=1, learning_rate=3e-4, n_steps=2048, batch_size=64)
-    callback_tune = RewardCallback(val_env=val_env_ppo)
-    model_ppo_tune.learn(total_timesteps=timesteps, callback=callback_tune)
+#%% CELL: Main Execution - Cross-Validation for PPO
+from sklearn.model_selection import KFold
+
+def run_cv_fold(train_subs, test_subs, df_final_pd, cgm_columns, other_features):
+    """
+    Ejecuta un fold de validación cruzada para el modelo PPO.
     
-    y_pred_ppo_test_tune = predict_with_ppo(model_ppo_tune, X_cgm_test, X_other_test)
-    mae_tune = mean_absolute_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune)
-    rmse_tune = np.sqrt(mean_squared_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune))
-    r2_tune = r2_score(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune)
-    print(f"PPO Test (tuned {timesteps}) - MAE: {mae_tune:.2f}, RMSE: {rmse_tune:.2f}, R²: {r2_tune:.2f}")
+    Args:
+        train_subs (np.ndarray): IDs de sujetos para entrenamiento
+        test_subs (np.ndarray): IDs de sujetos para prueba
+        df_final_pd (pd.DataFrame): DataFrame con datos procesados
+        cgm_columns (list): Lista de columnas CGM
+        other_features (list): Lista de otras características
+        
+    Returns:
+        float: MAE en el conjunto de prueba
+    """
+    train_mask = df_final_pd['subject_id'].isin(train_subs)
+    test_mask = df_final_pd['subject_id'].isin(test_subs)
     
-    plt.plot(callback_tune.train_rewards, label=f'Train Reward ({timesteps})')
-    plt.plot(np.arange(len(callback_tune.val_rewards)) * 1000, callback_tune.val_rewards, label=f'Val Reward ({timesteps})')
-    plt.xlabel('Timestep')
-    plt.ylabel('Reward')
-    plt.legend()
-    plt.title(f'PPO Training vs Validation Reward ({timesteps} timesteps)')
-    plt.show()
+    X_cgm_train_cv = scaler_cgm.transform(df_final_pd.loc[train_mask, cgm_columns]).reshape(-1, 24, 1)
+    X_other_train_cv = scaler_other.transform(df_final_pd.loc[train_mask, other_features])
+    y_train_cv = scaler_y.transform(df_final_pd.loc[train_mask, 'normal'].values.reshape(-1, 1)).flatten()
+    X_cgm_test_cv = scaler_cgm.transform(df_final_pd.loc[test_mask, cgm_columns]).reshape(-1, 24, 1)
+    X_other_test_cv = scaler_other.transform(df_final_pd.loc[test_mask, other_features])
+    y_test_cv = scaler_y.transform(df_final_pd.loc[test_mask, 'normal'].values.reshape(-1, 1)).flatten()
+    
+    env_cv = InsulinDoseEnv(X_cgm_train_cv, X_other_train_cv, y_train_cv, scaler_y)
+    model_cv = PPO("MlpPolicy", env_cv, verbose=0, learning_rate=3e-4, n_steps=2048, batch_size=64)
+    model_cv.learn(total_timesteps=50000)  # Reduced for speed
+    y_pred_cv = predict_with_ppo(model_cv, X_cgm_test_cv, X_other_test_cv)
+    return mean_absolute_error(scaler_y.inverse_transform(y_test_cv.reshape(-1, 1)), y_pred_cv)
+
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+subject_ids = df_final['subject_id'].unique().to_numpy()
+mae_scores = []
+cgm_columns = [f'cgm_{i}' for i in range(24)]
+other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
+                  'insulinSensitivityFactor', 'hour_of_day']
+
+# Convertir a pandas para KFold
+df_final_pd = df_final.to_pandas()
+
+for train_idx, test_idx in kf.split(subject_ids):
+    train_subs = subject_ids[train_idx]
+    test_subs = subject_ids[test_idx]
+    mae_cv = run_cv_fold(train_subs, test_subs, df_final_pd, cgm_columns, other_features)
+    mae_scores.append(mae_cv)
+
+print(f"Cross-validated PPO MAE: {np.mean(mae_scores):.2f} ± {np.std(mae_scores):.2f}")
+
+# # %% CELL: Main Execution - Tune PPO Training (Optional)
+# # Test different timesteps to check convergence
+# for timesteps in [50000, 200000]:
+#     print(f"\nTraining PPO with {timesteps} timesteps:")
+#     model_ppo_tune = PPO("MlpPolicy", train_env_ppo, verbose=1, learning_rate=3e-4, n_steps=2048, batch_size=64)
+#     callback_tune = RewardCallback(val_env=val_env_ppo)
+#     model_ppo_tune.learn(total_timesteps=timesteps, callback=callback_tune)
+    
+#     y_pred_ppo_test_tune = predict_with_ppo(model_ppo_tune, X_cgm_test, X_other_test)
+#     mae_tune = mean_absolute_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune)
+#     rmse_tune = np.sqrt(mean_squared_error(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune))
+#     r2_tune = r2_score(scaler_y.inverse_transform(y_test.reshape(-1, 1)), y_pred_ppo_test_tune)
+#     print(f"PPO Test (tuned {timesteps}) - MAE: {mae_tune:.2f}, RMSE: {rmse_tune:.2f}, R²: {r2_tune:.2f}")
+    
+#     plt.plot(callback_tune.train_rewards, label=f'Train Reward ({timesteps})')
+#     plt.plot(np.arange(len(callback_tune.val_rewards)) * 1000, callback_tune.val_rewards, label=f'Val Reward ({timesteps})')
+#     plt.xlabel('Timestep')
+#     plt.ylabel('Reward')
+#     plt.legend()
+#     plt.title(f'PPO Training vs Validation Reward ({timesteps} timesteps)')
+#     plt.show()
