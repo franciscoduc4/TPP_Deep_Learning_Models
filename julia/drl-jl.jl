@@ -57,6 +57,16 @@ function findDataPath()
     return path
 end
 
+function getFiguresPath(dataPath::String)
+figuresPath = joinpath(dirname(dirname(dataPath)), "figures", "julia")
+if !isdir(figuresPath)
+    mkpath(figuresPath)
+end
+return figuresPath
+end
+
+dataPath = findDataPath()
+
 # Global configuration
 CONFIG = Dict(
     "batchSize" => 128,
@@ -65,7 +75,8 @@ CONFIG = Dict(
     "capBg" => 300,
     "capIob" => 5,
     "capCarb" => 150,
-    "dataPath" => findDataPath(),
+    "dataPath" => dataPath,
+    "figuresPath" => getFiguresPath(dataPath),
     "juliaSeed" => 42
 )
 
@@ -488,16 +499,16 @@ function splitData(dfFinal)
                     "insulinSensitivityFactor", "hourOfDay"]
 
     # Escalar solo en datos de entrenamiento
-    XCgmTrain = fit_transform!(scalerCgm, Matrix(dfFinal[trainMask, cgmColumns]))
-    XCgmTrain = reshape(XCgmTrain, :, 24, 1)
-    XCgmVal = ScikitLearn.transform(scalerCgm, Matrix(dfFinal[valMask, cgmColumns]))
-    XCgmVal = reshape(XCgmVal, :, 24, 1)
-    XCgmTest = ScikitLearn.transform(scalerCgm, Matrix(dfFinal[testMask, cgmColumns]))
-    XCgmTest = reshape(XCgmTest, :, 24, 1)
+    xCgmTrain = fit_transform!(scalerCgm, Matrix(dfFinal[trainMask, cgmColumns]))
+    xCgmTrain = reshape(xCgmTrain, :, 24, 1)
+    xCgmVal = ScikitLearn.transform(scalerCgm, Matrix(dfFinal[valMask, cgmColumns]))
+    xCgmVal = reshape(xCgmVal, :, 24, 1)
+    xCgmTest = ScikitLearn.transform(scalerCgm, Matrix(dfFinal[testMask, cgmColumns]))
+    xCgmTest = reshape(xCgmTest, :, 24, 1)
     
-    XOtherTrain = fit_transform!(scalerOther, Matrix(dfFinal[trainMask, otherFeatures]))
-    XOtherVal = ScikitLearn.transform(scalerOther, Matrix(dfFinal[valMask, otherFeatures]))
-    XOtherTest = ScikitLearn.transform(scalerOther, Matrix(dfFinal[testMask, otherFeatures]))
+    xOtherTrain = fit_transform!(scalerOther, Matrix(dfFinal[trainMask, otherFeatures]))
+    xOtherVal = ScikitLearn.transform(scalerOther, Matrix(dfFinal[valMask, otherFeatures]))
+    xOtherTest = ScikitLearn.transform(scalerOther, Matrix(dfFinal[testMask, otherFeatures]))
     
     yTrain = fit_transform!(scalerY, reshape(dfFinal[trainMask, :normal], :, 1))
     yTrain = vec(yTrain)
@@ -506,33 +517,33 @@ function splitData(dfFinal)
     yTest = ScikitLearn.transform(scalerY, reshape(dfFinal[testMask, :normal], :, 1))
     yTest = vec(yTest)
 
-    XSubjectTrain = dfFinal[trainMask, :subjectId]
-    XSubjectVal = dfFinal[valMask, :subjectId]
-    XSubjectTest = dfFinal[testMask, :subjectId]
-    subjectTest = XSubjectTest
+    xSubjectTrain = dfFinal[trainMask, :subjectId]
+    xSubjectVal = dfFinal[valMask, :subjectId]
+    xSubjectTest = dfFinal[testMask, :subjectId]
+    subjectTest = xSubjectTest
 
-    println("Entrenamiento CGM: $(size(XCgmTrain)), Validación CGM: $(size(XCgmVal)), Prueba CGM: $(size(XCgmTest))")
-    println("Entrenamiento Otros: $(size(XOtherTrain)), Validación Otros: $(size(XOtherVal)), Prueba Otros: $(size(XOtherTest))")
-    println("Entrenamiento Subject: $(size(XSubjectTrain)), Validación Subject: $(size(XSubjectVal)), Prueba Subject: $(size(XSubjectTest))")
+    println("Entrenamiento CGM: $(size(xCgmTrain)), Validación CGM: $(size(xCgmVal)), Prueba CGM: $(size(xCgmTest))")
+    println("Entrenamiento Otros: $(size(xOtherTrain)), Validación Otros: $(size(xOtherVal)), Prueba Otros: $(size(xOtherTest))")
+    println("Entrenamiento Subject: $(size(xSubjectTrain)), Validación Subject: $(size(xSubjectVal)), Prueba Subject: $(size(xSubjectTest))")
     println("Sujetos de prueba: $testSubjects")
 
     elapsedTime = time() - startTime
     println("División de datos completa en $(round(elapsedTime, digits=2)) segundos")
     
-    return (XCgmTrain, XCgmVal, XCgmTest,
-            XOtherTrain, XOtherVal, XOtherTest,
-            XSubjectTrain, XSubjectVal, XSubjectTest,
+    return (xCgmTrain, xCgmVal, xCgmTest,
+            xOtherTrain, xOtherVal, xOtherTest,
+            xSubjectTrain, xSubjectVal, xSubjectTest,
             yTrain, yVal, yTest, subjectTest,
             scalerCgm, scalerOther, scalerY)
 end
 
 """
-    ruleBasedPrediction(XOther, scalerOther, scalerY; targetBg=100)
+    ruleBasedPrediction(xOther, scalerOther, scalerY; targetBg=100)
 
 Genera predicciones basadas en reglas médicas estándar.
 
 # Argumentos
-- `XOther::Matrix{Float64}`: Características adicionales normalizadas.
+- `xOther::Matrix{Float64}`: Características adicionales normalizadas.
 - `scalerOther::StandardScaler`: Scaler para desnormalizar características.
 - `scalerY::StandardScaler`: Scaler para normalizar predicciones.
 - `targetBg::Int=100`: Nivel objetivo de glucosa en sangre.
@@ -540,11 +551,11 @@ Genera predicciones basadas en reglas médicas estándar.
 # Retorno
 - `Vector{Float64}`: Vector con predicciones de dosis.
 """
-function ruleBasedPrediction(XOther, scalerOther, scalerY; targetBg=100)
+function ruleBasedPrediction(xOther, scalerOther, scalerY; targetBg=100)
     startTime = time()
     
-    XOtherNp = XOther
-    inverseTransformed = ScikitLearn.inverse_transform(scalerOther, XOtherNp)
+    xOtherNp = xOther
+    inverseTransformed = ScikitLearn.inverse_transform(scalerOther, xOtherNp)
     
     carbInput = inverseTransformed[:, 1]
     bgInput = inverseTransformed[:, 2]
@@ -621,70 +632,70 @@ function MLPModel(layerSizes::Vector{Int}, activation=relu; learningRate=0.001)
 end
 
 """
-    forward(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64})
+    forward(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64})
 
 Realiza una pasada hacia adelante a través del modelo.
 
 # Argumentos
 - `model::MLPModel`: Modelo MLP.
-- `XCgm::Array{Float64}`: Datos CGM.
-- `XOther::Matrix{Float64}`: Otras características.
+- `xCgm::Array{Float64}`: Datos CGM.
+- `xOther::Matrix{Float64}`: Otras características.
 
 # Retorno
 - `Vector{Float64}`: Salida del modelo.
 """
-function forward(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64})
+function forward(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64})
     # Aplanar datos CGM
-    batchSize = size(XCgm, 1)
-    XCgmFlat = reshape(XCgm, batchSize, :)
+    batchSize = size(xCgm, 1)
+    xCgmFlat = reshape(xCgm, batchSize, :)
     
     # Concatenar entradas
-    x = hcat(XCgmFlat, XOther)
+    x = hcat(xCgmFlat, xOther)
     
     # Pasada hacia adelante
     return vec(model.layers(x'))
 end
 
 """
-    loss(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64}, y::Vector{Float64})
+    loss(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64}, y::Vector{Float64})
 
 Calcula la función de pérdida.
 
 # Argumentos
 - `model::MLPModel`: Modelo MLP.
-- `XCgm::Array{Float64}`: Datos CGM.
-- `XOther::Matrix{Float64}`: Otras características.
+- `xCgm::Array{Float64}`: Datos CGM.
+- `xOther::Matrix{Float64}`: Otras características.
 - `y::Vector{Float64}`: Valores objetivo.
 
 # Retorno
 - `Float64`: Valor de la pérdida.
 """
-function loss(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64}, y::Vector{Float64})
-    ŷ = forward(model, XCgm, XOther)
+function loss(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64}, y::Vector{Float64})
+    ŷ = forward(model, xCgm, xOther)
     return model.lossFn(ŷ, y)
 end
 
 """
-    gradientStep!(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64}, y::Vector{Float64})
+    gradientStep!(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64}, y::Vector{Float64})
 
 Realiza un paso de gradiente para actualizar los parámetros del modelo.
 
 # Argumentos
 - `model::MLPModel`: Modelo MLP.
-- `XCgm::Array{Float64}`: Datos CGM.
-- `XOther::Matrix{Float64}`: Otras características.
+- `xCgm::Array{Float64}`: Datos CGM.
+- `xOther::Matrix{Float64}`: Otras características.
 - `y::Vector{Float64}`: Valores objetivo.
 
 # Retorno
 - `Float64`: Valor de la pérdida.
 """
-function gradientStep!(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64}, y::Vector{Float64})
+function gradientStep!(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64}, y::Vector{Float64})
     # Create the optimizer state only once
     optim_state = Flux.setup(model.optimizer, model.layers)
     
     # Compute gradients with the new API
     loss_value, grads = Flux.withgradient(model.layers) do m
-        ŷ = forward(MLPModel(m, model.optimizer, model.lossFn), XCgm, XOther)
+        ŷ = forward(MLPModel(m, model.optimizer, model.lossFn), xCgm, xOther)
         model.lossFn(ŷ, y)
     end
     
@@ -695,19 +706,19 @@ function gradientStep!(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Flo
 end
 
 """
-    train!(model::MLPModel, XCgmTrain::Array{Float64}, XOtherTrain::Matrix{Float64}, yTrain::Vector{Float64},
-           XCgmVal::Array{Float64}, XOtherVal::Matrix{Float64}, yVal::Vector{Float64};
+    train!(model::MLPModel, xCgmTrain::Array{Float64}, xOtherTrain::Matrix{Float64}, yTrain::Vector{Float64},
+           xCgmVal::Array{Float64}, xOtherVal::Matrix{Float64}, yVal::Vector{Float64};
            batchSize::Int=CONFIG["batchSize"], epochs::Int=100, patience::Int=10)
 
 Entrena el modelo con early stopping.
 
 # Argumentos
 - `model::MLPModel`: Modelo MLP.
-- `XCgmTrain::Array{Float64}`: Datos CGM de entrenamiento.
-- `XOtherTrain::Matrix{Float64}`: Otras características de entrenamiento.
+- `xCgmTrain::Array{Float64}`: Datos CGM de entrenamiento.
+- `xOtherTrain::Matrix{Float64}`: Otras características de entrenamiento.
 - `yTrain::Vector{Float64}`: Valores objetivo de entrenamiento.
-- `XCgmVal::Array{Float64}`: Datos CGM de validación.
-- `XOtherVal::Matrix{Float64}`: Otras características de validación.
+- `xCgmVal::Array{Float64}`: Datos CGM de validación.
+- `xOtherVal::Matrix{Float64}`: Otras características de validación.
 - `yVal::Vector{Float64}`: Valores objetivo de validación.
 - `batchSize::Int=CONFIG["batchSize"]`: Tamaño del lote para entrenar.
 - `epochs::Int=100`: Número de épocas.
@@ -716,9 +727,9 @@ Entrena el modelo con early stopping.
 # Retorno
 - `Tuple`: Pérdidas de entrenamiento, pérdidas de validación y mejor época.
 """
-function train!(model::MLPModel, XCgmTrain::Array{Float64}, XOtherTrain::Matrix{Float64}, yTrain::Vector{Float64},  XCgmVal::Array{Float64}, XOtherVal::Matrix{Float64}, yVal::Vector{Float64}; batchSize::Int=CONFIG["batchSize"], epochs::Int=100, patience::Int=10)
+function train!(model::MLPModel, xCgmTrain::Array{Float64}, xOtherTrain::Matrix{Float64}, yTrain::Vector{Float64},  xCgmVal::Array{Float64}, xOtherVal::Matrix{Float64}, yVal::Vector{Float64}; batchSize::Int=CONFIG["batchSize"], epochs::Int=100, patience::Int=10)
 
-    nSamples = size(XCgmTrain, 1)
+    nSamples = size(xCgmTrain, 1)
     nBatches = ceil(Int, nSamples / batchSize)
 
     # Create optimizer state
@@ -735,8 +746,8 @@ function train!(model::MLPModel, XCgmTrain::Array{Float64}, XOtherTrain::Matrix{
     for epoch in 1:epochs
         # Barajar datos
         indices = shuffle(1:nSamples)
-        XCgmTrainShuf = XCgmTrain[indices, :, :]
-        XOtherTrainShuf = XOtherTrain[indices, :]
+        xCgmTrainShuf = xCgmTrain[indices, :, :]
+        xOtherTrainShuf = xOtherTrain[indices, :]
         yTrainShuf = yTrain[indices]
 
         epochLoss = 0.0
@@ -745,8 +756,8 @@ function train!(model::MLPModel, XCgmTrain::Array{Float64}, XOtherTrain::Matrix{
             startIdx = (batchIdx - 1) * batchSize + 1
             endIdx = min(batchIdx * batchSize, nSamples)
             
-            batchCgm = XCgmTrainShuf[startIdx:endIdx, :, :]
-            batchOther = XOtherTrainShuf[startIdx:endIdx, :]
+            batchCgm = xCgmTrainShuf[startIdx:endIdx, :, :]
+            batchOther = xOtherTrainShuf[startIdx:endIdx, :]
             batchY = yTrainShuf[startIdx:endIdx]
             
             # Compute gradients and update parameters
@@ -765,7 +776,7 @@ function train!(model::MLPModel, XCgmTrain::Array{Float64}, XOtherTrain::Matrix{
         push!(trainLosses, avgTrainLoss)
 
         # Evaluar en conjunto de validación
-        valLoss = loss(model, XCgmVal, XOtherVal, yVal)
+        valLoss = loss(model, xCgmVal, xOtherVal, yVal)
         push!(valLosses, valLoss)
 
         # Imprimir progreso
@@ -795,39 +806,39 @@ function train!(model::MLPModel, XCgmTrain::Array{Float64}, XOtherTrain::Matrix{
 end
 
 """
-    predict(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64})
+    predict(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64})
 
 Genera predicciones para nuevos datos.
 
 # Argumentos
 - `model::MLPModel`: Modelo MLP.
-- `XCgm::Array{Float64}`: Datos CGM.
-- `XOther::Matrix{Float64}`: Otras características.
+- `xCgm::Array{Float64}`: Datos CGM.
+- `xOther::Matrix{Float64}`: Otras características.
 
 # Retorno
 - `Vector{Float64}`: Predicciones.
 """
-function predict(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64})
-    return forward(model, XCgm, XOther)
+function predict(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64})
+    return forward(model, xCgm, xOther)
 end
 
 """
-    generateDenormalizedPredictions(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64}, scalerY)
+    generateDenormalizedPredictions(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64}, scalerY)
 
 Genera predicciones desnormalizadas usando el modelo MLP.
 
 # Argumentos
 - `model::MLPModel`: Modelo entrenado.
-- `XCgm::Array{Float64}`: Datos CGM normalizados.
-- `XOther::Matrix{Float64}`: Otras características normalizadas.
+- `xCgm::Array{Float64}`: Datos CGM normalizados.
+- `xOther::Matrix{Float64}`: Otras características normalizadas.
 - `scalerY`: Scaler para desnormalizar las predicciones.
 
 # Retorno
 - `Vector{Float64}`: Predicciones desnormalizadas.
 """
-function generateDenormalizedPredictions(model::MLPModel, XCgm::Array{Float64}, XOther::Matrix{Float64}, scalerY)
+function generateDenormalizedPredictions(model::MLPModel, xCgm::Array{Float64}, xOther::Matrix{Float64}, scalerY)
     # Generar predicciones normalizadas
-    predictions = predict(model, XCgm, XOther)
+    predictions = predict(model, xCgm, xOther)
     
     # Desnormalizar predicciones
     denormalizedPredictions = ScikitLearn.inverse_transform(scalerY, reshape(predictions, :, 1))
@@ -836,25 +847,25 @@ function generateDenormalizedPredictions(model::MLPModel, XCgm::Array{Float64}, 
 end
 
 """
-    trainParallelModels(XCgmTrain, XOtherTrain, yTrain, XCgmVal, XOtherVal, yVal, nModels=4)
+    trainParallelModels(xCgmTrain, xOtherTrain, yTrain, xCgmVal, xOtherVal, yVal, nModels=4)
 
 Entrena múltiples modelos en paralelo.
 
 # Argumentos
-- `XCgmTrain::Array{Float64}`: Datos CGM de entrenamiento.
-- `XOtherTrain::Matrix{Float64}`: Otras características de entrenamiento.
+- `xCgmTrain::Array{Float64}`: Datos CGM de entrenamiento.
+- `xOtherTrain::Matrix{Float64}`: Otras características de entrenamiento.
 - `yTrain::Vector{Float64}`: Valores objetivo de entrenamiento.
-- `XCgmVal::Array{Float64}`: Datos CGM de validación.
-- `XOtherVal::Matrix{Float64}`: Otras características de validación.
+- `xCgmVal::Array{Float64}`: Datos CGM de validación.
+- `xOtherVal::Matrix{Float64}`: Otras características de validación.
 - `yVal::Vector{Float64}`: Valores objetivo de validación.
 - `nModels::Int=4`: Número de modelos a entrenar en paralelo.
 
 # Retorno
 - `Vector{MLPModel}`: Modelos entrenados.
 """
-function trainParallelModels(XCgmTrain, XOtherTrain, yTrain, XCgmVal, XOtherVal, yVal, nModels=4)
+function trainParallelModels(xCgmTrain, xOtherTrain, yTrain, xCgmVal, xOtherVal, yVal, nModels=4)
     # Split the training data into partitions
-    nSamples = size(XCgmTrain, 1)
+    nSamples = size(xCgmTrain, 1)
     partitionSize = div(nSamples, nModels)
     
     models = Vector{MLPModel}(undef, nModels)
@@ -865,16 +876,16 @@ function trainParallelModels(XCgmTrain, XOtherTrain, yTrain, XCgmVal, XOtherVal,
         endIdx = i == nModels ? nSamples : i * partitionSize
         
         # Create and train the model on this partition
-        inputDim = 24 * 1 + size(XOtherTrain, 2)
+        inputDim = 24 * 1 + size(xOtherTrain, 2)
         layerSizes = [inputDim, 64, 32, 16, 1]
         model = MLPModel(layerSizes, relu, learningRate=1e-3)
         
         train!(
             model,
-            XCgmTrain[startIdx:endIdx, :, :], 
-            XOtherTrain[startIdx:endIdx, :], 
+            xCgmTrain[startIdx:endIdx, :, :], 
+            xOtherTrain[startIdx:endIdx, :], 
             yTrain[startIdx:endIdx],
-            XCgmVal, XOtherVal, yVal,
+            xCgmVal, xOtherVal, yVal,
             batchSize=CONFIG["batchSize"],
             epochs=100,
             patience=10
@@ -887,22 +898,22 @@ function trainParallelModels(XCgmTrain, XOtherTrain, yTrain, XCgmVal, XOtherVal,
 end
 
 """
-    ensemblePredictions(models, XCgm, XOther, scalerY)
+    ensemblePredictions(models, xCgm, xOther, scalerY)
 
 Genera predicciones usando un ensamble de modelos.
 
 # Argumentos
 - `models::Vector{MLPModel}`: Modelos entrenados.
-- `XCgm::Array{Float64}`: Datos CGM.
-- `XOther::Matrix{Float64}`: Otras características.
+- `xCgm::Array{Float64}`: Datos CGM.
+- `xOther::Matrix{Float64}`: Otras características.
 - `scalerY`: Scaler para desnormalizar las predicciones.
 
 # Retorno
 - `Vector{Float64}`: Predicciones desnormalizadas.
 """
-function ensemblePredictions(models, XCgm, XOther, scalerY)
+function ensemblePredictions(models, xCgm, xOther, scalerY)
     # Collect predictions from all models
-    allPreds = [predict(model, XCgm, XOther) for model in models]
+    allPreds = [predict(model, xCgm, xOther) for model in models]
     
     # Average the predictions
     avgPreds = mean(allPreds)
@@ -964,6 +975,8 @@ function plotEvaluation(yTest::Vector{<:Real}, yPredJulia::Vector{<:Real}, yRule
     ylabel!(p1, "Dosis Predicha (unidades)")
     title!(p1, "Predicciones de Julia MLP vs Valores Reales")
     display(p1)
+    # Save the plot
+    savefig(p1, joinpath(CONFIG["figuresPath"], "julia_predictions_vs_real.png"))
 
     # 2. Residual Distribution
     residualsJulia = yTestDenorm .- yPredJulia
@@ -975,6 +988,8 @@ function plotEvaluation(yTest::Vector{<:Real}, yPredJulia::Vector{<:Real}, yRule
     ylabel!(p2, "Frecuencia")
     title!(p2, "Distribución de Residuales")
     display(p2)
+    # Save the plot
+    savefig(p2, joinpath(CONFIG["figuresPath"], "residuals_distribution.png"))
 
     # 3. MAE by Subject
     testSubjectsUnique = unique(subjectTest)
@@ -995,9 +1010,12 @@ function plotEvaluation(yTest::Vector{<:Real}, yPredJulia::Vector{<:Real}, yRule
     ylabel!(p3, "MAE (unidades)")
     title!(p3, "MAE por Sujeto")
     display(p3)
+    # Save the plot
+    savefig(p3, joinpath(CONFIG["figuresPath"], "mae_by_subject.png"))
 
     elapsedTime = time() - startTime
     println("Visualización completa en $(round(elapsedTime, digits=2)) segundos")
+    println("Gráficos guardados en $(CONFIG["figuresPath"])")
 end
 
 """
@@ -1018,6 +1036,10 @@ function plotLearningCurves(trainLosses::Vector{Float64}, valLosses::Vector{Floa
     ylabel!(p, "Pérdida (MSE)")
     title!(p, "Curvas de aprendizaje")
     display(p)
+    # Save the plot
+    savefig(p, joinpath(CONFIG["figuresPath"], "learning_curves.png"))
+    
+    println("Curvas de aprendizaje guardadas en $(joinpath(CONFIG["figuresPath"], "learning_curves.png"))")
 end
 
 # %% CELL: Main Execution - Preprocess Data
@@ -1037,16 +1059,16 @@ catch e
 end
 
 # Split data
-global XCgmTrain, XCgmVal, XCgmTest,
-        XOtherTrain, XOtherVal, XOtherTest,
-        XSubjectTrain, XSubjectVal, XSubjectTest,
+global xCgmTrain, xCgmVal, xCgmTest,
+        xOtherTrain, xOtherVal, xOtherTest,
+        xSubjectTrain, xSubjectVal, xSubjectTest,
         yTrain, yVal, yTest, subjectTest,
         scalerCgm, scalerOther, scalerY = splitData(dfFinal)
 
 # %% CELL: Main Execution - MLP Training
 
 # Definir arquitectura del modelo
-inputDim = 24 * 1 + size(XOtherTrain, 2)  # CGM (flattened) + other features
+inputDim = 24 * 1 + size(xOtherTrain, 2)  # CGM (flattened) + other features
 layerSizes = [inputDim, 64, 32, 16, 1]
 println("Arquitectura del modelo: $layerSizes")
 
@@ -1054,8 +1076,8 @@ println("Arquitectura del modelo: $layerSizes")
 global mlpModel = MLPModel(layerSizes, relu, learningRate=1e-3)
 trainLosses, valLosses, bestEpoch = train!(
     mlpModel,
-    XCgmTrain, XOtherTrain, yTrain,
-    XCgmVal, XOtherVal, yVal,
+    xCgmTrain, xOtherTrain, yTrain,
+    xCgmVal, xOtherVal, yVal,
     batchSize=CONFIG["batchSize"],
     epochs=200,
     patience=20
@@ -1065,12 +1087,12 @@ trainLosses, valLosses, bestEpoch = train!(
 plotLearningCurves(trainLosses, valLosses, bestEpoch)
 
 # Generar predicciones desnormalizadas para todos los conjuntos
-global yPredJuliaTrain = generateDenormalizedPredictions(mlpModel, XCgmTrain, XOtherTrain, scalerY)
-global yPredJuliaVal = generateDenormalizedPredictions(mlpModel, XCgmVal, XOtherVal, scalerY)
-global yPredJuliaTest = generateDenormalizedPredictions(mlpModel, XCgmTest, XOtherTest, scalerY)
+global yPredJuliaTrain = generateDenormalizedPredictions(mlpModel, xCgmTrain, xOtherTrain, scalerY)
+global yPredJuliaVal = generateDenormalizedPredictions(mlpModel, xCgmVal, xOtherVal, scalerY)
+global yPredJuliaTest = generateDenormalizedPredictions(mlpModel, xCgmTest, xOtherTest, scalerY)
 
 # Generar predicciones basadas en reglas para comparación
-global yRule = ruleBasedPrediction(XOtherTest, scalerOther, scalerY)
+global yRule = ruleBasedPrediction(xOtherTest, scalerOther, scalerY)
 
 # %% CELL: Main Execution - Print Metrics
 # Métricas para MLP de Julia
@@ -1107,15 +1129,15 @@ for lr in learningRates
         # Train model with current learning rate
         trainLosses, valLosses, bestEpoch = train!(
             modelTune,
-            XCgmTrain, XOtherTrain, yTrain,
-            XCgmVal, XOtherVal, yVal,
+            xCgmTrain, xOtherTrain, yTrain,
+            xCgmVal, xOtherVal, yVal,
             batchSize=CONFIG["batchSize"],
             epochs=2048,
             patience=10
         )
         
         # Generate predictions on test set
-        yPredTestTune = generateDenormalizedPredictions(modelTune, XCgmTest, XOtherTest, scalerY)
+        yPredTestTune = generateDenormalizedPredictions(modelTune, xCgmTest, xOtherTest, scalerY)
         
         # Calculate metrics
         yTestDenorm = ScikitLearn.inverse_transform(scalerY, reshape(yTest, :, 1))
@@ -1132,6 +1154,8 @@ for lr in learningRates
         ylabel!(p, "Loss (MSE)")
         title!(p, "Julia MLP Learning Curves (LR: $lr, Architecture: $arch)")
         display(p)
+        # Save the plot with a unique filename based on hyperparameters
+        savefig(p, joinpath(CONFIG["figuresPath"], "tuning_lr_$(lr)_arch_$(join(arch, "_")).png"))
         
         # Store results
         push!(results, Dict(

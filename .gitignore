@@ -1,4 +1,4 @@
-*Subject*
+*Subject*.xlsx
 manifest
 .venv
 /subjects
@@ -11,3 +11,7 @@ data/*
 build/
 /build/*
 *.so
+**/target
+Cargo.lock
+*.keras
+*.h5
