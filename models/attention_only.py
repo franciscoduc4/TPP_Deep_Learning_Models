@@ -5,8 +5,10 @@ from tensorflow.keras.layers import (
     MultiHeadAttention, GlobalAveragePooling1D, Concatenate,
     Add
 )
+from keras.saving import register_keras_serializable
 from .config import ATTENTION_CONFIG
 
+@register_keras_serializable
 class RelativePositionEncoding(tf.keras.layers.Layer):
     """
     Codificación de posición relativa para mejorar la atención temporal.
@@ -22,12 +24,13 @@ class RelativePositionEncoding(tf.keras.layers.Layer):
             shape=[2 * self.max_position - 1, self.depth],
             initializer="glorot_uniform"
         )
+        self.built = True
         
-    def call(self, length):
-        pos_emb = tf.gather(
-            self.rel_embeddings,
-            tf.range(length)[:, tf.newaxis] - tf.range(length)[tf.newaxis, :] + self.max_position - 1
-        )
+    def call(self, inputs):
+        # Now this function takes the actual tensor as input, not just the length
+        length = tf.shape(inputs)[1]
+        pos_indices = tf.range(length)[:, tf.newaxis] - tf.range(length)[tf.newaxis, :] + self.max_position - 1
+        pos_emb = tf.gather(self.rel_embeddings, pos_indices)
         return pos_emb
 
 def create_attention_block(x: tf.Tensor, num_heads: int, key_dim: int, 
@@ -57,10 +60,11 @@ def create_attention_block(x: tf.Tensor, num_heads: int, key_dim: int,
     """
     # Relative position encoding
     if ATTENTION_CONFIG['use_relative_attention']:
+        # Pass the whole tensor x, not just its length
         pos_encoding = RelativePositionEncoding(
             ATTENTION_CONFIG['max_relative_position'],
             key_dim
-        )(tf.shape(x)[1])
+        )(x)
         
         attention_output = MultiHeadAttention(
             num_heads=num_heads,

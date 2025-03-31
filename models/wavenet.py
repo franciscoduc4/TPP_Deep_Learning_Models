@@ -4,6 +4,7 @@ from tensorflow.keras.layers import (
     Input, Conv1D, Dense, Dropout, Add, Activation,
     BatchNormalization, GlobalAveragePooling1D, Concatenate
 )
+from keras.saving import register_keras_serializable
 from .config import WAVENET_CONFIG
 
 class WaveNetBlock(tf.keras.layers.Layer):

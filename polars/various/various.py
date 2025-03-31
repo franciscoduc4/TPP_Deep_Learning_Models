@@ -28,14 +28,18 @@ from tensorflow.keras.layers import (
 )
 from keras.saving import register_keras_serializable
 import matplotlib.pyplot as plt
+import sys
 import os
 from joblib import Parallel, delayed
 from datetime import timedelta
-import openpyxl
+# import openpyxl
 
 # Configuración de Matplotlib para evitar errores con Tkinter
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
 
 from models.attention_only import create_attention_model
 from models.cnn import create_cnn_model
@@ -51,7 +55,7 @@ from models.wavenet import create_wavenet_model
 
 # %%
 # Definición de la ruta del proyecto
-PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), "..", ".."))
+# PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), "..", ".."))
 SUBJECTS_RELATIVE_PATH = "data/Subjects"
 SUBJECTS_PATH = os.path.join(PROJECT_ROOT, SUBJECTS_RELATIVE_PATH)
 
@@ -301,6 +305,7 @@ MODEL_CREATORS = {
     'RNN': create_rnn_model,
     'TabNet': create_tabnet_model,
     'TCN': create_tcn_model,
+    'WaveNet': create_wavenet_model
 }
 
 # %% [markdown]

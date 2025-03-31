@@ -15,3 +15,4 @@ build/
 Cargo.lock
 *.keras
 *.h5
+__pycache__

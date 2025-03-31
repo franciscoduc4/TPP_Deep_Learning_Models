@@ -4,6 +4,7 @@ from tensorflow.keras.layers import (
     Input, Conv1D, Dense, Dropout, LayerNormalization,
     BatchNormalization, Add, Activation, GlobalAveragePooling1D
 )
+from keras.saving import register_keras_serializable
 from .config import TCN_CONFIG
 
 class WeightNormalization(tf.keras.layers.Wrapper):

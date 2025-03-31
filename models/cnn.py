@@ -5,6 +5,7 @@ from tensorflow.keras.layers import (
     MaxPooling1D, GlobalAveragePooling1D, GlobalMaxPooling1D, Concatenate,
     Activation, Add
 )
+from keras.saving import register_keras_serializable
 from .config import CNN_CONFIG
 
 @register_keras_serializable()

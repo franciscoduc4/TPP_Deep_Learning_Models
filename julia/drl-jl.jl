@@ -58,11 +58,11 @@ function findDataPath()
 end
 
 function getFiguresPath(dataPath::String)
-figuresPath = joinpath(dirname(dirname(dataPath)), "figures", "julia")
-if !isdir(figuresPath)
-    mkpath(figuresPath)
-end
-return figuresPath
+    figuresPath = joinpath(dirname(dirname(dataPath)), "figures", "julia")
+    if !isdir(figuresPath)
+        mkpath(figuresPath)
+    end
+    return figuresPath
 end
 
 dataPath = findDataPath()
