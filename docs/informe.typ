@@ -123,6 +123,8 @@
 ) = note(fill: fill, variant: variant, color: color, ..args) 
 
 
+#let TODO(body) = bordear("TODO", body, colour: "red")
+
 
 // Referencias
 #let pageref(label) = context {
@@ -705,6 +707,15 @@ PPO es un algoritmo _on-policy_, lo que significa que aprende de las experiencia
 )
 
 = Dataset <dataset>
+
+El dataset elegido para realizar este análisis es el DiaTrend @diatrend.
+
+#TODO(
+  [
+    #text(size: 25pt)[#highlight[*#underline[_Completar con el análisis hecho sobre el dataset. _]*]]
+  ]
+)
+
 
 = Metodología de Entrenamiento <metodologia>
 
