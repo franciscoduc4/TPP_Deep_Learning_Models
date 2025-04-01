@@ -1,5 +1,8 @@
 """Model configuration parameters"""
 
+###########################################################
+###                Deep Learning Models                 ###
+###########################################################
 TCN_CONFIG = {
     'filters': [32, 64, 128],
     'kernel_size': 3,
@@ -102,4 +105,18 @@ RNN_CONFIG = {
     'epsilon': 1e-6,
     'use_time_distributed': True,
     'activation': 'relu'
+}
+
+LSTM_CONFIG = {
+    'hidden_units': [64, 128, 256],
+    'dense_units': [128, 64], 
+    'dropout_rate': 0.25,
+    'recurrent_dropout': 0.15,
+    'epsilon': 1e-6,
+    'attention_heads': 4,
+    'use_bidirectional': True,
+    'activation': 'tanh',
+    'recurrent_activation': 'sigmoid',
+    'dense_activation': 'gelu', 
+    'use_layer_norm': True
 }

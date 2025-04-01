@@ -6,7 +6,7 @@ from tensorflow.keras.layers import (
     Activation, Add
 )
 from keras.saving import register_keras_serializable
-from .config import CNN_CONFIG
+from ..config import CNN_CONFIG
 
 @register_keras_serializable()
 class SqueezeExcitationBlock(tf.keras.layers.Layer):

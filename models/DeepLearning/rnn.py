@@ -5,7 +5,7 @@ from tensorflow.keras.layers import (
     Concatenate, Bidirectional, TimeDistributed, MaxPooling1D
 )
 from keras.saving import register_keras_serializable
-from .config import RNN_CONFIG
+from ..config import RNN_CONFIG
 
 def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     """

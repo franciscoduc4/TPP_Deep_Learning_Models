@@ -6,7 +6,7 @@ from tensorflow.keras.layers import (
     Add
 )
 from keras.saving import register_keras_serializable
-from .config import ATTENTION_CONFIG
+from ..config import ATTENTION_CONFIG
 
 @register_keras_serializable
 class RelativePositionEncoding(tf.keras.layers.Layer):

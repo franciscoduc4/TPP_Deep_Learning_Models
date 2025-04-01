@@ -5,7 +5,7 @@ from tensorflow.keras.layers import (
     MultiHeadAttention, GlobalAveragePooling1D, Concatenate, Add
 )
 from keras.saving import register_keras_serializable
-from .config import TRANSFORMER_CONFIG
+from ..config import TRANSFORMER_CONFIG
 
 class PositionEncoding(tf.keras.layers.Layer):
     """

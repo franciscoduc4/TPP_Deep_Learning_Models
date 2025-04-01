@@ -4,7 +4,7 @@ from tensorflow.keras.layers import (
     Input, Dense, BatchNormalization, Concatenate, Activation
 )
 from keras.saving import register_keras_serializable
-from .config import TABNET_CONFIG
+from ..config import TABNET_CONFIG
 
 class GLU(tf.keras.layers.Layer):
     """

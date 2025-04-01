@@ -4,7 +4,7 @@ from tensorflow.keras.layers import (
     MultiHeadAttention, Add, GlobalAveragePooling1D
 )
 from keras.saving import register_keras_serializable
-from .config import GRU_CONFIG
+from ..config import GRU_CONFIG
 
 def create_gru_attention_block(x, units, num_heads=4):
     """
