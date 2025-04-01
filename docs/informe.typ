@@ -485,43 +485,224 @@ PPO es un algoritmo _on-policy_, lo que significa que aprende de las experiencia
 
 == Lenguajes de Programación <lenguajes>
 
-+ Python 3.8+
-+ Julia
+=== Python <python>
+
+#recuadro(
+  rgb("#FFD348"),
+  "Python",
+  [
+    Se eligió Python como lenguaje de programación para el desarrollo del trabajo práctico debido al gran ecosistema que ofrece para el procesamiento y análisis de datos, así como para el aprendizaje automático y el aprendizaje por refuerzo. Python es ampliamente utilizado en la comunidad científica y tiene una gran cantidad de bibliotecas y herramientas que facilitan la implementación de modelos complejos.
+
+    Entre las librerías que se usaron se encuentran NumPy, Pandas, TensorFlow, Keras y PyTorch. Estas librerías proporcionan funcionalidades avanzadas para el manejo de datos, la construcción de modelos y la optimización de hiperparámetros, que se detallarán más adelante.
+  ],
+  pie: "Se debe usar Python 3.8 o superior."
+)
+
+=== Julia <julia>
+
+#recuadro(
+  rgb("#955EA6"),
+  "Julia",
+  [
+    Julia es un lenguaje de programación de alto rendimiento y fácil de usar, especialmente diseñado para la computación técnica y científica. Se eligió Julia para el desarrollo del trabajo práctico debido a su capacidad para manejar cálculos numéricos intensivos y su sintaxis clara y concisa.
+
+    Julia es particularmente adecuada para tareas de aprendizaje automático y aprendizaje por refuerzo, ya que ofrece un rendimiento comparable al de lenguajes como C, al tener un compilador JIT (Just in Time). Además, Julia ofrece varios paquetes para realizar análisis de datos y aprendizaje automático, como Flux.jl y MLJ.jl, que permiten construir y entrenar modelos de manera eficiente.
+  ]
+)
 
 == Librerías <librerias>
 
 === Procesamiento y Análisis de los Datos <procesamiento>
 
-+ NumPy
-+ Pandas
-+ Polars
+==== NumPy <numpy>
+
+#recuadro(
+  rgb("#4b73c9"),
+  "NumPy",
+  [
+    NumPy es una biblioteca fundamental para la computación científica en Python. Proporciona un objeto de matriz multidimensional y funciones para trabajar con estos arrays de manera eficiente. NumPy es ampliamente utilizado para realizar operaciones matemáticas y lógicas sobre arrays, así como para manipular datos numéricos.
+
+    En el trabajo práctico, se utilizó NumPy para realizar cálculos matemáticos y manipulación de datos, como la normalización y transformación de los datos de entrada.
+  ]
+)
+
+==== Pandas <pandas>
+
+#recuadro(
+  rgb("#2d18a3"),
+  "Pandas",
+  [
+    Pandas es una biblioteca de Python que proporciona estructuras de datos y herramientas para el análisis de datos. Permite manipular y analizar datos tabulares de manera eficiente, facilitando la carga, limpieza y transformación de datos.
+
+    En el trabajo práctico, se utilizó Pandas para cargar los datos, realizar operaciones de limpieza y transformación, así como para explorar y analizar los datos antes de entrenar los modelos.
+  ]
+)
+
+==== Polars <polars>
+
+#recuadro(
+  rgb("#1681FF"),
+  "Polars",
+  [
+    Polars es una biblioteca de análisis de datos en Python que se centra en la velocidad y la eficiencia. Utiliza un motor de ejecución paralelo y optimizado para realizar operaciones sobre grandes conjuntos de datos de manera rápida.
+
+    En el trabajo práctico, se utilizó Polars para realizar operaciones de análisis y manipulación de datos, aprovechando su rendimiento superior en comparación con otras bibliotecas como Pandas.
+  ]
+)
 
 === Visualización de Datos <visualizacion>
 
-+ Matplotlib
-+ Seaborn
-+ Plotly
+==== MatPlotLib <matplotlib>
+
+#recuadro(
+  rgb("#EA7324"),
+  "MatPlotLib",
+  [
+    Matplotlib es una biblioteca de visualización de datos en Python que permite crear gráficos estáticos, animados e interactivos. Proporciona una amplia variedad de tipos de gráficos y opciones de personalización.
+
+    En el trabajo práctico, se utilizó Matplotlib para crear gráficos y visualizaciones de los resultados obtenidos por los modelos, facilitando la interpretación y análisis de los datos.
+  ]
+)
+
+==== Seaborn <seaborn>
+
+#recuadro(
+  rgb("#89ADC8"),
+  "Seaborn",
+  [
+    Seaborn es una biblioteca de visualización de datos basada en Matplotlib que proporciona una interfaz de alto nivel para crear gráficos atractivos y informativos. Seaborn facilita la creación de gráficos estadísticos y la visualización de relaciones entre variables.
+
+    En el trabajo práctico, se utilizó Seaborn para crear gráficos estadísticos y visualizaciones más complejas, mejorando la presentación de los resultados.
+  ]
+)
+
+==== Plotly <plotly>
+
+#recuadro(
+  rgb("#18A0FF"),
+  "Plotly",
+  [
+    Plotly es una biblioteca de visualización interactiva que permite crear gráficos y dashboards interactivos. Proporciona una amplia variedad de tipos de gráficos y opciones de personalización.
+
+    En el trabajo práctico, se utilizó Plotly para crear visualizaciones interactivas que permiten explorar los resultados de manera más dinámica.
+  ]
+)
 
 === Aprendizaje Automático <aprendizaje>
 
-+ TensorFlow
-+ Keras
-+ PyTorch
-+ Scikit-learn
-+ JAX
+==== TensorFlow <tensor-flow>
+
+#recuadro(
+  rgb("#EE922B"),
+  "TensorFlow",
+  [
+    TensorFlow es una biblioteca de código abierto para el aprendizaje automático y el aprendizaje profundo. Proporciona herramientas y recursos para construir y entrenar modelos de aprendizaje automático, así como para implementar redes neuronales profundas.
+
+    En el trabajo práctico, se utilizó TensorFlow para construir y entrenar los modelos de aprendizaje profundo, aprovechando su flexibilidad y rendimiento.
+  ]
+)
+
+==== Keras <keras>
+
+#recuadro(
+  rgb("#D20808"),
+  "Keras",
+  [
+    Keras es una API de alto nivel para construir y entrenar modelos de aprendizaje profundo. Se integra con TensorFlow y proporciona una interfaz sencilla y fácil de usar para crear redes neuronales.
+
+    En el trabajo práctico, se utilizó Keras para construir y entrenar los modelos de aprendizaje profundo, facilitando la implementación y ajuste de los hiperparámetros.
+  ]
+)
+
+==== PyTorch <pytorch>
+
+#recuadro(
+  rgb("#F05136"),
+  "PyTorch",
+  [
+    PyTorch es una biblioteca de aprendizaje profundo de código abierto que proporciona una interfaz flexible y dinámica para construir y entrenar modelos. Es ampliamente utilizada en la investigación y la industria debido a su facilidad de uso y rendimiento.
+
+    En el trabajo práctico, se utilizó PyTorch para construir y entrenar los modelos de aprendizaje profundo, aprovechando su flexibilidad y capacidad para manejar datos dinámicos.
+  ]
+)
+
+==== Scikit-learn <scikit-learn>
+
+#recuadro(
+  rgb("#F59C4C"),
+  "Scikit-learn",
+  [
+    Scikit-learn es una biblioteca de aprendizaje automático en Python que proporciona herramientas para la construcción y evaluación de modelos. Incluye algoritmos de clasificación, regresión y agrupamiento, así como herramientas para la selección y evaluación de modelos.
+
+    En el trabajo práctico, se utilizó Scikit-learn para realizar tareas de preprocesamiento de datos, selección de características y evaluación de modelos.
+  ]
+)
+
+==== JAX <jax>
+
+#recuadro(
+  rgb("#087E66"),
+  "JAX",
+  [
+    JAX es una biblioteca de Python que permite la diferenciación automática y la ejecución en GPU/TPU. Proporciona herramientas para realizar cálculos numéricos de manera eficiente y flexible.
+
+    En el trabajo práctico, se utilizó JAX para realizar cálculos numéricos y optimización de modelos, aprovechando su capacidad para ejecutar operaciones en paralelo.
+  ]
+)
 
 === Aprendizaje por Refuerzo <aprendizaje-refuerzo>
 
-+ Stable Baselines3
+==== Stable Baselines3 <stable-baselines3>
+
+#recuadro(
+  rgb("#F9A825"),
+  "Stable Baselines3",
+  [
+    Stable Baselines3 es una biblioteca de aprendizaje por refuerzo en Python que proporciona implementaciones de algoritmos populares de aprendizaje por refuerzo. Facilita la construcción y entrenamiento de agentes de aprendizaje por refuerzo.
+
+    En el trabajo práctico, se utilizó Stable Baselines3 para implementar y entrenar el modelo PPO, aprovechando su facilidad de uso y rendimiento.
+  ]
+)
 
 === Simulación de Entornos <simulacion>
 
-+ OpenAI Gym
-+ TensorFlow Agents
+==== OpenAI Gym <openai-gym>
+
+#recuadro(
+  rgb("#16AC86"),
+  "OpenAI Gym",
+  [
+    OpenAI Gym es una biblioteca que proporciona un entorno para el desarrollo y evaluación de algoritmos de aprendizaje por refuerzo. Ofrece una variedad de entornos simulados para entrenar y evaluar agentes.
+
+    En el trabajo práctico, se utilizó OpenAI Gym para simular el entorno del paciente y evaluar el rendimiento del modelo PPO.
+  ]
+)
+
+==== TensorFlow Agents <tf-agents>
+
+#recuadro(
+  rgb("#EE922B"),
+  "TensorFlow Agents",
+  [
+    TensorFlow Agents es una biblioteca de aprendizaje por refuerzo que proporciona herramientas y recursos para construir y entrenar agentes de aprendizaje por refuerzo en entornos simulados.
+
+    En el trabajo práctico, se utilizó TensorFlow Agents para implementar y entrenar el modelo PPO, aprovechando su integración con TensorFlow.
+  ]
+)
 
 === Paralelismo <paralelismo>
 
-+ Joblib
+==== Joblib <joblib>
+
+#recuadro(
+  rgb("#E25B1E"),
+  "Joblib",
+  [
+    Joblib es una biblioteca de Python que proporciona herramientas para la paralelización y el almacenamiento en caché de funciones. Facilita la ejecución de tareas en paralelo y la gestión de recursos computacionales.
+
+    En el trabajo práctico, se utilizó Joblib para paralelizar el entrenamiento de los modelos y optimizar el uso de recursos computacionales.
+  ]
+)
 
 = Dataset <dataset>
 
