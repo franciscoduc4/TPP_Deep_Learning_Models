@@ -258,8 +258,10 @@ Un R#super[2] de 1 indica que el modelo explica toda la variabilidad de los dato
 
 = Modelos <modelos>
 
-== Baseline (Modelo Basado en Reglas) <baseline>
-=== Descripción <descripcion-baseline>
+== Modelos de Aprendizaje Profundo <deep-learning>
+
+=== Baseline (Modelo Basado en Reglas) <baseline>
+==== Descripción <descripcion-baseline>
 
 El modelo Baseline es un enfoque tradicional que usa un conjunto de reglas predefinidas por expertos para calcular la dosis de insulina. En este modelo, se determina la dosis mediante la siguiente fórmula:
 
@@ -282,7 +284,7 @@ El modelo Baseline es un enfoque tradicional que usa un conjunto de reglas prede
   ]
 )
 
-=== Componentes Principales <componentes-baseline>
+==== Componentes Principales <componentes-baseline>
 
 + #highlight(fill: lime.lighten(43%))[*Entradas*]
   - *ci* (_carbInput_): cantidad de carbohidratos de entrada.
@@ -292,7 +294,7 @@ El modelo Baseline es un enfoque tradicional que usa un conjunto de reglas prede
 + #highlight(fill: lime.lighten(43%))[*Regla de Cálculo*]
   - La dosis de insulina se calcula sumando la insulina necesaria para cubrir los carbohidratos y la insulina necesaria para corregir el nivel de glucosa actual al objetivo.
 
-=== Ventajas en la Predicción de Glucosa <ventajas-baseline>
+==== Ventajas en la Predicción de Glucosa <ventajas-baseline>
 #list(
   marker: ([✅], [✓]),
   [De fácil entendimiento e implementación.],
@@ -300,7 +302,7 @@ El modelo Baseline es un enfoque tradicional que usa un conjunto de reglas prede
   [Puede servir como punto de referencia para comparar el rendimiento de los modelos más complejos.]
 )
 
-=== Consideraciones Importantes <consideraciones-baseline>
+==== Consideraciones Importantes <consideraciones-baseline>
 
 #list(
   marker: [⚠︎],
@@ -309,12 +311,12 @@ El modelo Baseline es un enfoque tradicional que usa un conjunto de reglas prede
   [No aprende de los datos ni mejora con el tiempo.]
 )
 
-== FNN (Feedforward Neural Network) <fnn>
-=== Descripción <descripcion-fnn>
+=== FNN (Feedforward Neural Network) <fnn>
+==== Descripción <descripcion-fnn>
 
 Feedforward Neural Network (FNN, Red Neuronal Feedforward) es un tipo de red neuronal artificial donde las conexiones entre los nodos (las neuronas) no forman un ciclo.La información se mueve en una sola dirección, desde la capa de entrada, a través de las capas ocultas (si las hay), hasta la capa de salida. En este contexto, el FNN se utiliza para predecir la dosis de insulina basándose en las lecturas del monitor continuo de glucosa (CGM) y otras características relevantes en un momento dado.
 
-=== Componentes Principales <componentes-fnn>
+==== Componentes Principales <componentes-fnn>
 
 + #highlight(fill: lime.lighten(43%))[*Capa de Entrada*]
   - Recibe las características relevantes para la predicción, como las lecturas de CGM recientes, ingesta de carbohidratos, nivel actual de glucosa, etc.
@@ -332,7 +334,7 @@ Feedforward Neural Network (FNN, Red Neuronal Feedforward) es un tipo de red neu
   - Se utiliza una función de pérdida como el error cuadrático medio (MSE) para medir la discrepancia entre las predicciones de la red y los valores reales de dosis de insulina.
   - El objetivo del entrenamiento es minimizar esta función de pérdida ajustando los pesos de la red.
 
-=== Ventajas en la Predicción de Glucosa <ventajas-fnn>
+==== Ventajas en la Predicción de Glucosa <ventajas-fnn>
 
 #list(
   marker: ([✅], [✓]),
@@ -341,7 +343,7 @@ Feedforward Neural Network (FNN, Red Neuronal Feedforward) es un tipo de red neu
   [Puede utilizar diversas características como entrada para mejorar la precisión de la predicción.]
 )
 
-=== Consideraciones Importantes <consideraciones-fnn>
+==== Consideraciones Importantes <consideraciones-fnn>
 
 #list(
   marker: [⚠︎],
@@ -350,12 +352,12 @@ Feedforward Neural Network (FNN, Red Neuronal Feedforward) es un tipo de red neu
   [La elección de la arquitectura (número de capas y neuronas) y los hiperparámetros requiere experimntación y ajuste.]
 )
 
-== TCN (Temporal Convolutional Network) <tcn>
-=== Descripción <descripcion-tcn>
+=== TCN (Temporal Convolutional Network) <tcn>
+==== Descripción <descripcion-tcn>
 
 Temporal Convolutional Network (TCN, Red Convolucional Temporal) es una arquitectura de red neuronal diseñada específicamente para procesar datos secuenciales. A diferencia de las redes neuronales recurrentes (RNN), las TCNs usan convoluciones casuales, lo que significa que la predicción en un momento dado solo depende de los datos pasados y presentes, evitando la 'mirada hacia el futuro'. Además, las TCNs a menudo incorporan redes residuales para facilitar el entrenamiento de redes profundas y mitigar el problema del gradiente desvaneciente @vanishing-gradient.
 
-=== Componentes Principales <componentes-tcn>
+==== Componentes Principales <componentes-tcn>
 
 + #highlight(fill: lime.lighten(43%))[*Convoluciones Causales*]
   - Aseguran que la salida en el tiempo $t$ solo dependa de las entradas hasta el tiempo $t$.
@@ -367,7 +369,7 @@ Temporal Convolutional Network (TCN, Red Convolucional Temporal) es una arquitec
   - Las convoluciones dilatadas permiten que la red tenga un campo receptivo muy grande con relativamente pocas capas.
   - El factor de dilatación aumenta exponencialmente con la profundidad de la red, permitiendo capturar dependencias a largo plazo en la secuencia.
 
-=== Ventajas en la Predicción de Glucosa <ventajas-tcn>
+==== Ventajas en la Predicción de Glucosa <ventajas-tcn>
 
 #list(
   marker: ([✅], [✓]),
@@ -377,7 +379,7 @@ Temporal Convolutional Network (TCN, Red Convolucional Temporal) es una arquitec
   [Puede capturar patrones tanto locales como globales en las series temporales.]
 )
 
-=== Consideraciones Importantes <consideraciones-tcn>
+==== Consideraciones Importantes <consideraciones-tcn>
 
 #list(
   marker: [⚠︎],
@@ -386,14 +388,14 @@ Temporal Convolutional Network (TCN, Red Convolucional Temporal) es una arquitec
   [El diseño de la arquitectura (número de filtros, capas, tasas de dilatación) puede requerir ajustes.]
 )
 
-== GRU (Gated Recurrent Unit) <gru>
-=== Descripción <descripcion-gru>
+=== GRU (Gated Recurrent Unit) <gru>
+==== Descripción <descripcion-gru>
 
 Gated Recurrent Unit (GRU, Unidad Recurrente Cerrada) es un tipo de red neuronal recurrente (RNN) que, al igual que el LSTM (Long Short Term Memory), está diseñada para manejar datos secuenciales y dependencias a largo plazo. Sin embargo, la GRU tiene una arquitectura más sumple con solo dos puertas: una de actualización; otra de reinicio.
 
 La puerta de actualización controla cuánto del estado anterior debe conservarse, y cuánta nueva información debe agregarse. La puerta de reinicio determina cuánto del estado anterior debe olvidarse. Esta simplificación hace que las GRUs sean a menudo más rápidas de entrenar y tengan menos parámetros que las LSTMs, al tiempo que mantienen una capacidad similar para capturar dependencias temporales.
 
-=== Componentes Principales <componentes-gru>
+==== Componentes Principales <componentes-gru>
 
 + #highlight(fill: lime.lighten(43%))[*Puerta de Actualización*]
   - Controla cuánto del estado oculto anterior se mantiene en el estado oculto actual.
@@ -408,7 +410,7 @@ La puerta de actualización controla cuánto del estado anterior debe conservars
   - Almacena la información aprendida de la secuencia hasta el momento.
   - Se actualiza en cada paso de tiempo utilizando las puertas de actualización y reinicio.
 
-=== Ventajas en la Predicción de Glucosa <ventajas-gru>
+==== Ventajas en la Predicción de Glucosa <ventajas-gru>
 
 #list(
   marker: ([✅], [✓]),
@@ -418,7 +420,7 @@ La puerta de actualización controla cuánto del estado anterior debe conservars
   [Puede lograr un rendimiento similar al LSTM en muchas tareas de modelado de secuencias.]
 )
 
-=== Consideraciones Importantes <consideraciones-gru>
+==== Consideraciones Importantes <consideraciones-gru>
 
 #list(
   marker: [⚠︎],
@@ -427,8 +429,13 @@ La puerta de actualización controla cuánto del estado anterior debe conservars
   [La longitud de la secuencia y el número de unidades GRU afectan el rendimiento.]
 )
 
-== PPO (Proximal Policy Optimization) <ppo>
-=== Descripción <descripcion-ppo>
+== Modelos de Aprendizaje por Refuerzo <reinforcement-learning>
+
+
+== Modelos de Aprendizaje por Refuerzo Profundo <drl>
+
+=== PPO (Proximal Policy Optimization) <ppo>
+==== Descripción <descripcion-ppo>
 
 Proximal Policy Optimization (PPO, Optimización de Políticas Proximal) es un algoritmo de aprendizaje por refuerzo que se usa para entrenar agentes que toman decisiones secuenciales. En el contexto de la predicción de dosis de insulina, el agente (modelo PPO) aprende una política, que es una función que mappea el estado actual del paciente (por ejemplo, lecturas de CGM, ingesta de carbohidratos, actividad física) a una acción (la dosis de insulina a administrar).
 
@@ -436,7 +443,7 @@ El objetivo del agente es aprender una política que maximice una recompensa acu
 
 PPO es un algoritmo _on-policy_, lo que significa que aprende de las experiencias generadas por la política actual y actualiza la política de manera tal que los nuevos comportamientos no se desvíen demasiado de los antiguos, ayudando a estabilizar el entrenamiento.
 
-=== Componentes Principales <componentes-ppo>
+==== Componentes Principales <componentes-ppo>
 
 + #highlight(fill: lime.lighten(43%))[*Agente*]
   - El modelo que aprende a tomar decisiones sobre la dosis de insulina a administrar en función del estado actual del paciente.
@@ -455,7 +462,7 @@ PPO es un algoritmo _on-policy_, lo que significa que aprende de las experiencia
   - El mecanismo clave de PPO que limita la magnitud del cambio en la política durante cada actualización para evitar grandes caídas en el rendimiento.
   - Utiliza una función objetivo recortada para asegurar que la nueva política no sea demasiado diferente de la política anterior.
 
-=== Ventajas en la Predicción de Glucosa <ventajas-ppo>
+==== Ventajas en la Predicción de Glucosa <ventajas-ppo>
 
 #list(
   marker: ([✅], [✓]),
@@ -464,7 +471,7 @@ PPO es un algoritmo _on-policy_, lo que significa que aprende de las experiencia
   [Puede incorporar múltiples factores y objetivos en la función de recompensa. Por ejemplo, mantener la glucosa en rango, minimizar la hipoglucemia, hiperglucemia, etc.]
 )
 
-=== Consideraciones Importantes <consideraciones-ppo>
+==== Consideraciones Importantes <consideraciones-ppo>
 
 #list(
   marker: [⚠︎],
@@ -516,8 +523,12 @@ PPO es un algoritmo _on-policy_, lo que significa que aprende de las experiencia
 
 + Joblib
 
-= Resultados y Análisis <resultados>
+= Dataset <dataset>
 
+= Metodología de Entrenamiento <metodologia>
+
+
+= Resultados y Análisis <resultados>
 
 
 = Conclusiones <conclusiones>
