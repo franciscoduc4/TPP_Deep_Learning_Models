@@ -9,7 +9,7 @@ sys.path.append(PROJECT_ROOT)
 
 from models.config import CNN_CONFIG
 
-class squeeze_excitation_block(nn.Module):
+class SqueezeExcitationBlock(nn.Module):
     """
     Bloque Squeeze-and-Excitation como módulo de Flax.
     
@@ -77,7 +77,7 @@ def create_residual_block(x: jnp.ndarray, filters: int, dilation_rate: int = 1) 
     
     # Squeeze-and-Excitation
     if CNN_CONFIG['use_se_block']:
-        x = squeeze_excitation_block(filters=filters, se_ratio=CNN_CONFIG['se_ratio'])(x)
+        x = SqueezeExcitationBlock(filters=filters, se_ratio=CNN_CONFIG['se_ratio'])(x)
     
     # Proyección del residual si es necesario
     if skip.shape[-1] != filters:
@@ -116,7 +116,7 @@ def get_activation(x: jnp.ndarray, activation_name: str) -> jnp.ndarray:
     else:
         return nn.relu(x)  # Valor por defecto
 
-class cnn_model(nn.Module):
+class CNNModel(nn.Module):
     """
     Modelo CNN (Red Neuronal Convolucional) con entrada dual para datos CGM y otras características.
     
@@ -201,7 +201,7 @@ class cnn_model(nn.Module):
         
         return output
 
-def create_cnn_model(cgm_shape: tuple, other_features_shape: tuple) -> cnn_model:
+def create_cnn_model(cgm_shape: tuple, other_features_shape: tuple) -> CNNModel:
     """
     Crea un modelo CNN (Red Neuronal Convolucional) con JAX/Flax.
     
@@ -217,7 +217,7 @@ def create_cnn_model(cgm_shape: tuple, other_features_shape: tuple) -> cnn_model
     cnn_model
         Modelo Flax inicializado
     """
-    model = cnn_model(
+    model = CNNModel(
         config=CNN_CONFIG,
         cgm_shape=cgm_shape,
         other_features_shape=other_features_shape

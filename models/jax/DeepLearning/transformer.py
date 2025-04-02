@@ -9,7 +9,7 @@ sys.path.append(PROJECT_ROOT)
 
 from models.config import TRANSFORMER_CONFIG
 
-class position_encoding(nn.Module):
+class PositionEncoding(nn.Module):
     """
     Codificación posicional para el Transformer.
     
@@ -156,7 +156,7 @@ def create_transformer_block(inputs: jnp.ndarray, head_size: int, num_heads: int
         ffn = nn.Dropout(rate=dropout_rate, deterministic=deterministic)(ffn)
         return nn.LayerNorm(epsilon=TRANSFORMER_CONFIG['epsilon'])(res1 + ffn)
 
-class transformer_model(nn.Module):
+class TransformerModel(nn.Module):
     """
     Modelo Transformer con entrada dual para datos CGM y otras características.
     
@@ -196,7 +196,7 @@ class transformer_model(nn.Module):
         # Proyección inicial y codificación posicional
         x = nn.Dense(self.config['key_dim'] * self.config['num_heads'])(cgm_input)
         if self.config['use_relative_pos']:
-            x = position_encoding(
+            x = PositionEncoding(
                 max_position=self.config['max_position'],
                 d_model=self.config['key_dim'] * self.config['num_heads']
             )(x)
@@ -244,7 +244,7 @@ class transformer_model(nn.Module):
         
         return output
 
-def create_transformer_model(cgm_shape: tuple, other_features_shape: tuple) -> transformer_model:
+def create_transformer_model(cgm_shape: tuple, other_features_shape: tuple) -> TransformerModel:
     """
     Crea un modelo Transformer con entrada dual para datos CGM y otras características con JAX/Flax.
     
@@ -260,7 +260,7 @@ def create_transformer_model(cgm_shape: tuple, other_features_shape: tuple) -> t
     transformer_model
         Modelo Transformer inicializado
     """
-    model = transformer_model(
+    model = TransformerModel(
         config=TRANSFORMER_CONFIG,
         cgm_shape=cgm_shape,
         other_features_shape=other_features_shape

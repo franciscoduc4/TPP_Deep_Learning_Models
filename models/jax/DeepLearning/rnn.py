@@ -9,7 +9,7 @@ sys.path.append(PROJECT_ROOT)
 
 from models.config import RNN_CONFIG
 
-class time_distributed(nn.Module):
+class TimeDistributed(nn.Module):
     """
     Aplica una capa a cada paso temporal de forma independiente.
     
@@ -46,7 +46,7 @@ class time_distributed(nn.Module):
         output_features = outputs.shape[-1]
         return jnp.reshape(outputs, [batch_size, time_steps, output_features])
 
-class simple_rnn_cell(nn.Module):
+class SimpleRNNCell(nn.Module):
     """
     Implementación de una celda RNN simple.
     
@@ -262,7 +262,7 @@ def apply_rnn(cell_fn: Callable, inputs: jnp.ndarray, units: int, return_sequenc
             first_backward = outputs[:, 0, units:]
             return jnp.concatenate([last_forward, first_backward], axis=-1)
 
-class rnn_model(nn.Module):
+class RNNModel(nn.Module):
     """
     Modelo RNN optimizado para velocidad con procesamiento temporal distribuido.
     
@@ -301,9 +301,9 @@ class rnn_model(nn.Module):
         
         # Procesamiento temporal distribuido inicial
         if self.config['use_time_distributed']:
-            x = time_distributed(nn.Dense(32))(cgm_input)
+            x = TimeDistributed(nn.Dense(32))(cgm_input)
             x = get_activation(x, self.config['activation'])
-            x = time_distributed(nn.BatchNorm(
+            x = TimeDistributed(nn.BatchNorm(
                 epsilon=self.config['epsilon'],
                 momentum=0.9,
                 use_running_average=deterministic
@@ -322,7 +322,7 @@ class rnn_model(nn.Module):
         for units in self.config['hidden_units']:
             # Crear la celda RNN
             def create_rnn_cell(units=units):
-                return lambda h, x, dr, rdr, det: simple_rnn_cell(
+                return lambda h, x, dr, rdr, det: SimpleRNNCell(
                     units=units,
                     activation=get_activation_fn(self.config['activation'])
                 )(h, x, dr, rdr, det)
@@ -348,7 +348,7 @@ class rnn_model(nn.Module):
         
         # Último RNN sin return_sequences
         def create_final_rnn_cell(units=self.config['hidden_units'][-1]):
-            return lambda h, x, dr, rdr, det: simple_rnn_cell(
+            return lambda h, x, dr, rdr, det: SimpleRNNCell(
                 units=units,
                 activation=get_activation_fn(self.config['activation'])
             )(h, x, dr, rdr, det)
@@ -424,7 +424,7 @@ def get_activation_fn(activation_name: str) -> Callable:
     else:
         return jax.nn.relu  # Por defecto
 
-def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> rnn_model:
+def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> RNNModel:
     """
     Crea un modelo RNN optimizado para velocidad con procesamiento temporal distribuido con JAX/Flax.
     
@@ -440,7 +440,7 @@ def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> rnn_model
     rnn_model
         Modelo RNN inicializado
     """
-    model = rnn_model(
+    model = RNNModel(
         config=RNN_CONFIG,
         cgm_shape=cgm_shape,
         other_features_shape=other_features_shape

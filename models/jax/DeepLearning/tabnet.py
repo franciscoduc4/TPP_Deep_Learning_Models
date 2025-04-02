@@ -12,7 +12,7 @@ sys.path.append(PROJECT_ROOT)
 
 from models.config import TABNET_CONFIG
 
-class glu(nn.Module):
+class GLU(nn.Module):
     """
     Gated Linear Unit como módulo de Flax.
     
@@ -41,7 +41,7 @@ class glu(nn.Module):
         x = nn.Dense(self.units * 2)(inputs)
         return x[:, :self.units] * jax.nn.sigmoid(x[:, self.units:])
 
-class multi_head_feature_attention(nn.Module):
+class MultiHeadFeatureAttention(nn.Module):
     """
     Atención multi-cabeza para características.
     
@@ -84,7 +84,7 @@ class multi_head_feature_attention(nn.Module):
         
         return nn.LayerNorm(epsilon=1e-6)(inputs + attention_output)
 
-class ghost_batch_norm(nn.Module):
+class GhostBatchNorm(nn.Module):
     """
     Ghost Batch Normalization para conjuntos de datos pequeños.
     
@@ -165,7 +165,7 @@ class ghost_batch_norm(nn.Module):
         # Normalizar
         return scale * (x - mean) / jnp.sqrt(var + self.epsilon) + bias
 
-class enhanced_feature_transformer(nn.Module):
+class EnhancedFeatureTransformer(nn.Module):
     """
     Transformador de características mejorado con atención y ghost batch norm.
     
@@ -203,16 +203,16 @@ class enhanced_feature_transformer(nn.Module):
             Tensor transformado
         """
         # GLU layers
-        x = glu(self.feature_dim)(inputs)
-        x = ghost_batch_norm(self.virtual_batch_size)(x, deterministic=deterministic)
-        x = multi_head_feature_attention(
+        x = GLU(self.feature_dim)(inputs)
+        x = GhostBatchNorm(self.virtual_batch_size)(x, deterministic=deterministic)
+        x = MultiHeadFeatureAttention(
             num_heads=self.num_heads,
             key_dim=self.feature_dim // self.num_heads,
             dropout=self.dropout_rate
         )(x, deterministic=deterministic)
         
-        x = glu(self.feature_dim)(x)
-        x = ghost_batch_norm(self.virtual_batch_size)(x, deterministic=deterministic)
+        x = GLU(self.feature_dim)(x)
+        x = GhostBatchNorm(self.virtual_batch_size)(x, deterministic=deterministic)
         return nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
 
 def custom_softmax(x: jnp.ndarray, axis: int = -1) -> jnp.ndarray:
@@ -256,7 +256,7 @@ def feature_transformer(x: jnp.ndarray, feature_dim: int, batch_momentum: float 
     transform_gated = transform[:, :feature_dim] * jax.nn.sigmoid(transform[:, feature_dim:])
     return nn.BatchNorm(momentum=batch_momentum)(transform_gated)
 
-class tabnet_model(nn.Module):
+class TabnetModel(nn.Module):
     """
     Modelo TabNet personalizado con manejo de pérdidas de entropía.
     
@@ -279,7 +279,7 @@ class tabnet_model(nn.Module):
         """
         # Configuración de transformers
         self.transformers = [
-            enhanced_feature_transformer(
+            EnhancedFeatureTransformer(
                 feature_dim=self.config['feature_dim'],
                 num_heads=self.config['num_attention_heads'],
                 virtual_batch_size=self.config['virtual_batch_size'],
@@ -381,7 +381,7 @@ class tabnet_model(nn.Module):
         
         return output, entropy_loss
 
-def create_tabnet_model(cgm_shape: tuple, other_features_shape: tuple) -> tabnet_model:
+def create_tabnet_model(cgm_shape: tuple, other_features_shape: tuple) -> TabnetModel:
     """
     Crea un modelo TabNet mejorado con JAX/Flax.
     
@@ -397,7 +397,7 @@ def create_tabnet_model(cgm_shape: tuple, other_features_shape: tuple) -> tabnet
     tabnet_model
         Modelo TabNet inicializado
     """
-    model = tabnet_model(
+    model = TabnetModel(
         config=TABNET_CONFIG,
         cgm_shape=cgm_shape,
         other_features_shape=other_features_shape
@@ -405,7 +405,7 @@ def create_tabnet_model(cgm_shape: tuple, other_features_shape: tuple) -> tabnet
     
     return model
 
-def create_train_state(model: tabnet_model, 
+def create_train_state(model: TabnetModel, 
                        rng: jax.random.PRNGKey, 
                        learning_rate: float,
                        cgm_shape: Tuple[int, ...],

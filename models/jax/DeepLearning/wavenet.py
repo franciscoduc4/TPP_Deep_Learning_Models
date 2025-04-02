@@ -9,7 +9,7 @@ sys.path.append(PROJECT_ROOT)
 
 from models.config import WAVENET_CONFIG
 
-class wavenet_block(nn.Module):
+class WavenetBlock(nn.Module):
     """
     Bloque WaveNet mejorado con activaciones gated y escalado adaptativo.
     
@@ -183,7 +183,7 @@ def create_wavenet_block(x: jnp.ndarray, filters: int, kernel_size: int,
     
     return res, conv
 
-class wavenet_model(nn.Module):
+class WavenetModel(nn.Module):
     """
     Modelo WaveNet para predicción de series temporales con JAX/Flax.
     
@@ -233,7 +233,7 @@ class wavenet_model(nn.Module):
         # WaveNet stack
         for filters in self.config['filters']:
             for dilation in self.config['dilations']:
-                wavenet = wavenet_block(
+                wavenet = WavenetBlock(
                     filters=filters,
                     kernel_size=self.config['kernel_size'],
                     dilation_rate=dilation,
@@ -305,7 +305,7 @@ class wavenet_model(nn.Module):
         
         return output
 
-def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> wavenet_model:
+def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> WavenetModel:
     """
     Crea un modelo WaveNet para predicción de series temporales con JAX/Flax.
     
@@ -321,7 +321,7 @@ def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> waven
     wavenet_model
         Modelo WaveNet inicializado
     """
-    model = wavenet_model(
+    model = WavenetModel(
         config=WAVENET_CONFIG,
         cgm_shape=cgm_shape,
         other_features_shape=other_features_shape

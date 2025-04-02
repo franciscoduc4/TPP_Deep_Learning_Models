@@ -73,7 +73,7 @@ def create_gru_attention_block(x: jnp.ndarray, units: int, num_heads: int = 4,
     
     return x
 
-class gru_model(nn.Module):
+class GRUModel(nn.Module):
     """
     Modelo GRU avanzado con self-attention y conexiones residuales.
     
@@ -127,7 +127,7 @@ class gru_model(nn.Module):
         
         return output
 
-def create_gru_model(cgm_shape: tuple, other_features_shape: tuple) -> gru_model:
+def create_gru_model(cgm_shape: tuple, other_features_shape: tuple) -> GRUModel:
     """
     Crea un modelo GRU avanzado con self-attention y conexiones residuales con JAX/Flax.
     
@@ -143,7 +143,7 @@ def create_gru_model(cgm_shape: tuple, other_features_shape: tuple) -> gru_model
     gru_model
         Modelo GRU inicializado
     """
-    model = gru_model(
+    model = GRUModel(
         config=GRU_CONFIG,
         cgm_shape=cgm_shape,
         other_features_shape=other_features_shape

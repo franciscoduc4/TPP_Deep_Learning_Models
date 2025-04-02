@@ -9,7 +9,7 @@ sys.path.append(PROJECT_ROOT)
 
 from models.config import TCN_CONFIG
 
-class weight_normalization(nn.Module):
+class WeightNormalization(nn.Module):
     """
     Normalización de pesos para capas convolucionales.
     
@@ -123,7 +123,7 @@ def create_tcn_block(inputs: jnp.ndarray, filters: int, kernel_size: int,
     
     # Convolución con weight normalization o convolución estándar
     if TCN_CONFIG['use_weight_norm']:
-        conv = weight_normalization(
+        conv = WeightNormalization(
             filters=filters * 2,  # Double for gating
             kernel_size=kernel_size,
             dilation_rate=dilation_rate
@@ -176,7 +176,7 @@ def create_tcn_block(inputs: jnp.ndarray, filters: int, kernel_size: int,
     
     return conv
 
-class tcn_model(nn.Module):
+class TCNModel(nn.Module):
     """
     Modelo TCN completo usando JAX/Flax.
     
@@ -294,7 +294,7 @@ class tcn_model(nn.Module):
         
         return output
 
-def create_tcn_model(input_shape: tuple, other_features_shape: tuple) -> tcn_model:
+def create_tcn_model(input_shape: tuple, other_features_shape: tuple) -> TCNModel:
     """
     Crea un modelo TCN completo con JAX/Flax.
     
@@ -310,7 +310,7 @@ def create_tcn_model(input_shape: tuple, other_features_shape: tuple) -> tcn_mod
     tcn_model
         Modelo TCN inicializado
     """
-    model = tcn_model(
+    model = TCNModel(
         config=TCN_CONFIG,
         input_shape=input_shape,
         other_features_shape=other_features_shape

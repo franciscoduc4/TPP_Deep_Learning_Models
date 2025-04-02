@@ -102,7 +102,7 @@ def get_activation(x: jnp.ndarray, activation_name: str) -> jnp.ndarray:
     else:
         return nn.relu(x)  # Valor por defecto
 
-class fnn_model(nn.Module):
+class FNNModel(nn.Module):
     """
     Modelo de red neuronal feedforward (FNN) con características modernas implementado en JAX/Flax.
     
@@ -189,7 +189,7 @@ class fnn_model(nn.Module):
         return self._build_output_layer(x)
 
 def create_fnn_model(input_shape: tuple, 
-                     other_features_shape: Optional[tuple] = None) -> fnn_model:
+                     other_features_shape: Optional[tuple] = None) -> FNNModel:
     """
     Crea un modelo de red neuronal feedforward (FNN) con JAX/Flax.
     
@@ -205,7 +205,7 @@ def create_fnn_model(input_shape: tuple,
     fnn_model
         Modelo FNN inicializado
     """
-    model = fnn_model(
+    model = FNNModel(
         config=FNN_CONFIG,
         input_shape=input_shape,
         other_features_shape=other_features_shape
@@ -213,7 +213,7 @@ def create_fnn_model(input_shape: tuple,
     
     return model
 
-def create_train_state(model: fnn_model, 
+def create_train_state(model: FNNModel, 
                        rng: jax.random.PRNGKey, 
                        input_shape: tuple,
                        other_features_shape: Optional[tuple] = None,

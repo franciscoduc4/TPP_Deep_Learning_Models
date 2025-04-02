@@ -123,7 +123,7 @@ def get_activation_fn(activation_name: str):
     else:
         return jax.nn.tanh  # Por defecto
 
-class lstm_model(nn.Module):
+class LSTMModel(nn.Module):
     """
     Modelo LSTM avanzado con self-attention y conexiones residuales.
     
@@ -284,7 +284,7 @@ def create_forward_lstm(x: jnp.ndarray, units: int, dropout_rate: float, recurre
     
     return outputs
 
-def create_lstm_model(cgm_shape: tuple, other_features_shape: tuple) -> lstm_model:
+def create_lstm_model(cgm_shape: tuple, other_features_shape: tuple) -> LSTMModel:
     """
     Crea un modelo LSTM avanzado con self-attention y conexiones residuales con JAX/Flax.
     
@@ -300,7 +300,7 @@ def create_lstm_model(cgm_shape: tuple, other_features_shape: tuple) -> lstm_mod
     lstm_model
         Modelo LSTM inicializado
     """
-    model = lstm_model(
+    model = LSTMModel(
         config=LSTM_CONFIG,
         cgm_shape=cgm_shape,
         other_features_shape=other_features_shape
