@@ -290,7 +290,7 @@ class TabnetModel(tf.keras.Model):
                 # Calcular entropía
                 entropy = tf.reduce_mean(tf.reduce_sum(
                     -mask * tf.math.log(mask + 1e-15), axis=1
-                ))
+                ), axis=0)
                 entropy_loss += entropy
         
         # Combinar salidas con atención
