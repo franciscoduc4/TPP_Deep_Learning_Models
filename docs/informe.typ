@@ -262,6 +262,8 @@ Un R#super[2] de 1 indica que el modelo explica toda la variabilidad de los dato
 
 == Modelo Basado en Reglas <rule-based>
 
+El modelo basado en reglas es un enfoque tradicional que utiliza un conjunto de reglas predefinidas para calcular la dosis de insulina. Este modelo se basa en la experiencia clínica y el conocimiento experto, y no requiere entrenamiento previo con datos históricos.
+
 === Baseline (Modelo Basado en Reglas) <baseline>
 ==== Descripción <descripcion-baseline>
 
@@ -314,6 +316,10 @@ El modelo Baseline es un enfoque tradicional que usa un conjunto de reglas prede
 )
 
 == Modelos de Aprendizaje Profundo <deep-learning>
+
+Los modelos de aprendizaje profundo son algoritmos que utilizan redes neuronales para aprender patrones complejos en los datos. Estos modelos son capaces de capturar relaciones no lineales y dependencias temporales en los datos, lo que los hace adecuados para tareas como la predicción de dosis de insulina basándose en lecturas de glucosa.
+
+Los modelos de aprendizaje profundo se entrenan utilizando grandes cantidades de datos históricos, lo que les permite captar y aprender patrones y relaciones complejas en los datos. A continuación, se describen los modelos de aprendizaje profundo utilizados en este trabajo práctico.
 
 === Attention-Only <attention-only>
 ==== Descripción <descripcion-attention>
@@ -754,6 +760,10 @@ WaveNet es capaz de modelar secuencias de longitud variable y puede aprender pat
 
 == Modelos de Aprendizaje por Refuerzo <reinforcement-learning>
 
+Los modelos de aprendizaje por refuerzo son algoritmos que aprenden a tomar decisiones secuenciales en un entorno, maximizando una recompensa acumulada a lo largo del tiempo. En el contexto de la predicción de dosis de insulina, estos modelos pueden ser utilizados para aprender políticas óptimas de administración de insulina basándose en las lecturas del monitor continuo de glucosa (CGM) y otras características relevantes.
+
+Los modelos de aprendizaje por refuerzo son particularmente útiles en situaciones donde las decisiones deben tomarse en un contexto dinámico y donde las acciones pueden tener consecuencias a largo plazo. En este caso, el objetivo es aprender una política que maximice la recompensa acumulada, que puede estar relacionada con mantener los niveles de glucosa dentro de un rango objetivo.
+
 === Métodos Monte Carlo <monte-carlo-methods>
 ==== Descripción <descripcion-monte-carlo>
 
@@ -1054,6 +1064,12 @@ El algoritmo comienza con una estimación inicial de los valores de los estados 
 )
 
 == Modelos de Aprendizaje por Refuerzo Profundo <drl>
+
+Los modelos de aprendizaje por refuerzo profundo (Deep Reinforcement Learning, DRL) combinan el aprendizaje por refuerzo con redes neuronales profundas para abordar problemas complejos donde los espacios de estado y acción son grandes o continuos. En el contexto de la predicción de dosis de insulina, los modelos DRL pueden ser utilizados para aprender políticas óptimas de administración de insulina basándose en las lecturas del monitor continuo de glucosa (CGM) y otras características relevantes.
+
+Los modelos DRL son particularmente útiles en situaciones donde las decisiones deben tomarse en un contexto dinámico y donde las acciones pueden tener consecuencias a largo plazo. En este caso, el objetivo es aprender una política que maximice la recompensa acumulada, que puede estar relacionada con mantener los niveles de glucosa dentro de un rango objetivo.
+
+Los modelos DRL utilizan redes neuronales profundas para aproximar funciones de valor y políticas, lo que les permite manejar espacios de estado y acción complejos. Estos modelos son capaces de aprender representaciones jerárquicas de los datos y pueden generalizar a situaciones no vistas durante el entrenamiento.
 
 === A2C-A3C (Advantage Actor-Critic) <a2c-a3c>
 ==== Descripción <descripcion-a2c-a3c>
@@ -1632,7 +1648,7 @@ TRPO es un algoritmo _on-policy_, lo que significa que aprende de las experienci
   [
     Joblib es una biblioteca de Python que proporciona herramientas para la paralelización y el almacenamiento en caché de funciones. Facilita la ejecución de tareas en paralelo y la gestión de recursos computacionales.
 
-    En el trabajo práctico, se utilizó Joblib para paralelizar el entrenamiento de los modelos y optimizar el uso de recursos computacionales.
+    En el trabajo práctico, se utilizó Joblib para paralelizar procesamiento de los datos y optimizar el uso de recursos computacionales.
   ]
 )
 
