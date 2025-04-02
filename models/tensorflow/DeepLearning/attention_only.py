@@ -7,6 +7,7 @@ from tensorflow.keras.layers import (
     Add
 )
 from keras.saving import register_keras_serializable
+from typing import Dict, Tuple, Any, Optional
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -17,6 +18,18 @@ from models.config import ATTENTION_CONFIG
 class RelativePositionEncoding(tf.keras.layers.Layer):
     """
     Codificación de posición relativa para mejorar la atención temporal.
+    
+    Parámetros:
+    -----------
+    max_position : int
+        Posición máxima a codificar
+    depth : int
+        Profundidad de la codificación
+        
+    Retorna:
+    --------
+    tf.Tensor
+        Tensor de codificación de posición
     """
     def __init__(self, max_position: int, depth: int, **kwargs):
         super().__init__(**kwargs)
@@ -31,12 +44,46 @@ class RelativePositionEncoding(tf.keras.layers.Layer):
         )
         self.built = True
         
-    def call(self, inputs):
-        # Now this function takes the actual tensor as input, not just the length
+    def call(self, inputs: tf.Tensor) -> tf.Tensor:
         length = tf.shape(inputs)[1]
         pos_indices = tf.range(length)[:, tf.newaxis] - tf.range(length)[tf.newaxis, :] + self.max_position - 1
         pos_emb = tf.gather(self.rel_embeddings, pos_indices)
         return pos_emb
+    
+    def get_config(self) -> Dict:
+        config = super().get_config()
+        config.update({
+            "max_position": self.max_position,
+            "depth": self.depth
+        })
+        return config
+
+def get_activation(x: tf.Tensor, activation_name: str) -> tf.Tensor:
+    """
+    Aplica la función de activación según su nombre.
+    
+    Parámetros:
+    -----------
+    x : tf.Tensor
+        Tensor al que aplicar la activación
+    activation_name : str
+        Nombre de la función de activación
+        
+    Retorna:
+    --------
+    tf.Tensor
+        Tensor con la activación aplicada
+    """
+    if activation_name == 'relu':
+        return tf.nn.relu(x)
+    elif activation_name == 'gelu':
+        return tf.nn.gelu(x)
+    elif activation_name == 'swish':
+        return tf.nn.swish(x)
+    elif activation_name == 'silu':
+        return tf.nn.silu(x)
+    else:
+        return tf.nn.relu(x)  # Valor por defecto
 
 def create_attention_block(x: tf.Tensor, num_heads: int, key_dim: int, 
                          ff_dim: int, dropout_rate: float, training: bool = None) -> tf.Tensor:
@@ -63,9 +110,8 @@ def create_attention_block(x: tf.Tensor, num_heads: int, key_dim: int,
     tf.Tensor
         Tensor procesado
     """
-    # Relative position encoding
+    # Codificación de posición relativa
     if ATTENTION_CONFIG['use_relative_attention']:
-        # Pass the whole tensor x, not just its length
         pos_encoding = RelativePositionEncoding(
             ATTENTION_CONFIG['max_relative_position'],
             key_dim
@@ -82,14 +128,14 @@ def create_attention_block(x: tf.Tensor, num_heads: int, key_dim: int,
             key_dim=key_dim
         )(x, x)
     
-    # Gating mechanism
-    gate = tf.keras.layers.Dense(attention_output.shape[-1], activation='sigmoid')(x)
+    # Mecanismo de gating
+    gate = Dense(attention_output.shape[-1], activation='sigmoid')(x)
     attention_output = gate * attention_output
     
     attention_output = Dropout(dropout_rate)(attention_output, training=training)
     x = LayerNormalization(epsilon=1e-6)(x + attention_output)
     
-    # Enhanced feed-forward network with GLU
+    # Red feed-forward mejorada con GLU
     ffn = Dense(ff_dim)(x)
     ffn_gate = Dense(ff_dim, activation='sigmoid')(x)
     ffn = ffn * ffn_gate
@@ -105,9 +151,9 @@ def create_attention_model(cgm_shape: tuple, other_features_shape: tuple) -> Mod
     Parámetros:
     -----------
     cgm_shape : tuple
-        Forma de los datos CGM (samples, timesteps, features)
+        Forma de los datos CGM (muestras, pasos_temporales, características)
     other_features_shape : tuple
-        Forma de otras características (samples, features)
+        Forma de otras características (muestras, características)
 
     Retorna:
     --------
@@ -117,37 +163,54 @@ def create_attention_model(cgm_shape: tuple, other_features_shape: tuple) -> Mod
     cgm_input = Input(shape=cgm_shape[1:])
     other_input = Input(shape=(other_features_shape[1],))
     
-    # Initial projection
+    # Proyección inicial
     x = Dense(ATTENTION_CONFIG['key_dim'] * ATTENTION_CONFIG['num_heads'])(cgm_input)
     
-    # Stochastic depth (layer dropout)
+    # Stochastic depth (dropout de capas)
     survive_rates = tf.linspace(1.0, 0.5, ATTENTION_CONFIG['num_layers'])
     
-    # Stack attention blocks with stochastic depth
+    # Apilar bloques de atención con stochastic depth
     for i in range(ATTENTION_CONFIG['num_layers']):
-        if tf.random.uniform([]) < survive_rates[i]:
-            x = create_attention_block(
+        # En entrenamiento, aplicar dropout de capa
+        # En inferencia, aplicar todas las capas con el factor de supervivencia
+        if tf.keras.backend.learning_phase():
+            if tf.random.uniform([]) < survive_rates[i]:
+                x = create_attention_block(
+                    x,
+                    ATTENTION_CONFIG['num_heads'],
+                    ATTENTION_CONFIG['key_dim'],
+                    ATTENTION_CONFIG['ff_dim'],
+                    ATTENTION_CONFIG['dropout_rate']
+                )
+        else:
+            # En inferencia, escalar la salida
+            block_output = create_attention_block(
                 x,
                 ATTENTION_CONFIG['num_heads'],
                 ATTENTION_CONFIG['key_dim'],
                 ATTENTION_CONFIG['ff_dim'],
-                ATTENTION_CONFIG['dropout_rate']
+                ATTENTION_CONFIG['dropout_rate'],
+                training=False
             )
+            x = x + survive_rates[i] * (block_output - x)
     
-    # Global context
+    # Contexto global
     attention_pooled = GlobalAveragePooling1D()(x)
     max_pooled = tf.keras.layers.GlobalMaxPooling1D()(x)
     x = Concatenate()([attention_pooled, max_pooled])
     
-    # Combine with other features
+    # Combinar con otras características
     x = Concatenate()([x, other_input])
     
-    # Final MLP with residual
+    # MLP final con conexión residual
     skip = x
-    x = Dense(128, activation=ATTENTION_CONFIG['activation'])(x)
+    x = Dense(128)(x)
+    x = get_activation(x, ATTENTION_CONFIG['activation'])
     x = LayerNormalization(epsilon=1e-6)(x)
     x = Dropout(ATTENTION_CONFIG['dropout_rate'])(x)
-    x = Dense(128, activation=ATTENTION_CONFIG['activation'])(x)
+    x = Dense(128)(x)
+    x = get_activation(x, ATTENTION_CONFIG['activation'])
+    
     if skip.shape[-1] == 128:
         x = Add()([x, skip])
     

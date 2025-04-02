@@ -1,14 +1,14 @@
 import os, sys
-import tensorflow as tf
+import flax
+import jax
+import jax.numpy as jnp
 import numpy as np
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input, Dense, Conv1D, LSTM, Flatten, Concatenate,
-    BatchNormalization, Dropout, LayerNormalization
-)
-from tensorflow.keras.optimizers import Adam
+import flax.linen as nn
+import optax
+from flax.training import train_state
+from typing import Tuple, Dict, List, Any, Optional, Union, Callable, Sequence
 import threading
-from typing import Tuple, Dict, List, Any, Optional, Union, Callable
+from functools import partial
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -16,7 +16,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import A2C_A3C_CONFIG
 
 
-class ActorCriticModel(Model):
+class ActorCriticModel(nn.Module):
     """
     Modelo Actor-Crítico para A2C que divide la arquitectura en redes para
     política (actor) y valor (crítico).
@@ -27,92 +27,103 @@ class ActorCriticModel(Model):
         Dimensión del espacio de estados
     action_dim : int
         Dimensión del espacio de acciones
-    continuous : bool, opcional
+    continuous : bool
         Indica si el espacio de acciones es continuo o discreto
-    hidden_units : Optional[List[int]], opcional
+    hidden_units : Optional[List[int]]
         Unidades ocultas en cada capa
     """
-    def __init__(self, state_dim: int, action_dim: int, continuous: bool = True, 
-                hidden_units: Optional[List[int]] = None) -> None:
-        super().__init__()
-        
+    state_dim: int
+    action_dim: int
+    continuous: bool = True
+    hidden_units: Optional[Sequence[int]] = None
+    
+    def setup(self) -> None:
+        """
+        Inicializa las capas del modelo.
+        """
         # Valores predeterminados para capas ocultas
-        if hidden_units is None:
-            hidden_units = A2C_A3C_CONFIG['hidden_units']
-        
-        self.continuous = continuous
-        self.action_dim = action_dim
+        if self.hidden_units is None:
+            self.hidden_units = A2C_A3C_CONFIG['hidden_units']
         
         # Capas compartidas para procesamiento de estados
         self.shared_layers = []
-        for i, units in enumerate(hidden_units[:2]):
-            self.shared_layers.append(Dense(units, activation='tanh', name=f'shared_dense_{i}'))
-            self.shared_layers.append(LayerNormalization(epsilon=A2C_A3C_CONFIG['epsilon'], name=f'shared_ln_{i}'))
-            self.shared_layers.append(Dropout(A2C_A3C_CONFIG['dropout_rate'], name=f'shared_dropout_{i}'))
+        for i, units in enumerate(self.hidden_units[:2]):
+            self.shared_layers.append((
+                nn.Dense(units, name=f'shared_dense_{i}'),
+                nn.LayerNorm(epsilon=A2C_A3C_CONFIG['epsilon'], name=f'shared_ln_{i}'),
+                nn.Dropout(A2C_A3C_CONFIG['dropout_rate'], name=f'shared_dropout_{i}')
+            ))
         
         # Red del Actor (política)
         self.actor_layers = []
-        for i, units in enumerate(hidden_units[2:]):
-            self.actor_layers.append(Dense(units, activation='tanh', name=f'actor_dense_{i}'))
-            self.actor_layers.append(LayerNormalization(epsilon=A2C_A3C_CONFIG['epsilon'], name=f'actor_ln_{i}'))
+        for i, units in enumerate(self.hidden_units[2:]):
+            self.actor_layers.append((
+                nn.Dense(units, name=f'actor_dense_{i}'),
+                nn.LayerNorm(epsilon=A2C_A3C_CONFIG['epsilon'], name=f'actor_ln_{i}')
+            ))
         
-        # Capa de salida del actor (depende de si el espacio de acción es continuo o discreto)
-        if continuous:
+        # Capas de salida del actor (depende de si el espacio de acción es continuo o discreto)
+        if self.continuous:
             # Para acción continua (política gaussiana)
-            self.mu = Dense(action_dim, activation='linear', name='actor_mu')
-            self.log_sigma = Dense(action_dim, activation='linear', name='actor_log_sigma')
+            self.mu = nn.Dense(self.action_dim, name='actor_mu')
+            self.log_sigma = nn.Dense(self.action_dim, name='actor_log_sigma')
         else:
             # Para acción discreta (política categórica)
-            self.logits = Dense(action_dim, activation='linear', name='actor_logits')
+            self.logits = nn.Dense(self.action_dim, name='actor_logits')
         
         # Red del Crítico (valor)
         self.critic_layers = []
-        for i, units in enumerate(hidden_units[2:]):
-            self.critic_layers.append(Dense(units, activation='tanh', name=f'critic_dense_{i}'))
-            self.critic_layers.append(LayerNormalization(epsilon=A2C_A3C_CONFIG['epsilon'], name=f'critic_ln_{i}'))
+        for i, units in enumerate(self.hidden_units[2:]):
+            self.critic_layers.append((
+                nn.Dense(units, name=f'critic_dense_{i}'),
+                nn.LayerNorm(epsilon=A2C_A3C_CONFIG['epsilon'], name=f'critic_ln_{i}')
+            ))
         
         # Capa de salida del crítico (valor del estado)
-        self.value = Dense(1, activation='linear', name='critic_value')
-    
-    def call(self, inputs: tf.Tensor, training: bool = False) -> Tuple[Any, tf.Tensor]:
+        self.value = nn.Dense(1, name='critic_value')
+
+    def __call__(self, inputs: jnp.ndarray, training: bool = False, 
+                rngs: Optional[Dict[str, jnp.ndarray]] = None) -> Tuple[Any, jnp.ndarray]:
         """
         Pasa la entrada por el modelo Actor-Crítico.
         
         Parámetros:
         -----------
-        inputs : tf.Tensor
+        inputs : jnp.ndarray
             Tensor de entrada con los estados
         training : bool, opcional
             Indica si está en modo entrenamiento
+        rngs : Optional[Dict[str, jnp.ndarray]], opcional
+            Claves PRNG para procesos estocásticos
             
         Retorna:
         --------
-        Tuple[Any, tf.Tensor]
+        Tuple[Any, jnp.ndarray]
             (política, valor) - la política puede ser una tupla (mu, sigma) o logits
         """
         x = inputs
+        dropout_rng = None if rngs is None else rngs.get('dropout')
         
         # Capas compartidas
-        for layer in self.shared_layers:
-            if isinstance(layer, Dropout):
-                x = layer(x, training=training)
-            else:
-                x = layer(x)
+        for dense, layer_norm, dropout in self.shared_layers:
+            x = dense(x)
+            x = jnp.tanh(x)
+            x = layer_norm(x)
+            x = dropout(x, deterministic=not training, rng=dropout_rng)
         
         # Red del Actor
         actor_x = x
-        for layer in self.actor_layers:
-            if isinstance(layer, Dropout):
-                actor_x = layer(actor_x, training=training)
-            else:
-                actor_x = layer(actor_x)
+        for dense, layer_norm in self.actor_layers:
+            actor_x = dense(actor_x)
+            actor_x = jnp.tanh(actor_x)
+            actor_x = layer_norm(actor_x)
         
         # Salida del actor según el tipo de política
         if self.continuous:
             mu = self.mu(actor_x)
             log_sigma = self.log_sigma(actor_x)
-            log_sigma = tf.clip_by_value(log_sigma, -20, 2)  # Evitar valores extremos
-            sigma = tf.exp(log_sigma)
+            log_sigma = jnp.clip(log_sigma, -20.0, 2.0)  # Evitar valores extremos
+            sigma = jnp.exp(log_sigma)
             policy = (mu, sigma)
         else:
             logits = self.logits(actor_x)
@@ -120,123 +131,156 @@ class ActorCriticModel(Model):
         
         # Red del Crítico
         critic_x = x
-        for layer in self.critic_layers:
-            if isinstance(layer, Dropout):
-                critic_x = layer(critic_x, training=training)
-            else:
-                critic_x = layer(critic_x)
+        for dense, layer_norm in self.critic_layers:
+            critic_x = dense(critic_x)
+            critic_x = jnp.tanh(critic_x)
+            critic_x = layer_norm(critic_x)
         
         value = self.value(critic_x)
         
         return policy, value
-    
-    def get_action(self, state: np.ndarray, deterministic: bool = False) -> np.ndarray:
+
+    def get_action(self, params: Dict, state: jnp.ndarray, rng: jnp.ndarray, 
+                  deterministic: bool = False) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Obtiene una acción basada en el estado actual.
         
         Parámetros:
         -----------
-        state : np.ndarray
-            El estado actual
+        params : Dict
+            Parámetros del modelo
+        state : jnp.ndarray
+            Estado actual
+        rng : jnp.ndarray
+            Clave PRNG para generación de números aleatorios
         deterministic : bool, opcional
             Si es True, devuelve la acción con máxima probabilidad
         
         Retorna:
         --------
-        np.ndarray
-            Una acción muestreada de la distribución de política
+        Tuple[jnp.ndarray, jnp.ndarray]
+            (acción, nueva_clave_rng)
         """
-        state = tf.convert_to_tensor([state], dtype=tf.float32)
-        policy, _ = self.call(state)
+        rng, subkey = jax.random.split(rng)
+        
+        # Asegurar formato batch
+        if state.ndim == 1:
+            state = state[jnp.newaxis, :]
+        
+        # Aplicar modelo
+        policy, _ = self.apply({"params": params}, state)
         
         if self.continuous:
             mu, sigma = policy
             if deterministic:
-                return mu[0].numpy()
+                return mu[0], rng
+            
             # Muestrear de la distribución normal
-            dist = tf.random.normal(shape=mu.shape)
-            action = mu + sigma * dist
-            return action[0].numpy()
+            action = mu + sigma * jax.random.normal(subkey, mu.shape)
+            return action[0], rng
         else:
             logits = policy
             if deterministic:
-                return tf.argmax(logits[0]).numpy()
+                return jnp.argmax(logits[0]), rng
+            
             # Muestrear de la distribución categórica
-            probs = tf.nn.softmax(logits)
-            action = tf.random.categorical(tf.math.log(probs), 1)
-            return action[0, 0].numpy()
-    
-    def get_value(self, state: np.ndarray) -> float:
+            _ = jax.nn.softmax(logits)
+            action = jax.random.categorical(subkey, logits[0])
+            return action, rng
+
+    def get_value(self, params: Dict, state: jnp.ndarray) -> jnp.ndarray:
         """
         Obtiene el valor estimado para un estado.
         
         Parámetros:
         -----------
-        state : np.ndarray
+        params : Dict
+            Parámetros del modelo
+        state : jnp.ndarray
             El estado para evaluar
         
         Retorna:
         --------
-        float
+        jnp.ndarray
             El valor estimado del estado
         """
-        state = tf.convert_to_tensor([state], dtype=tf.float32)
-        _, value = self.call(state)
-        return value[0].numpy()
-    
-    def evaluate_actions(self, states: tf.Tensor, actions: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        # Asegurar formato batch
+        if state.ndim == 1:
+            state = state[jnp.newaxis, :]
+        
+        _, value = self.apply({"params": params}, state)
+        return value[0]
+
+    def evaluate_actions(self, params: Dict, states: jnp.ndarray, actions: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         Evalúa las acciones tomadas, devolviendo log_probs, valores y entropía.
         
         Parámetros:
         -----------
-        states : tf.Tensor
+        params : Dict
+            Parámetros del modelo
+        states : jnp.ndarray
             Los estados observados
-        actions : tf.Tensor
+        actions : jnp.ndarray
             Las acciones tomadas
         
         Retorna:
         --------
-        Tuple[tf.Tensor, tf.Tensor, tf.Tensor]
+        Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
             (log_probs, valores, entropía)
         """
-        policy, values = self.call(states)
+        policy, values = self.apply({"params": params}, states)
         
         if self.continuous:
             mu, sigma = policy
             # Calcular log probabilidad para acciones continuas
-            log_probs = -0.5 * tf.reduce_sum(
-                tf.square((actions - mu) / sigma) + 
-                2 * tf.math.log(sigma) + 
-                tf.math.log(2.0 * np.pi), 
+            log_probs = -0.5 * jnp.sum(
+                jnp.square((actions - mu) / sigma) + 
+                2 * jnp.log(sigma) + 
+                jnp.log(2.0 * np.pi), 
                 axis=1
             )
             # Entropía de política gaussiana
-            entropy = tf.reduce_sum(
-                0.5 * tf.math.log(2.0 * np.pi * tf.square(sigma)) + 0.5,
+            entropy = jnp.sum(
+                0.5 * jnp.log(2.0 * np.pi * jnp.square(sigma)) + 0.5,
                 axis=1
             )
         else:
             logits = policy
             # Calcular log probabilidad para acciones discretas
-            action_masks = tf.one_hot(actions, self.action_dim)
-            log_probs = tf.reduce_sum(
-                action_masks * tf.nn.log_softmax(logits),
+            action_masks = jax.nn.one_hot(actions, self.action_dim)
+            log_probs = jnp.sum(
+                action_masks * jax.nn.log_softmax(logits),
                 axis=1
             )
             # Entropía de política categórica
-            probs = tf.nn.softmax(logits)
-            entropy = -tf.reduce_sum(
-                probs * tf.math.log(probs + 1e-10),
+            probs = jax.nn.softmax(logits)
+            entropy = -jnp.sum(
+                probs * jnp.log(probs + 1e-10),
                 axis=1
             )
         
         return log_probs, values, entropy
 
 
+class A2CTrainState(train_state.TrainState):
+    """
+    Estado de entrenamiento para A2C, extendiendo el TrainState de Flax.
+    
+    Parámetros:
+    -----------
+    metrics : Optional[Dict]
+        Métricas de entrenamiento
+    rng : Optional[jnp.ndarray]
+        PRNG key
+    """
+    metrics: Optional[Dict] = None
+    rng: Optional[jnp.ndarray] = None
+
+
 class A2C:
     """
-    Implementación del algoritmo Advantage Actor-Critic (A2C).
+    Implementación del algoritmo Advantage Actor-Critic (A2C) con JAX.
     
     Este algoritmo utiliza un estimador de ventaja para actualizar la política
     y una red de valor para estimar los retornos esperados.
@@ -247,20 +291,22 @@ class A2C:
         Dimensión del espacio de estados
     action_dim : int
         Dimensión del espacio de acciones
-    continuous : bool, opcional
+    continuous : bool
         Indica si el espacio de acciones es continuo o discreto
-    learning_rate : float, opcional
+    learning_rate : float
         Tasa de aprendizaje
-    gamma : float, opcional
+    gamma : float
         Factor de descuento
-    entropy_coef : float, opcional
+    entropy_coef : float
         Coeficiente de entropía para exploración
-    value_coef : float, opcional
+    value_coef : float
         Coeficiente de pérdida de valor
-    max_grad_norm : float, opcional
+    max_grad_norm : float
         Norma máxima para recorte de gradientes
-    hidden_units : Optional[List[int]], opcional
+    hidden_units : Optional[List[int]]
         Unidades ocultas por capa
+    seed : int
+        Semilla para reproducibilidad
     """
     def __init__(
         self, 
@@ -272,8 +318,9 @@ class A2C:
         entropy_coef: float = A2C_A3C_CONFIG['entropy_coef'],
         value_coef: float = A2C_A3C_CONFIG['value_coef'],
         max_grad_norm: float = A2C_A3C_CONFIG['max_grad_norm'],
-        hidden_units: Optional[List[int]] = None
-    ) -> None:
+        hidden_units: Optional[List[int]] = None,
+        seed: int = 0
+    ):
         # Parámetros del modelo
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -288,79 +335,110 @@ class A2C:
             self.hidden_units = A2C_A3C_CONFIG['hidden_units']
         else:
             self.hidden_units = hidden_units
+            
+        # Crear modelo
+        self.rng = jax.random.PRNGKey(seed)
+        self.rng, init_rng = jax.random.split(self.rng)
+        self.model = ActorCriticModel(
+            state_dim=state_dim, 
+            action_dim=action_dim,
+            continuous=continuous,
+            hidden_units=self.hidden_units
+        )
         
-        # Crear modelo y optimizador
-        self.model = ActorCriticModel(state_dim, action_dim, continuous, self.hidden_units)
-        self.optimizer = Adam(learning_rate=learning_rate)
+        # Inicializar parámetros con entrada ficticia
+        dummy_input = jnp.ones((1, state_dim))
+        params = self.model.init(init_rng, dummy_input)["params"]
         
-        # Métricas
-        self.policy_loss_metric = tf.keras.metrics.Mean('policy_loss')
-        self.value_loss_metric = tf.keras.metrics.Mean('value_loss')
-        self.entropy_metric = tf.keras.metrics.Mean('entropy')
-        self.total_loss_metric = tf.keras.metrics.Mean('total_loss')
+        # Crear optimizador
+        optimizer = optax.adam(learning_rate=learning_rate)
+        
+        # Crear estado de entrenamiento
+        self.state = A2CTrainState.create(
+            apply_fn=self.model.apply,
+            params=params,
+            tx=optimizer,
+            metrics={
+                "policy_loss": [],
+                "value_loss": [],
+                "entropy_loss": [],
+                "total_loss": [],
+                "episode_rewards": []
+            },
+            rng=self.rng
+        )
     
-    @tf.function
-    def train_step(self, states: tf.Tensor, actions: tf.Tensor, 
-                 returns: tf.Tensor, advantages: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    @partial(jax.jit, static_argnums=(0,))
+    def _train_step(self, state: A2CTrainState, states: jnp.ndarray, 
+                   actions: jnp.ndarray, returns: jnp.ndarray, 
+                   advantages: jnp.ndarray) -> Tuple[A2CTrainState, Dict]:
         """
         Realiza un paso de entrenamiento para actualizar el modelo.
         
         Parámetros:
         -----------
-        states : tf.Tensor
+        state : a2c_train_state
+            Estado actual del entrenamiento
+        states : jnp.ndarray
             Estados observados en el entorno
-        actions : tf.Tensor
+        actions : jnp.ndarray
             Acciones tomadas para esos estados
-        returns : tf.Tensor
+        returns : jnp.ndarray
             Retornos estimados (para entrenar el crítico)
-        advantages : tf.Tensor
+        advantages : jnp.ndarray
             Ventajas estimadas (para entrenar el actor)
-        
+            
         Retorna:
         --------
-        Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]
-            (pérdida_total, pérdida_política, pérdida_valor, pérdida_entropía)
+        Tuple[a2c_train_state, Dict]
+            Nuevo estado de entrenamiento y métricas
         """
-        with tf.GradientTape() as tape:
+        def loss_fn(params):
             # Evaluar acciones con el modelo actual
-            log_probs, values, entropy = self.model.evaluate_actions(states, actions)
+            log_probs, values, entropy = self.model.evaluate_actions(params, states, actions)
             
             # Ventaja ya está calculada externamente
-            advantages = tf.reshape(advantages, [-1])
+            advantages_flat = advantages.reshape(-1)
             
             # Calcular pérdida de política
-            policy_loss = -tf.reduce_mean(log_probs * advantages, axis=0)
+            policy_loss = -jnp.mean(log_probs * advantages_flat, axis=0)
             
             # Calcular pérdida de valor
-            value_pred = tf.reshape(values, [-1])
-            returns = tf.reshape(returns, [-1])
-            value_loss = tf.reduce_mean(tf.square(returns - value_pred), axis=0)
+            value_pred = values.reshape(-1)
+            returns_flat = returns.reshape(-1)
+            value_loss = jnp.mean(jnp.square(returns_flat - value_pred), axis=0)
             
             # Calcular pérdida de entropía (regularización)
-            entropy_loss = -tf.reduce_mean(entropy, axis=0)
+            entropy_loss = -jnp.mean(entropy, axis=0)
             
             # Pérdida total combinada
             total_loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
             
-        # Calcular gradientes y actualizar pesos
-        grads = tape.gradient(total_loss, self.model.trainable_variables)
+            return total_loss, (policy_loss, value_loss, entropy_loss)
         
-        # Clipping de gradientes para estabilidad
+        # Calcular pérdida y gradientes
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (total_loss, (policy_loss, value_loss, entropy_loss)), grads = grad_fn(state.params)
+        
+        # Recortar gradientes si es necesario
         if self.max_grad_norm is not None:
-            grads, _ = tf.clip_by_global_norm(grads, self.max_grad_norm)
-            
-        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+            grads = optax.clip_by_global_norm(grads, self.max_grad_norm)
+        
+        # Actualizar parámetros
+        new_state = state.apply_gradients(grads=grads)
         
         # Actualizar métricas
-        self.policy_loss_metric.update_state(policy_loss)
-        self.value_loss_metric.update_state(value_loss)
-        self.entropy_metric.update_state(entropy_loss)
-        self.total_loss_metric.update_state(total_loss)
+        metrics = {
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            "entropy_loss": entropy_loss,
+            "total_loss": total_loss
+        }
         
-        return total_loss, policy_loss, value_loss, entropy_loss
+        return new_state, metrics
     
     def compute_returns_advantages(self, rewards: np.ndarray, values: np.ndarray, 
-                                 dones: np.ndarray, next_value: float) -> Tuple[np.ndarray, np.ndarray]:
+                                  dones: np.ndarray, next_value: float) -> Tuple[np.ndarray, np.ndarray]:
         """
         Calcula los retornos y ventajas para los estados visitados.
         
@@ -378,10 +456,10 @@ class A2C:
         Retorna:
         --------
         Tuple[np.ndarray, np.ndarray]
-            (returns, advantages) calculados
+            returns y ventajas calculados
         """
         # Añadir el valor del último estado
-        values = np.append(values, next_value)
+        values_extended = np.append(values, next_value)
         
         returns = np.zeros_like(rewards, dtype=np.float32)
         advantages = np.zeros_like(rewards, dtype=np.float32)
@@ -391,20 +469,21 @@ class A2C:
         for t in reversed(range(len(rewards))):
             # Si es terminal, el valor del siguiente estado es 0
             next_non_terminal = 1.0 - dones[t]
-            next_value = values[t + 1]
+            next_value = values_extended[t + 1]
             
             # Delta temporal para GAE
-            delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
+            delta = rewards[t] + self.gamma * next_value * next_non_terminal - values_extended[t]
             
             # Calcular ventaja con GAE
             gae = delta + self.gamma * A2C_A3C_CONFIG['lambda'] * next_non_terminal * gae
             advantages[t] = gae
             
             # Calcular retornos (para entrenar el crítico)
-            returns[t] = advantages[t] + values[t]
+            returns[t] = advantages[t] + values_extended[t]
         
         # Normalizar ventajas para reducir varianza
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         return returns, advantages
     
@@ -445,15 +524,18 @@ class A2C:
             states.append(current_state)
             
             # Obtener acción y valor
-            action = self.model.get_action(current_state)
+            self.rng, action_rng = jax.random.split(self.rng)
+            action, self.rng = self.model.get_action(
+                self.state.params, jnp.array(current_state), action_rng
+            )
             actions.append(action)
             
             # Valor del estado actual
-            value = self.model.get_value(current_state)
+            value = self.model.get_value(self.state.params, jnp.array(current_state)).item()
             values.append(value)
             
             # Ejecutar acción en el entorno
-            next_state, reward, done, _, _ = env.step(action)
+            next_state, reward, done, _, _ = env.step(np.array(action))
             
             # Guardar recompensa y done
             rewards.append(reward)
@@ -515,14 +597,21 @@ class A2C:
         returns, advantages = self.compute_returns_advantages(rewards_np, values_np, dones_np, final_value)
         
         # Actualizar modelo
-        _, policy_loss, value_loss, entropy_loss = self.train_step(
-            tf.convert_to_tensor(states_np), 
-            tf.convert_to_tensor(actions_np), 
-            tf.convert_to_tensor(returns), 
-            tf.convert_to_tensor(advantages)
+        self.state, metrics = self._train_step(
+            self.state, 
+            jnp.array(states_np), 
+            jnp.array(actions_np), 
+            jnp.array(returns), 
+            jnp.array(advantages)
         )
         
-        return policy_loss.numpy(), value_loss.numpy(), entropy_loss.numpy()
+        # Actualizar métricas
+        self.state.metrics["policy_loss"].append(metrics["policy_loss"].item())
+        self.state.metrics["value_loss"].append(metrics["value_loss"].item())
+        self.state.metrics["entropy_loss"].append(metrics["entropy_loss"].item())
+        self.state.metrics["total_loss"].append(metrics["total_loss"].item())
+        
+        return metrics["policy_loss"].item(), metrics["value_loss"].item(), metrics["entropy_loss"].item()
 
     def _update_history(self, history: Dict, episode_rewards: List, 
                       epoch: int, epochs: int, policy_loss: float, 
@@ -551,15 +640,15 @@ class A2C:
             Lista actualizada de recompensas de episodios
         """
         # Guardar estadísticas
-        history['policy_losses'].append(self.policy_loss_metric.result().numpy())
-        history['value_losses'].append(self.value_loss_metric.result().numpy())
-        history['entropy_losses'].append(self.entropy_metric.result().numpy())
+        history['policy_losses'].append(np.mean(self.state.metrics["policy_loss"]))
+        history['value_losses'].append(np.mean(self.state.metrics["value_loss"]))
+        history['entropy_losses'].append(np.mean(self.state.metrics["entropy_loss"]))
         
         # Resetear métricas
-        self.policy_loss_metric.reset_states()
-        self.value_loss_metric.reset_states()
-        self.entropy_metric.reset_states()
-        self.total_loss_metric.reset_states()
+        self.state.metrics["policy_loss"] = []
+        self.state.metrics["value_loss"] = []
+        self.state.metrics["entropy_loss"] = []
+        self.state.metrics["total_loss"] = []
         
         # Añadir recompensas de episodios completados
         if episode_rewards:
@@ -617,7 +706,12 @@ class A2C:
             )
             
             # Obtener valor del último estado si es necesario
-            next_value = self.model.get_value(state) if not dones[-1] else 0
+            if not dones[-1]:
+                next_value = self.model.get_value(
+                    self.state.params, jnp.array(state)
+                ).item()
+            else:
+                next_value = 0
             
             # Actualizar modelo
             policy_loss, value_loss, _ = self._update_model(
@@ -640,7 +734,9 @@ class A2C:
         filepath : str
             Ruta donde guardar el modelo
         """
-        self.model.save_weights(filepath)
+        with open(filepath, 'wb') as f:
+            params_bytes = flax.serialization.to_bytes(self.state.params)
+            f.write(params_bytes)
         
     def load_model(self, filepath: str) -> None:
         """
@@ -651,15 +747,15 @@ class A2C:
         filepath : str
             Ruta desde donde cargar el modelo
         """
-        # Asegurarse de que el modelo está construido primero
-        dummy_state = np.zeros((1, self.state_dim))
-        self.model(dummy_state)
-        self.model.load_weights(filepath)
+        with open(filepath, 'rb') as f:
+            params_bytes = f.read()
+            params = flax.serialization.from_bytes(self.state.params, params_bytes)
+            self.state = self.state.replace(params=params)
 
 
 class A3C(A2C):
     """
-    Implementación de Asynchronous Advantage Actor-Critic (A3C).
+    Implementación de Asynchronous Advantage Actor-Critic (A3C) con JAX.
     
     Extiende A2C para permitir entrenamiento asíncrono con múltiples trabajadores.
     
@@ -669,26 +765,28 @@ class A3C(A2C):
         Dimensión del espacio de estados
     action_dim : int
         Dimensión del espacio de acciones
-    continuous : bool, opcional
+    continuous : bool
         Indica si el espacio de acciones es continuo o discreto
-    n_workers : int, opcional
+    n_workers : int
         Número de trabajadores asíncronos
-    learning_rate : float, opcional
+    learning_rate : float
         Tasa de aprendizaje
-    gamma : float, opcional
+    gamma : float
         Factor de descuento
-    entropy_coef : float, opcional
+    entropy_coef : float
         Coeficiente de entropía para exploración
-    value_coef : float, opcional
+    value_coef : float
         Coeficiente de pérdida de valor
-    max_grad_norm : float, opcional
+    max_grad_norm : float
         Norma máxima para recorte de gradientes
-    hidden_units : Optional[List[int]], opcional
+    hidden_units : Optional[List[int]]
         Unidades ocultas por capa
+    seed : int
+        Semilla para reproducibilidad
     """
     def __init__(self, state_dim: int, action_dim: int, continuous: bool = True, 
                 n_workers: int = 4, **kwargs):
-        super().__init__(state_dim, action_dim, continuous, **kwargs)
+        super(A3C, self).__init__(state_dim, action_dim, continuous, **kwargs)
         self.n_workers = n_workers
         self.workers = []
     
@@ -710,7 +808,8 @@ class A3C(A2C):
         """
         return A3CWorker(
             self.model,
-            self.optimizer,
+            self.state,
+            self.rng,
             env_fn,
             worker_id,
             self.state_dim,
@@ -746,7 +845,10 @@ class A3C(A2C):
         # Crear trabajadores
         workers = []
         for i in range(self.n_workers):
+            # Crear nueva llave PRNG para cada trabajador
+            self.rng, worker_rng = jax.random.split(self.rng)
             worker = self.create_worker(env_fn, i)
+            worker.rng = worker_rng
             workers.append(worker)
         
         # Variables para seguimiento de recompensas y pérdidas
@@ -757,12 +859,15 @@ class A3C(A2C):
             'entropy_losses': []
         }
         
+        # Lock para proteger el acceso concurrente al modelo global
+        model_lock = threading.Lock()
+        
         # Crear e iniciar hilos
         threads = []
         for worker in workers:
             thread = threading.Thread(
                 target=worker.train,
-                args=(n_steps, total_steps // self.n_workers, history, render)
+                args=(n_steps, total_steps // self.n_workers, history, model_lock, render)
             )
             threads.append(thread)
             thread.daemon = True  # Terminar hilos cuando el programa principal termina
@@ -777,14 +882,16 @@ class A3C(A2C):
 
 class A3CWorker:
     """
-    Trabajador para el algoritmo A3C que entrena de forma asíncrona.
+    Trabajador para el algoritmo A3C que entrena de forma asíncrona con JAX.
     
     Parámetros:
     -----------
     global_model : actor_critic_model
         Modelo compartido global
-    optimizer : tf.keras.optimizers.Optimizer
-        Optimizador compartido
+    global_state : a2c_train_state
+        Estado de entrenamiento global
+    rng : jnp.ndarray
+        Clave PRNG para aleatoriedad
     env_fn : Callable
         Función que devuelve un entorno
     worker_id : int
@@ -796,18 +903,19 @@ class A3CWorker:
     gamma : float
         Factor de descuento
     entropy_coef : float
-        Coeficiente de entropía
+        Coeficiente de entropía para exploración
     value_coef : float
         Coeficiente de pérdida de valor
     max_grad_norm : float
         Norma máxima para recorte de gradientes
     continuous : bool
-        Indica si el espacio de acciones es continuo
+        Indica si el espacio de acciones es continuo o discreto
     """
     def __init__(
         self,
         global_model: ActorCriticModel,
-        optimizer: tf.keras.optimizers.Optimizer,
+        global_state: A2CTrainState,
+        rng: jnp.ndarray,
         env_fn: Callable,
         worker_id: int,
         state_dim: int,
@@ -817,7 +925,7 @@ class A3CWorker:
         value_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         continuous: bool = True
-    ) -> None:
+    ):
         # Parámetros del trabajador
         self.worker_id = worker_id
         self.env = env_fn()
@@ -831,24 +939,35 @@ class A3CWorker:
         
         # Modelo global compartido
         self.global_model = global_model
-        self.optimizer = optimizer
+        self.global_state = global_state
+        self.rng = rng
         
-        # Modelo local para este trabajador
-        self.local_model = ActorCriticModel(
-            state_dim, action_dim, continuous, 
-            hidden_units=A2C_A3C_CONFIG['hidden_units']
+        # Modelo local para este trabajador (misma arquitectura, diferentes pesos)
+        self.local_model = global_model
+        
+        # Estado local de entrenamiento
+        self.local_state = A2CTrainState.create(
+            apply_fn=global_state.apply_fn,
+            params=jax.tree_util.tree_map(lambda x: jnp.copy(x), global_state.params),
+            tx=global_state.tx,
+            metrics=dict(global_state.metrics),  # Copiar métrica
+            rng=rng
         )
-        # Sincronizar pesos locales con globales
+        
+        # Actualizar pesos locales
         self.update_local_model()
     
     def update_local_model(self) -> None:
         """
         Actualiza los pesos del modelo local desde el modelo global.
         """
-        self.local_model.set_weights(self.global_model.get_weights())
+        # Copiar parámetros del modelo global al local
+        self.local_state = self.local_state.replace(
+            params=jax.tree_util.tree_map(lambda x: jnp.copy(x), self.global_state.params)
+        )
     
-    def compute_returns_advantages(self, rewards: np.ndarray, values: np.ndarray, 
-                                 dones: np.ndarray, next_value: float) -> Tuple[np.ndarray, np.ndarray]:
+    def compute_returns_advantages(self, rewards: np.ndarray, values: np.ndarray,
+                                  dones: np.ndarray, next_value: float) -> Tuple[np.ndarray, np.ndarray]:
         """
         Calcula los retornos y ventajas para los estados visitados.
         
@@ -866,10 +985,10 @@ class A3CWorker:
         Retorna:
         --------
         Tuple[np.ndarray, np.ndarray]
-            (returns, advantages) calculados
+            returns y ventajas calculados
         """
         # Añadir el valor del último estado
-        values = np.append(values, next_value)
+        values_extended = np.append(values, next_value)
         
         returns = np.zeros_like(rewards, dtype=np.float32)
         advantages = np.zeros_like(rewards, dtype=np.float32)
@@ -879,77 +998,83 @@ class A3CWorker:
         for t in reversed(range(len(rewards))):
             # Si es terminal, el valor del siguiente estado es 0
             next_non_terminal = 1.0 - dones[t]
-            next_value = values[t + 1]
+            next_value = values_extended[t + 1]
             
             # Delta temporal para GAE
-            delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
+            delta = rewards[t] + self.gamma * next_value * next_non_terminal - values_extended[t]
             
             # Calcular ventaja con GAE
             gae = delta + self.gamma * A2C_A3C_CONFIG['lambda'] * next_non_terminal * gae
             advantages[t] = gae
             
             # Calcular retornos (para entrenar el crítico)
-            returns[t] = advantages[t] + values[t]
+            returns[t] = advantages[t] + values_extended[t]
         
         # Normalizar ventajas para reducir varianza
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         return returns, advantages
     
-    def train_step(self, states: tf.Tensor, actions: tf.Tensor, 
-                  returns: tf.Tensor, advantages: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    def train_step(self, states: jnp.ndarray, actions: jnp.ndarray, 
+                  returns: jnp.ndarray, advantages: jnp.ndarray) -> Tuple[Dict, Dict]:
         """
         Realiza un paso de entrenamiento asíncrono.
         
         Parámetros:
         -----------
-        states : tf.Tensor
+        states : jnp.ndarray
             Estados observados
-        actions : tf.Tensor
+        actions : jnp.ndarray
             Acciones tomadas
-        returns : tf.Tensor
+        returns : jnp.ndarray
             Retornos calculados
-        advantages : tf.Tensor
+        advantages : jnp.ndarray
             Ventajas calculadas
             
         Retorna:
         --------
-        Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]
-            (total_loss, policy_loss, value_loss, entropy_loss)
+        Tuple[Dict, Dict]
+            (gradientes calculados, métricas)
         """
-        with tf.GradientTape() as tape:
+        def loss_fn(params):
             # Evaluar acciones con el modelo local
-            log_probs, values, entropy = self.local_model.evaluate_actions(states, actions)
+            log_probs, values, entropy = self.local_model.evaluate_actions(params, states, actions)
             
             # Calcular pérdida de política
-            advantages = tf.reshape(advantages, [-1])
-            policy_loss = -tf.reduce_mean(log_probs * advantages, axis=0)
+            advantages_flat = advantages.reshape(-1)
+            policy_loss = -jnp.mean(log_probs * advantages_flat, axis=0)
             
             # Calcular pérdida de valor
-            value_pred = tf.reshape(values, [-1])
-            returns = tf.reshape(returns, [-1])
-            value_loss = tf.reduce_mean(tf.square(returns - value_pred), axis=0)
+            value_pred = values.reshape(-1)
+            returns_flat = returns.reshape(-1)
+            value_loss = jnp.mean(jnp.square(returns_flat - value_pred), axis=0)
             
             # Calcular pérdida de entropía (regularización)
-            entropy_loss = -tf.reduce_mean(entropy, axis=0)
+            entropy_loss = -jnp.mean(entropy, axis=0)
             
             # Pérdida total combinada
             total_loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
             
-        # Calcular gradientes usando el modelo local
-        grads = tape.gradient(total_loss, self.local_model.trainable_variables)
+            return total_loss, (policy_loss, value_loss, entropy_loss)
         
-        # Clipping de gradientes para estabilidad
+        # Calcular pérdida y gradientes
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (total_loss, (policy_loss, value_loss, entropy_loss)), grads = grad_fn(self.local_state.params)
+        
+        # Recortar gradientes si es necesario
         if self.max_grad_norm is not None:
-            grads, _ = tf.clip_by_global_norm(grads, self.max_grad_norm)
+            grads = optax.clip_by_global_norm(grads, self.max_grad_norm)
             
-        # Aplicar gradientes al modelo global de manera asíncrona
-        self.optimizer.apply_gradients(zip(grads, self.global_model.trainable_variables))
+        # Retornar gradientes y métricas (sin actualizar directamente)
+        metrics = {
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            "entropy_loss": entropy_loss,
+            "total_loss": total_loss
+        }
         
-        # Actualizar modelo local
-        self.update_local_model()
-        
-        return total_loss, policy_loss, value_loss, entropy_loss
+        return grads, metrics
     
     def _collect_step_data(self, state: np.ndarray, render: bool) -> Tuple:
         """
@@ -971,16 +1096,22 @@ class A3CWorker:
             self.env.render()
         
         # Obtener acción y valor con el modelo local
-        action = self.local_model.get_action(state)
-        value = self.local_model.get_value(state)
+        self.rng, action_rng = jax.random.split(self.rng)
+        action, self.rng = self.local_model.get_action(
+            self.local_state.params, jnp.array(state), action_rng
+        )
+        
+        value = self.local_model.get_value(
+            self.local_state.params, jnp.array(state)
+        ).item()
         
         # Ejecutar acción en el entorno
-        next_state, reward, done, _, _ = self.env.step(action)
+        next_state, reward, done, _, _ = self.env.step(np.array(action))
         
         return state, action, value, reward, done, next_state
     
     def _handle_episode_end(self, episode_reward: float, steps_done: int, 
-                          max_steps: int, shared_history: Dict) -> Tuple[np.ndarray, float]:
+                           max_steps: int, shared_history: Dict) -> Tuple[np.ndarray, float]:
         """
         Maneja el final de un episodio.
         
@@ -1017,7 +1148,8 @@ class A3CWorker:
     def _update_model_with_collected_data(self, states: List, actions: List,
                                         rewards: List, dones: List,
                                         values: List, done: bool,
-                                        next_state: np.ndarray, shared_history: Dict) -> None:
+                                        next_state: np.ndarray, 
+                                        shared_history: Dict, model_lock: threading.Lock) -> None:
         """
         Actualiza el modelo con los datos recolectados.
         
@@ -1039,9 +1171,13 @@ class A3CWorker:
             Estado final
         shared_history : Dict
             Historial compartido
+        model_lock : threading.Lock
+            Lock para proteger acceso al modelo global
         """
         # Si el episodio no terminó, calcular valor del último estado
-        next_value = 0.0 if done else self.local_model.get_value(next_state)
+        next_value = 0.0 if done else self.local_model.get_value(
+            self.local_state.params, jnp.array(next_state)
+        ).item()
             
         # Convertir a arrays de numpy
         states_np = np.array(states, dtype=np.float32)
@@ -1055,22 +1191,39 @@ class A3CWorker:
             rewards_np, values_np, dones_np, next_value
         )
         
-        # Actualizar modelo
-        _, policy_loss, value_loss, entropy_loss = self.train_step(
-            tf.convert_to_tensor(states_np),
-            tf.convert_to_tensor(actions_np),
-            tf.convert_to_tensor(returns),
-            tf.convert_to_tensor(advantages)
+        # Calcular gradientes con el modelo local (sin actualizar aún)
+        grads, metrics = self.train_step(
+            jnp.array(states_np),
+            jnp.array(actions_np),
+            jnp.array(returns),
+            jnp.array(advantages)
         )
         
-        # Guardar estadísticas
-        with threading.Lock():  # Proteger acceso compartido
-            shared_history['policy_losses'].append(policy_loss.numpy())
-            shared_history['value_losses'].append(value_loss.numpy())
-            shared_history['entropy_losses'].append(entropy_loss.numpy())
+        # Acceder al modelo global de manera segura para aplicar gradientes
+        with model_lock:
+            # Actualizar modelo global usando los gradientes calculados
+            updates, new_opt_state = self.global_state.tx.update(
+                grads, self.global_state.opt_state, self.global_state.params
+            )
+            new_params = optax.apply_updates(self.global_state.params, updates)
+            
+            # Actualizar estado global
+            self.global_state = self.global_state.replace(
+                params=new_params,
+                opt_state=new_opt_state
+            )
+            
+            # Guardar estadísticas
+            with threading.Lock():  # Proteger acceso compartido
+                shared_history['policy_losses'].append(metrics["policy_loss"].item())
+                shared_history['value_losses'].append(metrics["value_loss"].item())
+                shared_history['entropy_losses'].append(metrics["entropy_loss"].item())
+                
+        # Actualizar modelo local desde el global
+        self.update_local_model()
     
     def train(self, n_steps: int, max_steps: int, shared_history: Dict, 
-             render: bool = False) -> None:
+             model_lock: threading.Lock, render: bool = False) -> None:
         """
         Entrenamiento asíncrono del trabajador.
         
@@ -1082,12 +1235,14 @@ class A3CWorker:
             Pasos máximos para este trabajador
         shared_history : Dict
             Diccionario compartido para seguimiento
+        model_lock : threading.Lock
+            Lock para proteger acceso al modelo global
         render : bool, opcional
             Si se debe renderizar el entorno
         """
         # Estado inicial
         state, _ = self.env.reset()
-        episode_reward = 0
+        episode_reward = 0.0
         steps_done = 0
         
         while steps_done < max_steps:
@@ -1125,5 +1280,5 @@ class A3CWorker:
             # Si recolectamos suficientes pasos, actualizar modelo
             if states:
                 self._update_model_with_collected_data(
-                    states, actions, rewards, dones, values, done, state, shared_history
+                    states, actions, rewards, dones, values, done, state, shared_history, model_lock
                 )

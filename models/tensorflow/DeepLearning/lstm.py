@@ -6,20 +6,46 @@ from tensorflow.keras.layers import (
     MultiHeadAttention, Add, GlobalAveragePooling1D, GlobalMaxPooling1D,
     BatchNormalization, Bidirectional
 )
-from keras.saving import register_keras_serializable
+from typing import Tuple, Dict, Any, Optional, List, Union
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import LSTM_CONFIG
 
-def create_lstm_attention_block(x, units, num_heads=4, dropout_rate=0.2) -> tf.Tensor:
+def get_activation_fn(activation_name: str) -> Any:
+    """
+    Devuelve la función de activación correspondiente al nombre.
+    
+    Parámetros:
+    -----------
+    activation_name : str
+        Nombre de la función de activación
+        
+    Retorna:
+    --------
+    Any
+        Función de activación de TensorFlow
+    """
+    if activation_name == 'relu':
+        return tf.nn.relu
+    elif activation_name == 'tanh':
+        return tf.nn.tanh
+    elif activation_name == 'sigmoid':
+        return tf.nn.sigmoid
+    elif activation_name == 'gelu':
+        return tf.nn.gelu
+    else:
+        return tf.nn.tanh  # Por defecto
+
+def create_lstm_attention_block(x: tf.Tensor, units: int, num_heads: int = 4, 
+                               dropout_rate: float = 0.2) -> tf.Tensor:
     """
     Crea un bloque LSTM con self-attention y conexiones residuales.
     
     Parámetros:
     -----------
-    x : tensor
+    x : tf.Tensor
         Tensor de entrada
     units : int
         Número de unidades LSTM
@@ -30,7 +56,7 @@ def create_lstm_attention_block(x, units, num_heads=4, dropout_rate=0.2) -> tf.T
         
     Retorna:
     --------
-    tensor
+    tf.Tensor
         Tensor procesado
     """
     # LSTM con skip connection
@@ -75,9 +101,9 @@ def create_lstm_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     Parámetros:
     -----------
     cgm_shape : tuple
-        Forma de los datos CGM (samples, timesteps, features)
+        Forma de los datos CGM (muestras, pasos_temporales, características)
     other_features_shape : tuple
-        Forma de otras características (samples, features)
+        Forma de otras características (muestras, características)
         
     Retorna:
     --------
@@ -125,12 +151,19 @@ def create_lstm_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     
     # Red densa final con skip connections
     skip = x
-    x = Dense(LSTM_CONFIG['dense_units'][0], activation=LSTM_CONFIG['dense_activation'])(x)
+    
+    # Usar get_activation_fn para tener consistencia con la versión JAX
+    activation_fn = get_activation_fn(LSTM_CONFIG['dense_activation'])
+    
+    x = Dense(LSTM_CONFIG['dense_units'][0])(x)
+    x = tf.keras.layers.Activation(activation_fn)(x)
     x = LayerNormalization(epsilon=LSTM_CONFIG['epsilon'])(x)
     x = Dropout(LSTM_CONFIG['dropout_rate'])(x)
     
     # Segunda capa densa con residual
-    x = Dense(LSTM_CONFIG['dense_units'][1], activation=LSTM_CONFIG['dense_activation'])(x)
+    x = Dense(LSTM_CONFIG['dense_units'][1])(x)
+    x = tf.keras.layers.Activation(activation_fn)(x)
+    
     if skip.shape[-1] == LSTM_CONFIG['dense_units'][1]:
         x = Add()([x, skip])  # Skip connection si las dimensiones coinciden
         

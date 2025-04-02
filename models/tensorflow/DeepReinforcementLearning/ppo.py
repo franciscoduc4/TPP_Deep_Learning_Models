@@ -9,6 +9,8 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanSquaredError
 from tensorflow.keras.callbacks import EarlyStopping
+import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple, Any, Optional, Union, Callable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -20,8 +22,20 @@ class ActorCriticModel(Model):
     """
     Modelo Actor-Crítico para PPO que divide la arquitectura en redes para
     política (actor) y valor (crítico).
+    
+    Parámetros:
+    -----------
+    state_dim : int
+        Dimensión del espacio de estados
+    action_dim : int
+        Dimensión del espacio de acciones
+    hidden_units : Optional[List[int]], opcional
+        Unidades en capas ocultas (default: None)
     """
-    def __init__(self, state_dim, action_dim, hidden_units=None):
+    def __init__(self, 
+                state_dim: int, 
+                action_dim: int, 
+                hidden_units: Optional[List[int]] = None) -> None:
         super(ActorCriticModel, self).__init__()
         
         # Valores predeterminados para capas ocultas
@@ -54,7 +68,20 @@ class ActorCriticModel(Model):
         # Capa de salida del crítico (valor del estado)
         self.value = Dense(1, activation='linear', name='critic_value')
     
-    def call(self, inputs):
+    def call(self, inputs: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        """
+        Realiza el forward pass del modelo actor-crítico.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de estados de entrada
+            
+        Retorna:
+        --------
+        Tuple[tf.Tensor, tf.Tensor, tf.Tensor]
+            (mu, sigma, value) - Parámetros de la distribución de política y valor estimado
+        """
         x = inputs
         
         # Capas compartidas
@@ -79,42 +106,51 @@ class ActorCriticModel(Model):
         
         return mu, sigma, value
     
-    def get_action(self, state, deterministic=False):
+    def get_action(self, state: np.ndarray, deterministic: bool = False) -> np.ndarray:
         """
         Obtiene una acción basada en el estado actual.
         
-        Args:
-            state: El estado actual
-            deterministic: Si es True, devuelve la acción con máxima probabilidad
+        Parámetros:
+        -----------
+        state : np.ndarray
+            El estado actual
+        deterministic : bool, opcional
+            Si es True, devuelve la acción con máxima probabilidad (default: False)
         
-        Returns:
+        Retorna:
+        --------
+        np.ndarray
             Una acción muestreada de la distribución de política
         """
         state = tf.convert_to_tensor([state], dtype=tf.float32)
         mu, sigma, _ = self.call(state)
         
         if deterministic:
-            return mu[0]
+            return mu[0].numpy()
         
         # Muestrear de la distribución normal
         dist = tf.random.normal(shape=mu.shape)
         action = mu + sigma * dist
         
-        return action[0]
+        return action[0].numpy()
     
-    def get_value(self, state):
+    def get_value(self, state: np.ndarray) -> np.ndarray:
         """
         Obtiene el valor estimado para un estado.
         
-        Args:
-            state: El estado para evaluar
+        Parámetros:
+        -----------
+        state : np.ndarray
+            El estado para evaluar
         
-        Returns:
+        Retorna:
+        --------
+        np.ndarray
             El valor estimado del estado
         """
         state = tf.convert_to_tensor([state], dtype=tf.float32)
         _, _, value = self.call(state)
-        return value[0]
+        return value[0].numpy()
 
 
 class PPO:
@@ -123,19 +159,47 @@ class PPO:
     
     Esta implementación utiliza el clipping de PPO para actualizar la política
     y un estimador de ventaja generalizada (GAE) para mejorar el aprendizaje.
+    
+    Parámetros:
+    -----------
+    state_dim : int
+        Dimensión del espacio de estados
+    action_dim : int
+        Dimensión del espacio de acciones
+    learning_rate : float, opcional
+        Tasa de aprendizaje (default: PPO_CONFIG['learning_rate'])
+    gamma : float, opcional
+        Factor de descuento (default: PPO_CONFIG['gamma'])
+    epsilon : float, opcional
+        Parámetro de clipping para PPO (default: PPO_CONFIG['clip_epsilon'])
+    hidden_units : Optional[List[int]], opcional
+        Unidades en capas ocultas (default: None)
+    entropy_coef : float, opcional
+        Coeficiente para término de entropía (default: PPO_CONFIG['entropy_coef'])
+    value_coef : float, opcional
+        Coeficiente para pérdida de valor (default: PPO_CONFIG['value_coef'])
+    max_grad_norm : Optional[float], opcional
+        Norma máxima para clipping de gradientes (default: PPO_CONFIG['max_grad_norm'])
+    seed : int, opcional
+        Semilla para reproducibilidad (default: 42)
     """
     def __init__(
         self, 
-        state_dim, 
-        action_dim,
-        learning_rate=PPO_CONFIG['learning_rate'],
-        gamma=PPO_CONFIG['gamma'],
-        epsilon=PPO_CONFIG['clip_epsilon'],
-        hidden_units=None,
-        entropy_coef=PPO_CONFIG['entropy_coef'],
-        value_coef=PPO_CONFIG['value_coef'],
-        max_grad_norm=PPO_CONFIG['max_grad_norm']
-    ):
+        state_dim: int, 
+        action_dim: int,
+        learning_rate: float = PPO_CONFIG['learning_rate'],
+        gamma: float = PPO_CONFIG['gamma'],
+        epsilon: float = PPO_CONFIG['clip_epsilon'],
+        hidden_units: Optional[List[int]] = None,
+        entropy_coef: float = PPO_CONFIG['entropy_coef'],
+        value_coef: float = PPO_CONFIG['value_coef'],
+        max_grad_norm: Optional[float] = PPO_CONFIG['max_grad_norm'],
+        seed: int = 42
+    ) -> None:
+        # Configurar semillas para reproducibilidad
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+        
         # Parámetros del modelo
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -144,6 +208,7 @@ class PPO:
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.max_grad_norm = max_grad_norm
+        self.seed = seed
         
         # Valores predeterminados para capas ocultas
         if hidden_units is None:
@@ -160,41 +225,61 @@ class PPO:
         self.value_loss_metric = tf.keras.metrics.Mean('value_loss')
         self.entropy_metric = tf.keras.metrics.Mean('entropy')
         self.total_loss_metric = tf.keras.metrics.Mean('total_loss')
+        
+        # Inicializar modelo para evitar errores en la primera llamada
+        dummy_state = np.zeros((1, state_dim), dtype=np.float32)
+        self.model(dummy_state)
     
-    def log_prob(self, mu, sigma, actions):
+    def log_prob(self, mu: tf.Tensor, sigma: tf.Tensor, actions: tf.Tensor) -> tf.Tensor:
         """
         Calcula el logaritmo de la probabilidad de acciones bajo una política gaussiana.
         
-        Args:
-            mu: Media de la distribución gaussiana
-            sigma: Desviación estándar de la distribución gaussiana
-            actions: Acciones para calcular su probabilidad
+        Parámetros:
+        -----------
+        mu : tf.Tensor
+            Media de la distribución gaussiana
+        sigma : tf.Tensor
+            Desviación estándar de la distribución gaussiana
+        actions : tf.Tensor
+            Acciones para calcular su probabilidad
         
-        Returns:
+        Retorna:
+        --------
+        tf.Tensor
             Logaritmo de probabilidad de las acciones
         """
         logp_normal = -0.5 * tf.square((actions - mu) / sigma) - 0.5 * tf.math.log(2.0 * np.pi) - tf.math.log(sigma)
         return tf.reduce_sum(logp_normal, axis=-1, keepdims=True)
     
     @tf.function
-    def train_step(self, states, actions, old_log_probs, rewards, advantages, values):
+    def train_step(self, states: tf.Tensor, actions: tf.Tensor, old_log_probs: tf.Tensor, 
+                  rewards: tf.Tensor, advantages: tf.Tensor, values: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         Realiza un paso de entrenamiento para actualizar el modelo.
         
-        Args:
-            states: Estados observados en el entorno
-            actions: Acciones tomadas para esos estados
-            old_log_probs: Log de probabilidades de acciones bajo la política antigua
-            rewards: Recompensas recibidas
-            advantages: Ventajas estimadas
-            values: Valores antiguos estimados por el crítico
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados observados en el entorno
+        actions : tf.Tensor
+            Acciones tomadas para esos estados
+        old_log_probs : tf.Tensor
+            Log de probabilidades de acciones bajo la política antigua
+        rewards : tf.Tensor
+            Recompensas recibidas
+        advantages : tf.Tensor
+            Ventajas estimadas
+        values : tf.Tensor
+            Valores antiguos estimados por el crítico
         
-        Returns:
-            Pérdida total, pérdida de política, pérdida de valor, entropía
+        Retorna:
+        --------
+        Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]
+            (pérdida total, pérdida de política, pérdida de valor, entropía)
         """
         with tf.GradientTape() as tape:
             # Pasar estados por el modelo
-            mu, sigma, new_values = self.model(states)
+            mu, sigma, new_values = self.model(states, training=True)
             
             # Calcular nueva probabilidad de acciones
             new_log_probs = self.log_prob(mu, sigma, actions)
@@ -242,20 +327,30 @@ class PPO:
         
         return total_loss, policy_loss, value_loss, entropy
     
-    def compute_gae(self, rewards, values, next_values, dones, gamma=0.99, lam=0.95):
+    def compute_gae(self, rewards: np.ndarray, values: np.ndarray, next_values: np.ndarray, 
+                  dones: np.ndarray, gamma: float = 0.99, lam: float = 0.95) -> Tuple[np.ndarray, np.ndarray]:
         """
         Calcula el Estimador de Ventaja Generalizada (GAE).
         
-        Args:
-            rewards: Recompensas recibidas
-            values: Valores estimados para los estados actuales
-            next_values: Valores estimados para los estados siguientes
-            dones: Indicadores de fin de episodio
-            gamma: Factor de descuento
-            lam: Factor lambda para GAE
+        Parámetros:
+        -----------
+        rewards : np.ndarray
+            Recompensas recibidas
+        values : np.ndarray
+            Valores estimados para los estados actuales
+        next_values : np.ndarray
+            Valores estimados para los estados siguientes
+        dones : np.ndarray
+            Indicadores de fin de episodio
+        gamma : float, opcional
+            Factor de descuento (default: 0.99)
+        lam : float, opcional
+            Factor lambda para GAE (default: 0.95)
         
-        Returns:
-            Ventajas y retornos calculados
+        Retorna:
+        --------
+        Tuple[np.ndarray, np.ndarray]
+            (ventajas, retornos) - Ventajas y retornos calculados
         """
         advantages = np.zeros_like(rewards)
         last_gae = 0
@@ -276,125 +371,377 @@ class PPO:
         
         return advantages, returns
     
-    def train(self, env, epochs=100, steps_per_epoch=4000, batch_size=64, update_iters=10):
+    def _collect_trajectories(self, env: Any, steps_per_epoch: int) -> Tuple[List[np.ndarray], Dict[str, List[float]]]:
+        """
+        Recolecta trayectorias de experiencia en el entorno.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o compatible
+        steps_per_epoch : int
+            Número de pasos a ejecutar
+            
+        Retorna:
+        --------
+        Tuple[List[np.ndarray], Dict[str, List[float]]]
+            (datos_trayectoria, historial_episodios) - Datos recopilados y métricas por episodio
+        """
+        # Contenedores para almacenar experiencias
+        states = []
+        actions = []
+        rewards = []
+        values = []
+        dones = []
+        next_values = []
+        log_probs = []
+        
+        # Para tracking de episodios
+        episode_rewards = []
+        episode_lengths = []
+        episode_reward = 0
+        episode_length = 0
+        
+        # Recolectar experiencias
+        state, _ = env.reset()
+        for _ in range(steps_per_epoch):
+            episode_length += 1
+            states.append(state)
+            
+            # Obtener acción y valor
+            action = self.model.get_action(state)
+            mu, sigma, value = self.model(tf.convert_to_tensor([state], dtype=tf.float32))
+            
+            # Log prob de la acción
+            log_prob = self.log_prob(mu, sigma, tf.convert_to_tensor([action], dtype=tf.float32))[0]
+            
+            # Dar paso en el entorno
+            next_state, reward, done, _, _ = env.step(action)
+            
+            # Guardar experiencia
+            actions.append(action)
+            rewards.append(reward)
+            values.append(value[0][0].numpy())
+            dones.append(float(done))
+            log_probs.append(log_prob.numpy())
+            
+            # Actualizar estado y recompensa acumulada
+            state = next_state
+            episode_reward += reward
+            
+            # Si el episodio termina, resetear y registrar métricas
+            if done:
+                state, _ = env.reset()
+                episode_rewards.append(episode_reward)
+                episode_lengths.append(episode_length)
+                episode_reward = 0
+                episode_length = 0
+            
+            # Obtener valor del siguiente estado
+            next_value = self.model.get_value(next_state)
+            next_values.append(next_value[0])
+        
+        # Si el último episodio no terminó, guardar sus métricas parciales
+        if episode_length > 0:
+            episode_rewards.append(episode_reward)
+            episode_lengths.append(episode_length)
+            
+        # Empaquetar datos
+        trajectory_data = [
+            np.array(states, dtype=np.float32),
+            np.array(actions, dtype=np.float32),
+            np.array(rewards, dtype=np.float32),
+            np.array(values, dtype=np.float32),
+            np.array(dones, dtype=np.float32),
+            np.array(next_values, dtype=np.float32),
+            np.array(log_probs, dtype=np.float32)
+        ]
+        
+        episode_history = {
+            'reward': episode_rewards,
+            'length': episode_lengths
+        }
+        
+        return trajectory_data, episode_history
+    
+    def _update_policy(self, states: np.ndarray, actions: np.ndarray, old_log_probs: np.ndarray, 
+                     returns: np.ndarray, advantages: np.ndarray, values: np.ndarray,
+                     batch_size: int, update_iters: int) -> Dict[str, float]:
+        """
+        Actualiza la política y el crítico con los datos recolectados.
+        
+        Parámetros:
+        -----------
+        states : np.ndarray
+            Estados observados
+        actions : np.ndarray
+            Acciones tomadas
+        old_log_probs : np.ndarray
+            Log probs originales de las acciones
+        returns : np.ndarray
+            Retornos calculados
+        advantages : np.ndarray
+            Ventajas estimadas
+        values : np.ndarray
+            Valores originales estimados
+        batch_size : int
+            Tamaño de lote para actualización
+        update_iters : int
+            Número de iteraciones de actualización
+            
+        Retorna:
+        --------
+        Dict[str, float]
+            Métricas promedio de entrenamiento
+        """
+        # Convertir a tensores
+        states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
+        actions_tensor = tf.convert_to_tensor(actions, dtype=tf.float32)
+        old_log_probs_tensor = tf.convert_to_tensor(old_log_probs, dtype=tf.float32)
+        returns_tensor = tf.convert_to_tensor(returns, dtype=tf.float32)
+        advantages_tensor = tf.convert_to_tensor(advantages, dtype=tf.float32)
+        values_tensor = tf.convert_to_tensor(values, dtype=tf.float32)
+        
+        # Crear conjunto de datos para entrenar
+        dataset = tf.data.Dataset.from_tensor_slices(
+            (states_tensor, actions_tensor, old_log_probs_tensor, returns_tensor, advantages_tensor, values_tensor)
+        )
+        dataset = dataset.shuffle(buffer_size=states.shape[0]).batch(batch_size)
+        
+        # Resetear métricas
+        self.policy_loss_metric.reset_states()
+        self.value_loss_metric.reset_states()
+        self.entropy_metric.reset_states()
+        self.total_loss_metric.reset_states()
+        
+        # Entrenar durante varias iteraciones
+        for _ in range(update_iters):
+            for batch in dataset:
+                self.train_step(*batch)
+        
+        # Recopilar métricas
+        metrics = {
+            'policy_loss': float(self.policy_loss_metric.result().numpy()),
+            'value_loss': float(self.value_loss_metric.result().numpy()),
+            'entropy': float(self.entropy_metric.result().numpy()),
+            'total_loss': float(self.total_loss_metric.result().numpy())
+        }
+        
+        return metrics
+    
+    def train(self, env: Any, epochs: int = 100, steps_per_epoch: int = 4000, batch_size: int = 64, 
+             update_iters: int = 10, gae_lambda: float = 0.95,
+             log_interval: int = 10) -> Dict[str, List[float]]:
         """
         Entrena el agente con PPO en un entorno dado.
         
-        Args:
-            env: Entorno de OpenAI Gym o compatible
-            epochs: Número de épocas de entrenamiento
-            steps_per_epoch: Pasos por época
-            batch_size: Tamaño de lote para actualización
-            update_iters: Número de iteraciones de actualización por lote
-        
-        Returns:
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o compatible
+        epochs : int, opcional
+            Número de épocas de entrenamiento (default: 100)
+        steps_per_epoch : int, opcional
+            Pasos por época (default: 4000)
+        batch_size : int, opcional
+            Tamaño de lote para actualización (default: 64)
+        update_iters : int, opcional
+            Número de iteraciones de actualización por lote (default: 10)
+        gae_lambda : float, opcional
+            Factor lambda para GAE (default: 0.95)
+        log_interval : int, opcional
+            Intervalo para mostrar información (default: 10)
+            
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historial de entrenamiento
         """
         history = {
-            'reward': [],
-            'policy_loss': [],
-            'value_loss': [],
-            'entropy': [],
-            'total_loss': []
+            'reward': [],       # Recompensa por episodio
+            'avg_reward': [],   # Recompensa promedio por época
+            'policy_loss': [],  # Pérdida de política por época
+            'value_loss': [],   # Pérdida de valor por época
+            'entropy': [],      # Entropía por época
+            'total_loss': []    # Pérdida total por época
         }
         
         for epoch in range(epochs):
-            # Contenedores para almacenar experiencias
-            states = []
-            actions = []
-            rewards = []
-            values = []
-            dones = []
-            next_values = []
-            log_probs = []
+            # 1. Recolectar trayectorias
+            trajectory_data, episode_history = self._collect_trajectories(env, steps_per_epoch)
+            states, actions, rewards, values, dones, next_values, log_probs = trajectory_data
             
-            # Recolectar experiencias
-            state, _ = env.reset()
-            episode_reward = 0
-            for _ in range(steps_per_epoch):
-                states.append(state)
-                
-                # Obtener acción y valor
-                action = self.model.get_action(state)
-                mu, sigma, value = self.model(tf.convert_to_tensor([state], dtype=tf.float32))
-                
-                # Log prob de la acción
-                log_prob = self.log_prob(mu, sigma, tf.convert_to_tensor([action], dtype=tf.float32))[0]
-                
-                # Dar paso en el entorno
-                next_state, reward, done, _, _ = env.step(action.numpy())
-                
-                # Guardar experiencia
-                actions.append(action)
-                rewards.append(reward)
-                values.append(value[0][0])
-                dones.append(done)
-                log_probs.append(log_prob)
-                
-                # Actualizar estado y recompensa acumulada
-                state = next_state
-                episode_reward += reward
-                
-                # Si el episodio termina, resetear
-                if done:
-                    state, _ = env.reset()
-                    history['reward'].append(episode_reward)
-                    episode_reward = 0
-                
-                # Obtener valor del siguiente estado
-                next_value = self.model.get_value(next_state)
-                next_values.append(next_value.numpy()[0])
+            # Registrar recompensas de episodios
+            history['reward'].extend(episode_history['reward'])
+            history['avg_reward'].append(np.mean(episode_history['reward']))
             
-            # Calcular ventajas y retornos usando GAE
+            # 2. Calcular ventajas y retornos usando GAE
             advantages, returns = self.compute_gae(
-                np.array(rewards), np.array(values), 
-                np.array(next_values), np.array(dones)
-            )
+                rewards, values, next_values, dones, self.gamma, gae_lambda)
             
-            # Convertir listas a arrays
-            states = np.array(states, dtype=np.float32)
-            actions = np.array(actions, dtype=np.float32)
-            old_log_probs = np.array(log_probs, dtype=np.float32)
-            
-            # Crear conjunto de datos para entrenar
-            dataset = tf.data.Dataset.from_tensor_slices(
-                (states, actions, old_log_probs, returns, advantages, values)
-            )
-            dataset = dataset.shuffle(buffer_size=steps_per_epoch).batch(batch_size)
-            
-            # Entrenar durante varias iteraciones
-            for _ in range(update_iters):
-                for batch in dataset:
-                    self.train_step(*batch)
+            # 3. Actualizar política
+            metrics = self._update_policy(
+                states, actions, log_probs, returns, advantages, values,
+                batch_size, update_iters)
             
             # Registrar métricas
-            history['policy_loss'].append(self.policy_loss_metric.result().numpy())
-            history['value_loss'].append(self.value_loss_metric.result().numpy())
-            history['entropy'].append(self.entropy_metric.result().numpy())
-            history['total_loss'].append(self.total_loss_metric.result().numpy())
-            
-            # Resetear métricas
-            self.policy_loss_metric.reset_states()
-            self.value_loss_metric.reset_states()
-            self.entropy_metric.reset_states()
-            self.total_loss_metric.reset_states()
+            history['policy_loss'].append(metrics['policy_loss'])
+            history['value_loss'].append(metrics['value_loss']) 
+            history['entropy'].append(metrics['entropy'])
+            history['total_loss'].append(metrics['total_loss'])
             
             # Mostrar progreso
-            if (epoch + 1) % 10 == 0:
-                avg_reward = np.mean(history['reward'][-10:])
-                print(f"Epoch {epoch+1}/{epochs} - Avg Reward: {avg_reward:.2f}, "
-                      f"Policy Loss: {history['policy_loss'][-1]:.4f}, "
-                      f"Value Loss: {history['value_loss'][-1]:.4f}")
+            if (epoch + 1) % log_interval == 0 or epoch == 0:
+                print(f"Época {epoch+1}/{epochs} - Recompensa Promedio: {history['avg_reward'][-1]:.2f}, "
+                      f"Pérdida Política: {history['policy_loss'][-1]:.4f}, "
+                      f"Pérdida Valor: {history['value_loss'][-1]:.4f}")
         
         return history
     
-    def save_model(self, filepath):
-        """Guarda el modelo en un archivo."""
-        self.model.save_weights(filepath)
+    def evaluate(self, env: Any, n_episodes: int = 10, deterministic: bool = True, render: bool = False) -> float:
+        """
+        Evalúa el agente entrenado en un entorno.
         
-    def load_model(self, filepath):
-        """Carga el modelo desde un archivo."""
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o compatible
+        n_episodes : int, opcional
+            Número de episodios para evaluar (default: 10)
+        deterministic : bool, opcional
+            Si usar acciones determinísticas (default: True)
+        render : bool, opcional
+            Si renderizar el entorno (default: False)
+            
+        Retorna:
+        --------
+        float
+            Recompensa promedio por episodio
+        """
+        total_rewards = []
+        total_lengths = []
+        
+        for episode in range(n_episodes):
+            state, _ = env.reset()
+            done = False
+            episode_reward = 0
+            episode_length = 0
+            
+            while not done:
+                # Obtener acción (determinística o estocástica)
+                action = self.model.get_action(state, deterministic=deterministic)
+                
+                # Dar paso en el entorno
+                next_state, reward, done, _, _ = env.step(action)
+                
+                # Renderizar si es necesario
+                if render:
+                    env.render()
+                
+                # Actualizar estado y contadores
+                state = next_state
+                episode_reward += reward
+                episode_length += 1
+                
+            # Registrar resultados
+            total_rewards.append(episode_reward)
+            total_lengths.append(episode_length)
+            print(f"Episodio {episode+1}/{n_episodes} - Recompensa: {episode_reward:.2f}, Longitud: {episode_length}")
+        
+        # Calcular estadísticas
+        mean_reward = np.mean(total_rewards)
+        mean_length = np.mean(total_lengths)
+        std_reward = np.std(total_rewards)
+        
+        print(f"\nEvaluación completada - Recompensa Promedio: {mean_reward:.2f} ± {std_reward:.2f}, "
+              f"Longitud Promedio: {mean_length:.1f}")
+              
+        return mean_reward
+    
+    def save_model(self, filepath: str) -> None:
+        """
+        Guarda el modelo en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        self.model.save_weights(filepath)
+        print(f"Modelo guardado en {filepath}")
+        
+    def load_model(self, filepath: str) -> None:
+        """
+        Carga el modelo desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
         # Asegurarse de que el modelo está construido primero
-        dummy_state = np.zeros((1, self.state_dim))
+        dummy_state = np.zeros((1, self.state_dim), dtype=np.float32)
         self.model(dummy_state)
         self.model.load_weights(filepath)
+        print(f"Modelo cargado desde {filepath}")
+    
+    def visualize_training(self, history: Dict[str, List[float]], window_size: int = 5) -> None:
+        """
+        Visualiza los resultados del entrenamiento.
+        
+        Parámetros:
+        -----------
+        history : Dict[str, List[float]]
+            Historial de entrenamiento
+        window_size : int, opcional
+            Tamaño de ventana para suavizado (default: 5)
+        """
+        def smooth(y, window_size):
+            """Aplica suavizado con media móvil."""
+            box = np.ones(window_size) / window_size
+            return np.convolve(y, box, mode='valid')
+        
+        plt.figure(figsize=(15, 10))
+        
+        # Graficar recompensas por episodio
+        plt.subplot(2, 2, 1)
+        rewards = history['reward']
+        plt.plot(rewards, alpha=0.3, color='blue')
+        if len(rewards) > window_size:
+            plt.plot(range(window_size-1, len(rewards)), 
+                    smooth(rewards, window_size), 
+                    color='blue', label='Suavizado')
+        plt.title('Recompensa por Episodio')
+        plt.xlabel('Episodio')
+        plt.ylabel('Recompensa')
+        plt.grid(alpha=0.3)
+        
+        # Graficar recompensa promedio por época
+        plt.subplot(2, 2, 2)
+        avg_rewards = history['avg_reward']
+        plt.plot(avg_rewards, marker='o', color='green')
+        plt.title('Recompensa Promedio por Época')
+        plt.xlabel('Época')
+        plt.ylabel('Recompensa Promedio')
+        plt.grid(alpha=0.3)
+        
+        # Graficar pérdidas
+        plt.subplot(2, 2, 3)
+        plt.plot(history['policy_loss'], label='Política', color='red')
+        plt.plot(history['value_loss'], label='Valor', color='orange')
+        plt.title('Pérdidas')
+        plt.xlabel('Época')
+        plt.ylabel('Pérdida')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        
+        # Graficar entropía
+        plt.subplot(2, 2, 4)
+        plt.plot(history['entropy'], color='purple')
+        plt.title('Entropía')
+        plt.xlabel('Época')
+        plt.ylabel('Entropía')
+        plt.grid(alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()

@@ -1,16 +1,16 @@
 import os, sys
-import tensorflow as tf
+import jax
+import jax.numpy as jnp
 import numpy as np
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input, Dense, Conv1D, Flatten, Concatenate,
-    BatchNormalization, Dropout, LayerNormalization
-)
-from tensorflow.keras.optimizers import Adam
+import flax
+import flax.linen as nn
+import optax
+from flax.training import train_state
+from typing import Dict, List, Tuple, Any, Optional, Union, Callable, Sequence
+from functools import partial
+import matplotlib.pyplot as plt
 from collections import deque
 import random
-import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple, Any, Optional, Union, Callable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -95,7 +95,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-class ActorNetwork(Model):
+class ActorNetwork(nn.Module):
     """
     Red del Actor para SAC que produce una distribución de política gaussiana.
     
@@ -104,173 +104,142 @@ class ActorNetwork(Model):
     
     Parámetros:
     -----------
-    state_dim : int
-        Dimensión del espacio de estados
     action_dim : int
         Dimensión del espacio de acciones
-    action_high : np.ndarray
+    action_high : jnp.ndarray
         Límite superior del espacio de acciones
-    action_low : np.ndarray
+    action_low : jnp.ndarray
         Límite inferior del espacio de acciones
-    hidden_units : Optional[List[int]], opcional
+    hidden_units : Optional[Sequence[int]], opcional
         Unidades en capas ocultas (default: None)
     """
-    def __init__(
-        self, 
-        state_dim: int, 
-        action_dim: int, 
-        action_high: np.ndarray, 
-        action_low: np.ndarray, 
-        hidden_units: Optional[List[int]] = None
-    ) -> None:
-        super(ActorNetwork, self).__init__()
-        
-        # Límites de acciones para escalar la salida
-        self.action_high = action_high
-        self.action_low = action_low
-        self.action_dim = action_dim
-        self.log_std_min = SAC_CONFIG['log_std_min']  # Límite inferior para log_std
-        self.log_std_max = SAC_CONFIG['log_std_max']  # Límite superior para log_std
-        
-        # Valores predeterminados para capas ocultas
-        if hidden_units is None:
-            hidden_units = SAC_CONFIG['actor_hidden_units']
-        
-        # Capas para el procesamiento del estado
-        self.hidden_layers = []
-        for i, units in enumerate(hidden_units):
-            self.hidden_layers.append(Dense(
-                units, 
-                activation=SAC_CONFIG['actor_activation'],
-                name=f'actor_dense_{i}'
-            ))
-            self.hidden_layers.append(LayerNormalization(
-                epsilon=SAC_CONFIG['epsilon'],
-                name=f'actor_ln_{i}'
-            ))
-            self.hidden_layers.append(Dropout(
-                SAC_CONFIG['dropout_rate'],
-                name=f'actor_dropout_{i}'
-            ))
-        
-        # Capas de salida para media y log-desviación estándar
-        self.mean_layer = Dense(action_dim, activation='linear', name='actor_mean')
-        self.log_std_layer = Dense(action_dim, activation='linear', name='actor_log_std')
+    action_dim: int
+    action_high: jnp.ndarray
+    action_low: jnp.ndarray
+    hidden_units: Optional[Sequence[int]] = None
     
-    def call(self, inputs: tf.Tensor, training: bool = False) -> Tuple[tf.Tensor, tf.Tensor]:
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool = False) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Realiza el forward pass del modelo actor.
         
         Parámetros:
         -----------
-        inputs : tf.Tensor
-            Tensor de estados
+        x : jnp.ndarray
+            Tensor de estados de entrada
         training : bool, opcional
             Si está en modo entrenamiento (default: False)
             
         Retorna:
         --------
-        Tuple[tf.Tensor, tf.Tensor]
+        Tuple[jnp.ndarray, jnp.ndarray]
             (mean, std) - Media y desviación estándar de la distribución de política
         """
-        x = inputs
+        hidden_units = self.hidden_units or SAC_CONFIG['actor_hidden_units']
+        log_std_min = SAC_CONFIG['log_std_min']
+        log_std_max = SAC_CONFIG['log_std_max']
+        dropout_rate = SAC_CONFIG['dropout_rate']
         
-        # Procesar a través de capas ocultas
-        for layer in self.hidden_layers:
-            if isinstance(layer, Dropout):
-                x = layer(x, training=training)
-            else:
-                x = layer(x)
+        # Capas para procesar el estado
+        for i, units in enumerate(hidden_units):
+            x = nn.Dense(units, name=f'actor_dense_{i}')(x)
+            x = getattr(nn, SAC_CONFIG['actor_activation'])(x)
+            x = nn.LayerNorm(epsilon=SAC_CONFIG['epsilon'], name=f'actor_ln_{i}')(x)
+            x = nn.Dropout(rate=dropout_rate, deterministic=not training, name=f'actor_dropout_{i}')(x)
         
-        # Calcular media y log_std
-        mean = self.mean_layer(x)
-        log_std = self.log_std_layer(x)
-        log_std = tf.clip_by_value(log_std, self.log_std_min, self.log_std_max)
-        std = tf.exp(log_std)
+        # Capas de salida para media y log-desviación estándar
+        mean = nn.Dense(self.action_dim, name='actor_mean')(x)
+        log_std = nn.Dense(self.action_dim, name='actor_log_std')(x)
+        
+        # Restringir log_std al rango especificado
+        log_std = jnp.clip(log_std, log_std_min, log_std_max)
+        std = jnp.exp(log_std)
         
         return mean, std
     
-    def sample_action(self, state: tf.Tensor, deterministic: bool = False) -> Tuple[tf.Tensor, Optional[tf.Tensor]]:
+    def sample_action(self, mean: jnp.ndarray, std: jnp.ndarray, key: jnp.ndarray, 
+                     deterministic: bool = False) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         Muestrea una acción de la distribución de política.
         
         Parámetros:
         -----------
-        state : tf.Tensor
-            El estado actual
+        mean : jnp.ndarray
+            Media de la distribución gaussiana
+        std : jnp.ndarray
+            Desviación estándar de la distribución
+        key : jnp.ndarray
+            PRNG key para muestreo aleatorio
         deterministic : bool, opcional
             Si es True, devuelve la acción media (sin ruido) (default: False)
             
         Retorna:
         --------
-        Tuple[tf.Tensor, Optional[tf.Tensor]]
-            (acción, log_prob) - Acción muestreada y log-probabilidad
+        Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+            (actions, log_probs, next_key) - Acciones, logaritmos de probabilidad y siguiente llave PRNG
         """
-        # Obtener parámetros de la distribución
-        mean, std = self(state, training=False)
-        
         if deterministic:
             # Para evaluación o explotación
             actions = mean
-            log_probs = None
-        else:
-            # Muestrear usando el truco de reparametrización para permitir backprop
-            noise = tf.random.normal(shape=mean.shape)
-            z = mean + std * noise
-            
-            # Aplicar tanh para acotar las acciones
-            actions = tf.tanh(z)
-            
-            # Calcular log-probabilidad con corrección para tanh
-            log_probs = self._log_prob(z, std, actions)
+            return jax.lax.stop_gradient(self._scale_actions(actions)), None, key
+        
+        # Muestrear usando el truco de reparametrización para permitir backprop
+        noise = jax.random.normal(key, mean.shape)
+        z = mean + std * noise
+        
+        # Aplicar tanh para acotar las acciones
+        actions = jnp.tanh(z)
         
         # Escalar acciones al rango deseado
         scaled_actions = self._scale_actions(actions)
         
-        return scaled_actions, log_probs
+        # Calcular log-probabilidad con corrección para tanh
+        log_probs = self._log_prob(z, std, actions)
+        
+        return scaled_actions, log_probs, key
     
-    def _scale_actions(self, actions: tf.Tensor) -> tf.Tensor:
+    def _scale_actions(self, actions: jnp.ndarray) -> jnp.ndarray:
         """
         Escala las acciones al rango deseado.
         
         Parámetros:
         -----------
-        actions : tf.Tensor
+        actions : jnp.ndarray
             Acciones normalizadas en el rango [-1, 1]
             
         Retorna:
         --------
-        tf.Tensor
+        jnp.ndarray
             Acciones escaladas al rango [action_low, action_high]
         """
         return actions * (self.action_high - self.action_low) / 2 + (self.action_high + self.action_low) / 2
     
-    def _log_prob(self, z: tf.Tensor, std: tf.Tensor, actions: tf.Tensor) -> tf.Tensor:
+    def _log_prob(self, z: jnp.ndarray, std: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
         """
         Calcula el logaritmo de la probabilidad de una acción.
         
         Parámetros:
         -----------
-        z : tf.Tensor
+        z : jnp.ndarray
             Valor antes de aplicar tanh
-        std : tf.Tensor
+        std : jnp.ndarray
             Desviación estándar
-        actions : tf.Tensor
+        actions : jnp.ndarray
             Acción muestreada
             
         Retorna:
         --------
-        tf.Tensor
+        jnp.ndarray
             Log-probabilidad de la acción
         """
         # Log-prob de distribución normal
-        log_prob_gaussian = -0.5 * (tf.square(z) + 2 * tf.math.log(std) + tf.math.log(2.0 * np.pi))
-        log_prob_gaussian = tf.reduce_sum(log_prob_gaussian, axis=-1, keepdims=True)
+        log_prob_gaussian = -0.5 * (jnp.square(z) + 2 * jnp.log(std) + jnp.log(2.0 * jnp.pi))
+        log_prob_gaussian = jnp.sum(log_prob_gaussian, axis=-1, keepdims=True)
         
         # Corrección por transformación tanh
-        # Deriva del cambio de variable (ver paper SAC)
-        squash_correction = tf.reduce_sum(
-            tf.math.log(1.0 - tf.square(tf.tanh(z)) + 1e-6),
+        # Deriva de cambio de variable (ver paper SAC)
+        squash_correction = jnp.sum(
+            jnp.log(1.0 - jnp.square(jnp.tanh(z)) + 1e-6),
             axis=-1,
             keepdims=True
         )
@@ -278,101 +247,75 @@ class ActorNetwork(Model):
         return log_prob_gaussian - squash_correction
 
 
-class CriticNetwork(Model):
+class CriticNetwork(nn.Module):
     """
     Red de Crítico para SAC que mapea pares (estado, acción) a valores-Q.
     
     Parámetros:
     -----------
-    state_dim : int
-        Dimensión del espacio de estados
-    action_dim : int
-        Dimensión del espacio de acciones
-    hidden_units : Optional[List[int]], opcional
+    hidden_units : Optional[Sequence[int]], opcional
         Unidades en capas ocultas (default: None)
     """
-    def __init__(
-        self, 
-        state_dim: int, 
-        action_dim: int, 
-        hidden_units: Optional[List[int]] = None
-    ) -> None:
-        super(CriticNetwork, self).__init__()
-        
-        # Valores predeterminados para capas ocultas
-        if hidden_units is None:
-            hidden_units = SAC_CONFIG['critic_hidden_units']
-        
-        # Capas para procesar el estado inicialmente
-        self.state_layers = []
-        for i, units in enumerate(hidden_units[:1]):  # Primera capa solo para estado
-            self.state_layers.append(Dense(
-                units, 
-                activation=SAC_CONFIG['critic_activation'],
-                name=f'critic_state_dense_{i}'
-            ))
-            self.state_layers.append(LayerNormalization(
-                epsilon=SAC_CONFIG['epsilon'],
-                name=f'critic_state_ln_{i}'
-            ))
-        
-        # Capas para procesar la combinación estado-acción
-        self.combined_layers = []
-        for i, units in enumerate(hidden_units[1:]):
-            self.combined_layers.append(Dense(
-                units, 
-                activation=SAC_CONFIG['critic_activation'],
-                name=f'critic_combined_dense_{i}'
-            ))
-            self.combined_layers.append(LayerNormalization(
-                epsilon=SAC_CONFIG['epsilon'],
-                name=f'critic_combined_ln_{i}'
-            ))
-            self.combined_layers.append(Dropout(
-                SAC_CONFIG['dropout_rate'],
-                name=f'critic_dropout_{i}'
-            ))
-        
-        # Capa de salida: valor Q
-        self.output_layer = Dense(1, name='critic_output')
+    hidden_units: Optional[Sequence[int]] = None
     
-    def call(self, inputs: Tuple[tf.Tensor, tf.Tensor], training: bool = False) -> tf.Tensor:
+    @nn.compact
+    def __call__(self, states: jnp.ndarray, actions: jnp.ndarray, training: bool = False) -> jnp.ndarray:
         """
         Realiza el forward pass del modelo crítico.
         
         Parámetros:
         -----------
-        inputs : Tuple[tf.Tensor, tf.Tensor]
-            Tupla (estados, acciones)
+        states : jnp.ndarray
+            Tensor de estados
+        actions : jnp.ndarray
+            Tensor de acciones
         training : bool, opcional
             Si está en modo entrenamiento (default: False)
             
         Retorna:
         --------
-        tf.Tensor
+        jnp.ndarray
             Valores Q estimados
         """
-        states, actions = inputs
+        hidden_units = self.hidden_units or SAC_CONFIG['critic_hidden_units']
+        dropout_rate = SAC_CONFIG['dropout_rate']
         
         # Procesar el estado inicialmente
         x = states
-        for layer in self.state_layers:
-            x = layer(x)
+        for i, units in enumerate(hidden_units[:1]):  # Primera capa solo para estado
+            x = nn.Dense(units, name=f'critic_state_dense_{i}')(x)
+            x = getattr(nn, SAC_CONFIG['critic_activation'])(x)
+            x = nn.LayerNorm(epsilon=SAC_CONFIG['epsilon'], name=f'critic_state_ln_{i}')(x)
         
         # Combinar estado procesado con acción
-        x = tf.concat([x, actions], axis=-1)
+        x = jnp.concatenate([x, actions], axis=-1)
         
         # Procesar la combinación
-        for layer in self.combined_layers:
-            if isinstance(layer, Dropout):
-                x = layer(x, training=training)
-            else:
-                x = layer(x)
+        for i, units in enumerate(hidden_units[1:]):
+            x = nn.Dense(units, name=f'critic_combined_dense_{i}')(x)
+            x = getattr(nn, SAC_CONFIG['critic_activation'])(x)
+            x = nn.LayerNorm(epsilon=SAC_CONFIG['epsilon'], name=f'critic_combined_ln_{i}')(x)
+            x = nn.Dropout(rate=dropout_rate, deterministic=not training, name=f'critic_dropout_{i}')(x)
         
         # Capa de salida: valor Q
-        q_value = self.output_layer(x)
+        q_value = nn.Dense(1, name='critic_output')(x)
         
         return q_value
+
+
+class SACTrainState(train_state.TrainState):
+    """
+    Estado de entrenamiento para SAC que extiende el TrainState de Flax.
+    
+    Atributos adicionales:
+    --------------------
+    target_params : flax.core.FrozenDict
+        Parámetros de las redes target
+    key : jnp.ndarray
+        Llave PRNG para generación de números aleatorios
+    """
+    target_params: flax.core.FrozenDict
+    key: jnp.ndarray
 
 
 class SAC:
@@ -408,7 +351,7 @@ class SAC:
         seed: int = 42
     ) -> None:
         # Configurar semillas para reproducibilidad
-        tf.random.set_seed(seed)
+        key = jax.random.PRNGKey(seed)
         np.random.seed(seed)
         random.seed(seed)
         
@@ -432,8 +375,8 @@ class SAC:
         # Parámetros del entorno y del modelo
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.action_high = action_high 
-        self.action_low = action_low
+        self.action_high = jnp.array(action_high, dtype=jnp.float32)
+        self.action_low = jnp.array(action_low, dtype=jnp.float32)
         
         # Valores predeterminados para capas ocultas
         if actor_hidden_units is None:
@@ -447,60 +390,60 @@ class SAC:
             self.critic_hidden_units = critic_hidden_units
         
         # Crear modelos
-        self.actor = ActorNetwork(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            action_high=action_high,
-            action_low=action_low,
+        self.actor_network = ActorNetwork(
+            action_dim=action_dim, 
+            action_high=self.action_high, 
+            action_low=self.action_low,
             hidden_units=self.actor_hidden_units
         )
         
-        # Crear dos críticos (para reducir sobreestimación)
-        self.critic_1 = CriticNetwork(
-            state_dim=state_dim, 
-            action_dim=action_dim,
-            hidden_units=self.critic_hidden_units
+        self.critic_network_1 = CriticNetwork(hidden_units=self.critic_hidden_units)
+        self.critic_network_2 = CriticNetwork(hidden_units=self.critic_hidden_units)
+        
+        # Inicializar parámetros
+        key, init_key_actor = jax.random.split(key)
+        key, init_key_critic1 = jax.random.split(key)
+        key, init_key_critic2 = jax.random.split(key)
+        
+        dummy_state = jnp.ones((1, state_dim), dtype=jnp.float32)
+        dummy_action = jnp.ones((1, action_dim), dtype=jnp.float32)
+        
+        actor_params = self.actor_network.init(init_key_actor, dummy_state)
+        critic_params_1 = self.critic_network_1.init(init_key_critic1, dummy_state, dummy_action)
+        critic_params_2 = self.critic_network_2.init(init_key_critic2, dummy_state, dummy_action)
+        
+        # Crear optimizadores
+        actor_tx = optax.adam(learning_rate=actor_lr)
+        critic_tx = optax.adam(learning_rate=critic_lr)
+        
+        # Inicializar estados de entrenamiento
+        self.actor_state = train_state.TrainState.create(
+            apply_fn=self.actor_network.apply,
+            params=actor_params,
+            tx=actor_tx
         )
         
-        self.critic_2 = CriticNetwork(
-            state_dim=state_dim, 
-            action_dim=action_dim,
-            hidden_units=self.critic_hidden_units
+        self.critic_state_1 = SACTrainState.create(
+            apply_fn=self.critic_network_1.apply,
+            params=critic_params_1,
+            tx=critic_tx,
+            target_params=critic_params_1,
+            key=key
         )
         
-        # Crear redes target
-        self.target_critic_1 = CriticNetwork(
-            state_dim=state_dim, 
-            action_dim=action_dim,
-            hidden_units=self.critic_hidden_units
+        key, subkey = jax.random.split(key)
+        self.critic_state_2 = SACTrainState.create(
+            apply_fn=self.critic_network_2.apply,
+            params=critic_params_2,
+            tx=critic_tx,
+            target_params=critic_params_2,
+            key=subkey
         )
         
-        self.target_critic_2 = CriticNetwork(
-            state_dim=state_dim, 
-            action_dim=action_dim,
-            hidden_units=self.critic_hidden_units
-        )
-        
-        # Asegurar que los modelos estén construidos
-        dummy_state = np.zeros((1, state_dim), dtype=np.float32)
-        dummy_action = np.zeros((1, action_dim), dtype=np.float32)
-        
-        _ = self.actor(dummy_state)
-        _ = self.critic_1([dummy_state, dummy_action])
-        _ = self.critic_2([dummy_state, dummy_action])
-        _ = self.target_critic_1([dummy_state, dummy_action])
-        _ = self.target_critic_2([dummy_state, dummy_action])
-        
-        # Sincronizar pesos de redes target con principales
-        self.update_target_networks(tau=1.0)
-        
-        # Optimizadores
-        self.actor_optimizer = Adam(learning_rate=actor_lr)
-        self.critic_optimizer = Adam(learning_rate=critic_lr)
-        
-        # Parámetro alpha (temperatura)
-        self.log_alpha = tf.Variable(tf.math.log(initial_alpha), dtype=tf.float32)
-        self.alpha_optimizer = Adam(learning_rate=alpha_lr)
+        # Inicializar alpha (coeficiente de temperatura)
+        self.log_alpha = jnp.array(jnp.log(initial_alpha), dtype=jnp.float32)
+        self.alpha_optimizer = optax.adam(learning_rate=alpha_lr)
+        self.alpha_opt_state = self.alpha_optimizer.init(self.log_alpha)
         
         # Entropía objetivo (heurística: -dim(A))
         if target_entropy is None:
@@ -517,160 +460,254 @@ class SAC:
         self.alpha_loss_sum = 0.0
         self.entropy_sum = 0.0
         self.updates_count = 0
+        
+        # PRNG key
+        self.key = key
+        
+        # Compilar funciones para mejorar rendimiento
+        self.update_actor = jax.jit(self._update_actor)
+        self.update_critics = jax.jit(self._update_critics)
+        self.update_alpha = jax.jit(self._update_alpha)
+        self.update_target_networks = jax.jit(self._update_target_networks)
     
-    def update_target_networks(self, tau: Optional[float] = None) -> None:
+    def _update_target_networks(
+        self, 
+        critic_state_1: SACTrainState, 
+        critic_state_2: SACTrainState, 
+        tau: Optional[float] = None
+    ) -> Tuple[SACTrainState, SACTrainState]:
         """
         Actualiza los parámetros de las redes target con soft update.
         
         Parámetros:
         -----------
+        critic_state_1 : SACTrainState
+            Estado del primer crítico
+        critic_state_2 : SACTrainState
+            Estado del segundo crítico
         tau : Optional[float], opcional
             Factor de interpolación (default: None, usa el valor del objeto)
+            
+        Retorna:
+        --------
+        Tuple[SACTrainState, SACTrainState]
+            Estados actualizados de los críticos
         """
         tau = tau if tau is not None else self.tau
         
-        # Actualizar target_critic_1
-        for source_weight, target_weight in zip(self.critic_1.trainable_variables, self.target_critic_1.trainable_variables):
-            target_weight.assign((1 - tau) * target_weight + tau * source_weight)
+        new_target_params_1 = jax.tree_map(
+            lambda tp, p: (1 - tau) * tp + tau * p,
+            critic_state_1.target_params,
+            critic_state_1.params
+        )
         
-        # Actualizar target_critic_2
-        for source_weight, target_weight in zip(self.critic_2.trainable_variables, self.target_critic_2.trainable_variables):
-            target_weight.assign((1 - tau) * target_weight + tau * source_weight)
+        new_target_params_2 = jax.tree_map(
+            lambda tp, p: (1 - tau) * tp + tau * p,
+            critic_state_2.target_params,
+            critic_state_2.params
+        )
+        
+        new_critic_state_1 = critic_state_1.replace(target_params=new_target_params_1)
+        new_critic_state_2 = critic_state_2.replace(target_params=new_target_params_2)
+        
+        return new_critic_state_1, new_critic_state_2
     
-    @tf.function
-    def _update_critics(self, states: tf.Tensor, actions: tf.Tensor, rewards: tf.Tensor, 
-                     next_states: tf.Tensor, dones: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+    def _update_critics(
+        self,
+        critic_state_1: SACTrainState,
+        critic_state_2: SACTrainState,
+        actor_state: train_state.TrainState,
+        log_alpha: jnp.ndarray,
+        states: jnp.ndarray,
+        actions: jnp.ndarray,
+        rewards: jnp.ndarray,
+        next_states: jnp.ndarray,
+        dones: jnp.ndarray
+    ) -> Tuple[SACTrainState, SACTrainState, jnp.ndarray, jnp.ndarray]:
         """
         Actualiza las redes de crítica.
         
         Parámetros:
         -----------
-        states : tf.Tensor
+        critic_state_1 : SACTrainState
+            Estado del primer crítico
+        critic_state_2 : SACTrainState
+            Estado del segundo crítico
+        actor_state : train_state.TrainState
+            Estado del actor
+        log_alpha : jnp.ndarray
+            Logaritmo del parámetro alpha
+        states : jnp.ndarray
             Estados actuales
-        actions : tf.Tensor
+        actions : jnp.ndarray
             Acciones tomadas
-        rewards : tf.Tensor
+        rewards : jnp.ndarray
             Recompensas recibidas
-        next_states : tf.Tensor
+        next_states : jnp.ndarray
             Estados siguientes
-        dones : tf.Tensor
+        dones : jnp.ndarray
             Indicadores de fin de episodio
             
         Retorna:
         --------
-        Tuple[tf.Tensor, tf.Tensor]
-            (critic_loss, q_value) - Pérdida y valor Q para seguimiento
+        Tuple[SACTrainState, SACTrainState, jnp.ndarray, jnp.ndarray]
+            Estados actualizados de los críticos, pérdida, y valores Q
         """
+        key, actor_key = jax.random.split(critic_state_1.key)
+        
         # Calcular alpha actual
-        alpha = tf.exp(self.log_alpha)
+        alpha = jnp.exp(log_alpha)
         
         # Obtener acciones y log_probs para el siguiente estado
-        next_actions, next_log_probs = self.actor.sample_action(next_states)
+        mean, std = actor_state.apply_fn(actor_state.params, next_states)
+        next_actions, next_log_probs, _ = self.actor_network.sample_action(mean, std, actor_key)
         
         # Calcular valores Q para el siguiente estado usando redes target
-        q1_next = self.target_critic_1([next_states, next_actions])
-        q2_next = self.target_critic_2([next_states, next_actions])
+        q1_next = critic_state_1.apply_fn(
+            critic_state_1.target_params, next_states, next_actions)
+        q2_next = critic_state_2.apply_fn(
+            critic_state_2.target_params, next_states, next_actions)
         
         # Tomar el mínimo para evitar sobreestimación
-        q_next = tf.minimum(q1_next, q2_next)
+        q_next = jnp.minimum(q1_next, q2_next)
         
         # Añadir término de entropía al Q-target (soft Q-learning)
         soft_q_next = q_next - alpha * next_log_probs
         
         # Calcular target usando ecuación de Bellman
         q_target = rewards + (1 - dones) * self.gamma * soft_q_next
-        q_target = tf.stop_gradient(q_target)
+        q_target = jax.lax.stop_gradient(q_target)
         
-        # Actualizar crítico 1
-        with tf.GradientTape() as tape1:
-            q1_pred = self.critic_1([states, actions])
-            critic_1_loss = tf.reduce_mean(tf.square(q_target - q1_pred), axis=0)
+        # Definir función de pérdida para crítico 1
+        def critic_1_loss_fn(params):
+            q1_pred = critic_state_1.apply_fn(params, states, actions)
+            return jnp.mean(jnp.square(q_target - q1_pred))
         
-        critic_1_gradients = tape1.gradient(critic_1_loss, self.critic_1.trainable_variables)
-        self.critic_optimizer.apply_gradients(zip(critic_1_gradients, self.critic_1.trainable_variables))
+        # Definir función de pérdida para crítico 2
+        def critic_2_loss_fn(params):
+            q2_pred = critic_state_2.apply_fn(params, states, actions)
+            return jnp.mean(jnp.square(q_target - q2_pred))
         
-        # Actualizar crítico 2
-        with tf.GradientTape() as tape2:
-            q2_pred = self.critic_2([states, actions])
-            critic_2_loss = tf.reduce_mean(tf.square(q_target - q2_pred), axis=0)
+        # Calcular gradientes y actualizar crítico 1
+        grad_fn_1 = jax.value_and_grad(critic_1_loss_fn)
+        critic_1_loss, critic_1_grads = grad_fn_1(critic_state_1.params)
         
-        critic_2_gradients = tape2.gradient(critic_2_loss, self.critic_2.trainable_variables)
-        self.critic_optimizer.apply_gradients(zip(critic_2_gradients, self.critic_2.trainable_variables))
+        # Calcular gradientes y actualizar crítico 2
+        grad_fn_2 = jax.value_and_grad(critic_2_loss_fn)
+        critic_2_loss, critic_2_grads = grad_fn_2(critic_state_2.params)
+        
+        # Aplicar gradientes
+        new_critic_state_1 = critic_state_1.apply_gradients(
+            grads=critic_1_grads, key=key)
+        
+        key, subkey = jax.random.split(key)
+        new_critic_state_2 = critic_state_2.apply_gradients(
+            grads=critic_2_grads, key=subkey)
         
         # Calcular pérdida total
         critic_loss = critic_1_loss + critic_2_loss
         
         # Para métricas, calcular un Q-value para seguimiento
-        q_value = tf.reduce_mean(q1_pred, axis=0)
+        q_value = critic_state_1.apply_fn(critic_state_1.params, states, actions)
         
-        return critic_loss, q_value
+        return new_critic_state_1, new_critic_state_2, critic_loss, jnp.mean(q_value)
     
-    @tf.function
-    def _update_actor(self, states: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    def _update_actor(
+        self,
+        actor_state: train_state.TrainState,
+        critic_state_1: SACTrainState,
+        critic_state_2: SACTrainState,
+        log_alpha: jnp.ndarray,
+        states: jnp.ndarray
+    ) -> Tuple[train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         Actualiza la red del actor.
         
         Parámetros:
         -----------
-        states : tf.Tensor
+        actor_state : train_state.TrainState
+            Estado del actor
+        critic_state_1 : SACTrainState
+            Estado del primer crítico
+        critic_state_2 : SACTrainState
+            Estado del segundo crítico
+        log_alpha : jnp.ndarray
+            Logaritmo del parámetro alpha
+        states : jnp.ndarray
             Estados actuales
             
         Retorna:
         --------
-        Tuple[tf.Tensor, tf.Tensor, tf.Tensor]
-            (actor_loss, log_probs, entropy) - Pérdida, log_probs y entropía
+        Tuple[train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray]
+            Estado actualizado del actor, pérdida, log_probs, y entropía
         """
-        alpha = tf.exp(self.log_alpha)
+        alpha = jnp.exp(log_alpha)
+        key = critic_state_1.key
         
-        with tf.GradientTape() as tape:
+        def actor_loss_fn(params):
             # Obtener distribución de política
-            actions, log_probs = self.actor.sample_action(states)
+            mean, std = actor_state.apply_fn(params, states)
+            actions, log_probs, _ = self.actor_network.sample_action(mean, std, key)
             
             # Calcular valores Q
-            q1 = self.critic_1([states, actions])
-            q2 = self.critic_2([states, actions])
+            q1 = critic_state_1.apply_fn(critic_state_1.params, states, actions)
+            q2 = critic_state_2.apply_fn(critic_state_2.params, states, actions)
             
             # Tomar el mínimo para evitar sobreestimación
-            q = tf.minimum(q1, q2)
+            q = jnp.minimum(q1, q2)
             
             # Pérdida del actor: minimizar KL divergence entre política y Q suavizada
-            actor_loss = tf.reduce_mean(alpha * log_probs - q, axis=0)
+            actor_loss = jnp.mean(alpha * log_probs - q)
+            
+            return actor_loss, (log_probs, -jnp.mean(log_probs))
         
-        actor_gradients = tape.gradient(actor_loss, self.actor.trainable_variables)
-        self.actor_optimizer.apply_gradients(zip(actor_gradients, self.actor.trainable_variables))
+        # Calcular gradientes y actualizar actor
+        grad_fn = jax.value_and_grad(actor_loss_fn, has_aux=True)
+        (actor_loss, (log_probs, entropy)), actor_grads = grad_fn(actor_state.params)
         
-        # Entropía para seguimiento (negativo de log_prob promedio)
-        entropy = -tf.reduce_mean(log_probs, axis=0)
+        new_actor_state = actor_state.apply_gradients(grads=actor_grads)
         
-        return actor_loss, log_probs, entropy
+        return new_actor_state, actor_loss, log_probs, entropy
     
-    @tf.function
-    def _update_alpha(self, log_probs: tf.Tensor) -> tf.Tensor:
+    def _update_alpha(
+        self,
+        log_alpha: jnp.ndarray,
+        opt_state: optax.OptState,
+        log_probs: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, optax.OptState, jnp.ndarray]:
         """
         Actualiza el parámetro de temperatura alpha.
         
         Parámetros:
         -----------
-        log_probs : tf.Tensor
+        log_alpha : jnp.ndarray
+            Logaritmo del parámetro alpha
+        opt_state : optax.OptState
+            Estado del optimizador de alpha
+        log_probs : jnp.ndarray
             Log-probabilidades de las acciones muestreadas
             
         Retorna:
         --------
-        tf.Tensor
-            Pérdida de alpha
+        Tuple[jnp.ndarray, optax.OptState, jnp.ndarray]
+            Nuevo log_alpha, estado del optimizador, y pérdida
         """
-        with tf.GradientTape() as tape:
-            alpha = tf.exp(self.log_alpha)
+        def alpha_loss_fn(log_alpha):
+            alpha = jnp.exp(log_alpha)
             # Objetivo: ajustar alpha para alcanzar la entropía objetivo
-            alpha_loss = -tf.reduce_mean(
-                alpha * (tf.reduce_mean(log_probs, axis=0) + self.target_entropy),
-                axis=0
+            alpha_loss = -jnp.mean(
+                alpha * (jnp.mean(log_probs) + self.target_entropy)
             )
+            return alpha_loss
         
-        alpha_gradients = tape.gradient(alpha_loss, [self.log_alpha])
-        self.alpha_optimizer.apply_gradients(zip(alpha_gradients, [self.log_alpha]))
+        # Calcular gradientes y actualizar alpha
+        alpha_loss, alpha_grads = jax.value_and_grad(alpha_loss_fn)(log_alpha)
         
-        return alpha_loss
+        updates, new_opt_state = self.alpha_optimizer.update(
+            alpha_grads, opt_state, log_alpha)
+        new_log_alpha = optax.apply_updates(log_alpha, updates)
+        
+        return new_log_alpha, new_opt_state, alpha_loss
     
     def train_step(self) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         """
@@ -688,24 +725,47 @@ class SAC:
         # Muestrear batch del buffer
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
         
-        # Convertir a tensores de TF
-        states = tf.convert_to_tensor(states, dtype=tf.float32)
-        actions = tf.convert_to_tensor(actions, dtype=tf.float32)
-        rewards = tf.convert_to_tensor(rewards, dtype=tf.float32)
-        next_states = tf.convert_to_tensor(next_states, dtype=tf.float32)
-        dones = tf.convert_to_tensor(dones, dtype=tf.float32)
+        # Convertir a jnp arrays
+        states = jnp.array(states, dtype=jnp.float32)
+        actions = jnp.array(actions, dtype=jnp.float32)
+        rewards = jnp.array(rewards, dtype=jnp.float32)
+        next_states = jnp.array(next_states, dtype=jnp.float32)
+        dones = jnp.array(dones, dtype=jnp.float32)
         
         # Actualizar críticos
-        critic_loss, _ = self._update_critics(states, actions, rewards, next_states, dones)
+        self.critic_state_1, self.critic_state_2, critic_loss, _ = self.update_critics(
+            self.critic_state_1,
+            self.critic_state_2,
+            self.actor_state,
+            self.log_alpha,
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones
+        )
         
         # Actualizar actor
-        actor_loss, log_probs, entropy = self._update_actor(states)
+        self.actor_state, actor_loss, log_probs, entropy = self.update_actor(
+            self.actor_state,
+            self.critic_state_1,
+            self.critic_state_2,
+            self.log_alpha,
+            states
+        )
         
         # Actualizar alpha
-        alpha_loss = self._update_alpha(log_probs)
+        self.log_alpha, self.alpha_opt_state, alpha_loss = self.update_alpha(
+            self.log_alpha,
+            self.alpha_opt_state,
+            log_probs
+        )
         
         # Actualizar redes target
-        self.update_target_networks()
+        self.critic_state_1, self.critic_state_2 = self.update_target_networks(
+            self.critic_state_1,
+            self.critic_state_2
+        )
         
         # Actualizar métricas acumuladas
         self.actor_loss_sum += float(actor_loss)
@@ -732,14 +792,18 @@ class SAC:
         np.ndarray
             Acción seleccionada
         """
-        # Convertir a tensor y añadir dimensión de batch
-        state = tf.convert_to_tensor([state], dtype=tf.float32)
+        # Convertir a jnp array y añadir dimensión de batch
+        state = jnp.array(state, dtype=jnp.float32)[None, :]
+        
+        # Obtener distribución de política
+        mean, std = self.actor_state.apply_fn(self.actor_state.params, state)
         
         # Obtener acción
-        action, _ = self.actor.sample_action(state, deterministic)
+        self.key, subkey = jax.random.split(self.key)
+        action, _, _ = self.actor_network.sample_action(mean, std, subkey, deterministic)
         
         # Convertir a numpy y eliminar dimensión de batch
-        return action[0].numpy()
+        return np.array(action[0], dtype=np.float32)
     
     def _init_training_history(self) -> Dict[str, List[float]]:
         """
@@ -779,8 +843,8 @@ class SAC:
             Acción seleccionada
         """
         if total_steps < warmup_steps:
-            # Acciones aleatorias uniformes durante el calentamiento
-            rng = np.random.default_rng(seed=42)  # Providing a fixed seed for reproducibility
+            # Use the same seed pattern as JAX for consistency
+            rng = np.random.default_rng(seed=int(self.key[0]))
             return rng.uniform(self.action_low, self.action_high, self.action_dim)
         else:
             return self.get_action(state, deterministic=False)
@@ -853,7 +917,7 @@ class SAC:
             history['alpha_losses'].append(float('nan'))
             history['entropies'].append(float('nan'))
         
-        history['alphas'].append(float(tf.exp(self.log_alpha)))
+        history['alphas'].append(float(jnp.exp(self.log_alpha)))
     
     def _reset_metrics(self) -> None:
         """
@@ -966,7 +1030,7 @@ class SAC:
         if (episode + 1) % evaluate_interval == 0:
             avg_reward = np.mean(episode_reward_history)
             print(f"Episodio {episode+1}/{episodes} - Recompensa Promedio: {avg_reward:.2f}, "
-                  f"Alpha: {float(tf.exp(self.log_alpha)):.4f}")
+                  f"Alpha: {float(jnp.exp(self.log_alpha)):.4f}")
             
             # Evaluar rendimiento actual
             eval_reward = self.evaluate(env, episodes=3, render=False)
@@ -1103,13 +1167,18 @@ class SAC:
         if not os.path.exists(directory):
             os.makedirs(directory)
         
-        # Guardar modelos completos
-        self.actor.save_weights(os.path.join(directory, 'actor.h5'))
-        self.critic_1.save_weights(os.path.join(directory, 'critic_1.h5'))
-        self.critic_2.save_weights(os.path.join(directory, 'critic_2.h5'))
+        # Guardar parámetros de las redes
+        with open(os.path.join(directory, 'actor_params.pkl'), 'wb') as f:
+            f.write(flax.serialization.to_bytes(self.actor_state.params))
+            
+        with open(os.path.join(directory, 'critic_1_params.pkl'), 'wb') as f:
+            f.write(flax.serialization.to_bytes(self.critic_state_1.params))
+            
+        with open(os.path.join(directory, 'critic_2_params.pkl'), 'wb') as f:
+            f.write(flax.serialization.to_bytes(self.critic_state_2.params))
         
         # Guardar alpha
-        alpha = float(tf.exp(self.log_alpha))
+        alpha = jnp.exp(self.log_alpha).item()
         np.save(os.path.join(directory, 'alpha.npy'), alpha)
         
         print(f"Modelos guardados en {directory}")
@@ -1123,19 +1192,30 @@ class SAC:
         directory : str
             Directorio de donde cargar los modelos
         """
+        # Cargar parámetros de las redes
         try:
-            # Cargar modelos
-            self.actor.load_weights(os.path.join(directory, 'actor.h5'))
-            self.critic_1.load_weights(os.path.join(directory, 'critic_1.h5'))
-            self.critic_2.load_weights(os.path.join(directory, 'critic_2.h5'))
+            with open(os.path.join(directory, 'actor_params.pkl'), 'rb') as f:
+                actor_params = flax.serialization.from_bytes(
+                    self.actor_state.params, f.read())
+                self.actor_state = self.actor_state.replace(params=actor_params)
             
-            # Actualizar redes target
-            self.update_target_networks(tau=1.0)
+            with open(os.path.join(directory, 'critic_1_params.pkl'), 'rb') as f:
+                critic_1_params = flax.serialization.from_bytes(
+                    self.critic_state_1.params, f.read())
+                self.critic_state_1 = self.critic_state_1.replace(
+                    params=critic_1_params, target_params=critic_1_params)
+            
+            with open(os.path.join(directory, 'critic_2_params.pkl'), 'rb') as f:
+                critic_2_params = flax.serialization.from_bytes(
+                    self.critic_state_2.params, f.read())
+                self.critic_state_2 = self.critic_state_2.replace(
+                    params=critic_2_params, target_params=critic_2_params)
             
             # Cargar alpha
             try:
-                alpha = float(np.load(os.path.join(directory, 'alpha.npy')))
-                self.log_alpha.assign(tf.math.log(alpha))
+                alpha = np.load(os.path.join(directory, 'alpha.npy')).item()
+                self.log_alpha = jnp.array(np.log(alpha), dtype=jnp.float32)
+                self.alpha_opt_state = self.alpha_optimizer.init(self.log_alpha)
             except (FileNotFoundError, IOError) as e:
                 print(f"No se pudo cargar alpha, usando el valor actual: {str(e)}")
             

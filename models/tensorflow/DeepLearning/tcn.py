@@ -6,21 +6,36 @@ from tensorflow.keras.layers import (
     BatchNormalization, Add, Activation, GlobalAveragePooling1D
 )
 from keras.saving import register_keras_serializable
+from typing import Tuple, List, Dict, Any, Optional, Union
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import TCN_CONFIG
 
+@register_keras_serializable()
 class WeightNormalization(tf.keras.layers.Wrapper):
     """
     Normalización de pesos para capas convolucionales.
+    
+    Parámetros:
+    -----------
+    layer : tf.keras.layers.Layer
+        Capa a la que aplicar normalización de pesos
     """
-    def __init__(self, layer, **kwargs):
+    def __init__(self, layer: tf.keras.layers.Layer, **kwargs):
         super().__init__(layer, **kwargs)
         self.layer = layer
 
-    def build(self, input_shape):
+    def build(self, input_shape: Tuple) -> None:
+        """
+        Construye la capa con normalización de pesos.
+        
+        Parámetros:
+        -----------
+        input_shape : Tuple
+            Forma de entrada
+        """
         self.layer.build(input_shape)
         self.g = self.add_weight(
             name='g',
@@ -29,26 +44,104 @@ class WeightNormalization(tf.keras.layers.Wrapper):
             trainable=True
         )
 
-    def call(self, inputs):
+    def call(self, inputs: tf.Tensor) -> tf.Tensor:
+        """
+        Aplica la capa con normalización de pesos.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de entrada
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Tensor procesado
+        """
         weights = self.layer.weights[0]
-        norm = tf.sqrt(tf.sum(tf.square(weights), axis=[0, 1]))
+        norm = tf.sqrt(tf.sum(tf.square(weights), axis=[0, 1]) + 1e-5)
         self.layer.kernel = weights * (self.g / norm)
         outputs = self.layer.call(inputs)
         return outputs
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración de la capa.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario de configuración
+        """
+        config = super().get_config()
+        config.update({
+            'layer': {
+                'class_name': self.layer.__class__.__name__,
+                'config': self.layer.get_config()
+            }
+        })
+        return config
 
+@register_keras_serializable()
 class CausalPadding(tf.keras.layers.Layer):
     """
     Capa personalizada para padding causal.
+    
+    Parámetros:
+    -----------
+    padding_size : int
+        Tamaño del padding
     """
-    def __init__(self, padding_size, **kwargs):
+    def __init__(self, padding_size: int, **kwargs):
         super().__init__(**kwargs)
         self.padding_size = padding_size
 
-    def call(self, inputs):
+    def call(self, inputs: tf.Tensor) -> tf.Tensor:
+        """
+        Aplica padding causal a un tensor.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de entrada
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Tensor con padding aplicado
+        """
         return tf.pad(inputs, [[0, 0], [self.padding_size, 0], [0, 0]])
 
-    def compute_output_shape(self, input_shape):
+    def compute_output_shape(self, input_shape: Tuple) -> Tuple:
+        """
+        Calcula la forma de salida.
+        
+        Parámetros:
+        -----------
+        input_shape : Tuple
+            Forma de entrada
+            
+        Retorna:
+        --------
+        Tuple
+            Forma de salida
+        """
         return (input_shape[0], input_shape[1] + self.padding_size, input_shape[2])
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración de la capa.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario de configuración
+        """
+        config = super().get_config()
+        config.update({
+            'padding_size': self.padding_size
+        })
+        return config
 
 def create_tcn_block(input_layer: tf.Tensor, filters: int, kernel_size: int, 
                     dilation_rate: int, dropout_rate: float) -> tf.Tensor:
@@ -116,6 +209,35 @@ def create_tcn_block(input_layer: tf.Tensor, filters: int, kernel_size: int,
     
     return conv
 
+def apply_activation(x: tf.Tensor, activation_name: str) -> tf.Tensor:
+    """
+    Aplica una función de activación a un tensor.
+    
+    Parámetros:
+    -----------
+    x : tf.Tensor
+        Tensor de entrada
+    activation_name : str
+        Nombre de la función de activación
+        
+    Retorna:
+    --------
+    tf.Tensor
+        Tensor con la activación aplicada
+    """
+    if activation_name == 'relu':
+        return tf.nn.relu(x)
+    elif activation_name == 'gelu':
+        return tf.nn.gelu(x)
+    elif activation_name == 'selu':
+        return tf.nn.selu(x)
+    elif activation_name == 'sigmoid':
+        return tf.nn.sigmoid(x)
+    elif activation_name == 'tanh':
+        return tf.nn.tanh(x)
+    else:
+        return tf.nn.relu(x)  # Default
+
 def create_tcn_model(input_shape: tuple, other_features_shape: tuple) -> Model:
     """
     Crea un modelo TCN completo.
@@ -123,9 +245,9 @@ def create_tcn_model(input_shape: tuple, other_features_shape: tuple) -> Model:
     Parámetros:
     -----------
     input_shape : tuple
-        Forma de los datos CGM
+        Forma de los datos CGM (muestras, pasos_temporales, características)
     other_features_shape : tuple
-        Forma de otras características
+        Forma de otras características (muestras, características)
     
     Retorna:
     --------
@@ -170,14 +292,21 @@ def create_tcn_model(input_shape: tuple, other_features_shape: tuple) -> Model:
     
     # MLP final con residual connections
     skip = x
-    x = Dense(128, activation=TCN_CONFIG['activation'])(x)
+    
+    # Usar la función de activación directamente en lugar de la capa Activation
+    x = Dense(128)(x)
+    x = apply_activation(x, TCN_CONFIG['activation'])
     x = LayerNormalization(epsilon=TCN_CONFIG['epsilon'])(x)
     x = Dropout(TCN_CONFIG['dropout_rate'][0])(x)
-    x = Dense(128, activation=TCN_CONFIG['activation'])(x)
+    
+    x = Dense(128)(x)
+    x = apply_activation(x, TCN_CONFIG['activation'])
+    
     if skip.shape[-1] == 128:
         x = Add()([x, skip])
     
-    x = Dense(64, activation=TCN_CONFIG['activation'])(x)
+    x = Dense(64)(x)
+    x = apply_activation(x, TCN_CONFIG['activation'])
     x = LayerNormalization(epsilon=TCN_CONFIG['epsilon'])(x)
     x = Dropout(TCN_CONFIG['dropout_rate'][1])(x)
     

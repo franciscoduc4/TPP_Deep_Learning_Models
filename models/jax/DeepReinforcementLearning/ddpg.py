@@ -1,16 +1,13 @@
 import os, sys
-import tensorflow as tf
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from flax.training import train_state
 import numpy as np
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input, Dense, Conv1D, Flatten, Concatenate,
-    BatchNormalization, Dropout, LayerNormalization
-)
-from tensorflow.keras.optimizers import Adam
+import optax
+from typing import Dict, List, Tuple, Any, Optional, Callable, Sequence
 from collections import deque
 import random
-from typing import Dict, List, Tuple, Any, Optional, Callable, Union
-import matplotlib.pyplot as plt
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -125,7 +122,7 @@ class OUActionNoise:
         self.dt = dt
         self.x_initial = x_initial
         self.seed = seed
-        self.rng = np.random.default_rng(seed)
+        self.key = jax.random.PRNGKey(seed)
         self.reset()
         
     def __call__(self) -> np.ndarray:
@@ -137,11 +134,15 @@ class OUActionNoise:
         np.ndarray
             Valor de ruido generado
         """
+        # Dividir clave para mantener independencia estadística
+        self.key, subkey = jax.random.split(self.key)
+        
         # Fórmula para el proceso de Ornstein-Uhlenbeck
+        noise = jax.random.normal(subkey, shape=self.mean.shape)
         x = (
             self.x_prev
             + self.theta * (self.mean - self.x_prev) * self.dt
-            + self.std_dev * np.sqrt(self.dt) * self.rng.normal(size=self.mean.shape)
+            + self.std_dev * np.sqrt(self.dt) * noise
         )
         self.x_prev = x
         return x
@@ -156,36 +157,7 @@ class OUActionNoise:
             self.x_prev = np.zeros_like(self.mean)
 
 
-def activation_function(x: tf.Tensor, name: str) -> tf.Tensor:
-    """
-    Aplica una función de activación según su nombre.
-    
-    Parámetros:
-    -----------
-    x : tf.Tensor
-        Tensor de entrada
-    name : str
-        Nombre de la activación ('relu', 'tanh', 'leaky_relu', etc.)
-        
-    Retorna:
-    --------
-    tf.Tensor
-        Tensor con activación aplicada
-    """
-    if name == 'relu':
-        return tf.nn.relu(x)
-    elif name == 'tanh':
-        return tf.nn.tanh(x)
-    elif name == 'leaky_relu':
-        return tf.nn.leaky_relu(x)
-    elif name == 'gelu':
-        return tf.nn.gelu(x)
-    else:
-        # Por defecto usar ReLU
-        return tf.nn.relu(x)
-
-
-class ActorNetwork(Model):
+class ActorNetwork(nn.Module):
     """
     Red de Actor para DDPG que mapea estados a acciones determinísticas.
     
@@ -202,81 +174,51 @@ class ActorNetwork(Model):
     hidden_units : Optional[List[int]], opcional
         Unidades en capas ocultas (default: None, usa configuración por defecto)
     """
-    def __init__(self, state_dim: int, action_dim: int, action_high: np.ndarray, 
-                action_low: np.ndarray, hidden_units: Optional[List[int]] = None) -> None:
-        super().__init__()
-        
-        # Valores predeterminados para capas ocultas
-        if hidden_units is None:
-            hidden_units = DDPG_CONFIG['actor_hidden_units']
-        
-        self.action_high = action_high
-        self.action_low = action_low
-        self.action_range = action_high - action_low
-        
-        # Capas para el procesamiento del estado
-        self.layers_list = []
-        for i, units in enumerate(hidden_units):
-            self.layers_list.append(Dense(
-                units, 
-                name=f'actor_dense_{i}'
-            ))
-            self.layers_list.append(LayerNormalization(
-                epsilon=DDPG_CONFIG['epsilon'],
-                name=f'actor_ln_{i}'
-            ))
-            self.layers_list.append(Dropout(
-                DDPG_CONFIG['dropout_rate'],
-                name=f'actor_dropout_{i}'
-            ))
-        
-        # Capa de salida: acciones con activación tanh [-1, 1] escalada al rango de acción
-        self.output_layer = Dense(
-            action_dim, 
-            activation='tanh',
-            name='actor_output'
-        )
+    state_dim: int
+    action_dim: int
+    action_high: np.ndarray
+    action_low: np.ndarray
+    hidden_units: Optional[List[int]] = None
     
-    def call(self, inputs: tf.Tensor, training: bool = False) -> tf.Tensor:
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool = False) -> jnp.ndarray:
         """
         Pasa la entrada por la red del actor.
         
         Parámetros:
         -----------
-        inputs : tf.Tensor
+        x : jnp.ndarray
             Estado de entrada
         training : bool, opcional
             Indica si está en modo entrenamiento (default: False)
             
         Retorna:
         --------
-        tf.Tensor
+        jnp.ndarray
             Acción determinística
         """
-        x = inputs
+        # Valores predeterminados para capas ocultas
+        hidden_units = self.hidden_units or DDPG_CONFIG['actor_hidden_units']
+        action_range = self.action_high - self.action_low
         
         # Procesar a través de capas ocultas
-        for layer in self.layers_list:
-            # Aplicar activación antes de capas normalization/dropout
-            if isinstance(layer, Dense):
-                x = layer(x)
-                x = activation_function(x, DDPG_CONFIG['actor_activation'])
-            # Para capas de Dropout, pasamos el parámetro training
-            elif isinstance(layer, Dropout):
-                x = layer(x, training=training)
-            else:
-                x = layer(x)
+        for i, units in enumerate(hidden_units):
+            x = nn.Dense(units, name=f'actor_dense_{i}')(x)
+            x = activation_function(x, DDPG_CONFIG['actor_activation'])
+            x = nn.LayerNorm(epsilon=DDPG_CONFIG['epsilon'], name=f'actor_ln_{i}')(x)
+            x = nn.Dropout(rate=DDPG_CONFIG['dropout_rate'], deterministic=not training)(x)
         
         # Capa de salida con activación tanh y escalado
-        raw_actions = self.output_layer(x)
+        raw_actions = nn.Dense(self.action_dim, name='actor_output')(x)
+        raw_actions = jnp.tanh(raw_actions)
         
         # Escalar desde [-1, 1] al rango de acción [low, high]
-        scaled_actions = 0.5 * (raw_actions + 1.0) * self.action_range + self.action_low
+        scaled_actions = 0.5 * (raw_actions + 1.0) * action_range + self.action_low
         
         return scaled_actions
 
 
-class CriticNetwork(Model):
+class CriticNetwork(nn.Module):
     """
     Red de Crítico para DDPG que mapea pares (estado, acción) a valores-Q.
     
@@ -289,89 +231,180 @@ class CriticNetwork(Model):
     hidden_units : Optional[List[int]], opcional
         Unidades en capas ocultas (default: None, usa configuración por defecto)
     """
-    def __init__(self, state_dim: int, action_dim: int, 
-                hidden_units: Optional[List[int]] = None) -> None:
-        super().__init__()
-        
-        # Valores predeterminados para capas ocultas
-        if hidden_units is None:
-            hidden_units = DDPG_CONFIG['critic_hidden_units']
-        
-        # Capas iniciales para procesar el estado
-        self.state_layers = []
-        for i, units in enumerate(hidden_units[:1]):  # Primera capa solo para estado
-            self.state_layers.append(Dense(
-                units,
-                name=f'critic_state_dense_{i}'
-            ))
-            self.state_layers.append(LayerNormalization(
-                epsilon=DDPG_CONFIG['epsilon'],
-                name=f'critic_state_ln_{i}'
-            ))
-        
-        # Capas para procesar la combinación de estado y acción
-        self.combined_layers = []
-        for i, units in enumerate(hidden_units[1:]):
-            self.combined_layers.append(Dense(
-                units,
-                name=f'critic_combined_dense_{i}'
-            ))
-            self.combined_layers.append(LayerNormalization(
-                epsilon=DDPG_CONFIG['epsilon'],
-                name=f'critic_combined_ln_{i}'
-            ))
-            self.combined_layers.append(Dropout(
-                DDPG_CONFIG['dropout_rate'],
-                name=f'critic_dropout_{i}'
-            ))
-        
-        # Capa de salida: valor Q (sin activación)
-        self.output_layer = Dense(1, name='critic_output')
+    state_dim: int
+    action_dim: int
+    hidden_units: Optional[List[int]] = None
     
-    def call(self, inputs: Tuple[tf.Tensor, tf.Tensor], training: bool = False) -> tf.Tensor:
+    @nn.compact
+    def __call__(self, inputs: Tuple[jnp.ndarray, jnp.ndarray], training: bool = False) -> jnp.ndarray:
         """
         Pasa la entrada por la red del crítico.
         
         Parámetros:
         -----------
-        inputs : Tuple[tf.Tensor, tf.Tensor]
+        inputs : Tuple[jnp.ndarray, jnp.ndarray]
             Tupla de (estados, acciones)
         training : bool, opcional
             Indica si está en modo entrenamiento (default: False)
             
         Retorna:
         --------
-        tf.Tensor
+        jnp.ndarray
             Valores Q estimados
         """
+        # Valores predeterminados para capas ocultas
+        hidden_units = self.hidden_units or DDPG_CONFIG['critic_hidden_units']
         states, actions = inputs
         
-        # Procesar el estado
+        # Procesar el estado inicialmente
         x = states
-        for i, layer in enumerate(self.state_layers):
-            if isinstance(layer, Dense):
-                x = layer(x)
-                x = activation_function(x, DDPG_CONFIG['critic_activation'])
-            else:
-                x = layer(x)
+        for i, units in enumerate(hidden_units[:1]):
+            x = nn.Dense(units, name=f'critic_state_dense_{i}')(x)
+            x = activation_function(x, DDPG_CONFIG['critic_activation'])
+            x = nn.LayerNorm(epsilon=DDPG_CONFIG['epsilon'], name=f'critic_state_ln_{i}')(x)
         
         # Combinar estado procesado con acción
-        x = Concatenate()([x, actions])
+        x = jnp.concatenate([x, actions], axis=-1)
         
         # Procesar a través de capas combinadas
-        for layer in self.combined_layers:
-            if isinstance(layer, Dense):
-                x = layer(x)
-                x = activation_function(x, DDPG_CONFIG['critic_activation'])
-            elif isinstance(layer, Dropout):
-                x = layer(x, training=training)
-            else:
-                x = layer(x)
+        for i, units in enumerate(hidden_units[1:]):
+            x = nn.Dense(units, name=f'critic_combined_dense_{i}')(x)
+            x = activation_function(x, DDPG_CONFIG['critic_activation'])
+            x = nn.LayerNorm(epsilon=DDPG_CONFIG['epsilon'], name=f'critic_combined_ln_{i}')(x)
+            x = nn.Dropout(rate=DDPG_CONFIG['dropout_rate'], deterministic=not training)(x)
         
-        # Capa de salida
-        q_value = self.output_layer(x)
+        # Capa de salida (sin activación)
+        q_value = nn.Dense(1, name='critic_output')(x)
         
         return q_value
+
+
+class DDPGTrainState:
+    """
+    Clase para almacenar el estado del entrenamiento del algoritmo DDPG.
+    
+    Parámetros:
+    -----------
+    actor : train_state.TrainState
+        Estado de entrenamiento para la red del actor
+    critic : train_state.TrainState
+        Estado de entrenamiento para la red del crítico
+    target_actor_params : Any
+        Parámetros de la red target del actor
+    target_critic_params : Any
+        Parámetros de la red target del crítico
+    key : jax.random.PRNGKey
+        Clave para generación de números aleatorios
+    """
+    def __init__(self, actor: train_state.TrainState, critic: train_state.TrainState,
+                target_actor_params: Any, target_critic_params: Any,
+                key: jnp.ndarray):
+        self.actor = actor
+        self.critic = critic
+        self.target_actor_params = target_actor_params
+        self.target_critic_params = target_critic_params
+        self.key = key
+        
+        # Métricas (como valores acumulados)
+        self.actor_loss_sum = 0.0
+        self.critic_loss_sum = 0.0
+        self.q_value_sum = 0.0
+        self.count = 0
+    
+    def update_metrics(self, actor_loss: float, critic_loss: float, q_value: float) -> None:
+        """
+        Actualiza las métricas del entrenamiento.
+        
+        Parámetros:
+        -----------
+        actor_loss : float
+            Pérdida del actor
+        critic_loss : float
+            Pérdida del crítico
+        q_value : float
+            Valor Q promedio
+        """
+        self.actor_loss_sum += actor_loss
+        self.critic_loss_sum += critic_loss
+        self.q_value_sum += q_value
+        self.count += 1
+    
+    def reset_metrics(self) -> None:
+        """
+        Reinicia las métricas de entrenamiento.
+        """
+        self.actor_loss_sum = 0.0
+        self.critic_loss_sum = 0.0
+        self.q_value_sum = 0.0
+        self.count = 0
+    
+    def get_metrics(self) -> Tuple[float, float, float]:
+        """
+        Obtiene los valores promedio de las métricas.
+        
+        Retorna:
+        --------
+        Tuple[float, float, float]
+            (actor_loss_avg, critic_loss_avg, q_value_avg)
+        """
+        if self.count > 0:
+            return (
+                self.actor_loss_sum / self.count,
+                self.critic_loss_sum / self.count,
+                self.q_value_sum / self.count
+            )
+        return 0.0, 0.0, 0.0
+
+
+def activation_function(x: jnp.ndarray, name: str) -> jnp.ndarray:
+    """
+    Aplica una función de activación según su nombre.
+    
+    Parámetros:
+    -----------
+    x : jnp.ndarray
+        Tensor de entrada
+    name : str
+        Nombre de la activación ('relu', 'tanh', 'leaky_relu', etc.)
+        
+    Retorna:
+    --------
+    jnp.ndarray
+        Tensor con activación aplicada
+    """
+    if name == 'relu':
+        return nn.relu(x)
+    elif name == 'tanh':
+        return jnp.tanh(x)
+    elif name == 'leaky_relu':
+        return nn.leaky_relu(x)
+    elif name == 'gelu':
+        return nn.gelu(x)
+    else:
+        # Por defecto usar ReLU
+        return nn.relu(x)
+
+
+def soft_update(params: Any, target_params: Any, tau: float) -> Any:
+    """
+    Realiza una actualización suave de los parámetros target.
+    
+    Parámetros:
+    -----------
+    params : Any
+        Parámetros fuente
+    target_params : Any
+        Parámetros target a actualizar
+    tau : float
+        Factor de actualización suave (0 < tau ≤ 1)
+        
+    Retorna:
+    --------
+    Any
+        Nuevos parámetros target
+    """
+    # Función para aplicar actualización suave a parámetros individuales
+    return jax.tree_map(lambda p, tp: tau * p + (1.0 - tau) * tp, params, target_params)
 
 
 class DDPG:
@@ -391,10 +424,26 @@ class DDPG:
         Límite superior del rango de acciones
     action_low : np.ndarray
         Límite inferior del rango de acciones
-    config : Optional[Dict[str, Any]], opcional
-        Configuración personalizada (default: None, usa configuración por defecto)
+    actor_lr : float, opcional
+        Tasa de aprendizaje del actor
+    critic_lr : float, opcional
+        Tasa de aprendizaje del crítico
+    gamma : float, opcional
+        Factor de descuento
+    tau : float, opcional
+        Factor de actualización suave para redes target
+    buffer_capacity : int, opcional
+        Capacidad del buffer de experiencias
+    batch_size : int, opcional
+        Tamaño del lote para entrenamiento
+    noise_std : float, opcional
+        Desviación estándar del ruido para exploración
+    actor_hidden_units : Optional[List[int]], opcional
+        Unidades en capas ocultas del actor
+    critic_hidden_units : Optional[List[int]], opcional
+        Unidades en capas ocultas del crítico
     seed : int, opcional
-        Semilla para generación de números aleatorios (default: 42)
+        Semilla para generación de números aleatorios
     """
     def __init__(
         self, 
@@ -418,68 +467,69 @@ class DDPG:
         noise_std = self.config.get('noise_std', DDPG_CONFIG['noise_std'])
         actor_hidden_units = self.config.get('actor_hidden_units')
         critic_hidden_units = self.config.get('critic_hidden_units')
-        
         # Parámetros del entorno y del modelo
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.action_high = action_high
         self.action_low = action_low
         
-        # Configurar semilla para reproducibilidad
-        tf.random.set_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+        # Inicializar clave para generación de números aleatorios
+        self.key = jax.random.PRNGKey(seed)
         
         # Valores predeterminados para capas ocultas
         self.actor_hidden_units = actor_hidden_units or DDPG_CONFIG['actor_hidden_units']
         self.critic_hidden_units = critic_hidden_units or DDPG_CONFIG['critic_hidden_units']
         
-        # Crear modelos Actor y Crítico
-        self.actor = ActorNetwork(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            action_high=action_high,
-            action_low=action_low,
+        # Definir modelos
+        self.actor_def = ActorNetwork(
+            state_dim=state_dim, 
+            action_dim=action_dim, 
+            action_high=action_high, 
+            action_low=action_low, 
             hidden_units=self.actor_hidden_units
         )
-        
-        self.critic = CriticNetwork(
-            state_dim=state_dim,
-            action_dim=action_dim,
+        self.critic_def = CriticNetwork(
+            state_dim=state_dim, 
+            action_dim=action_dim, 
             hidden_units=self.critic_hidden_units
         )
         
-        # Crear copias target
-        self.target_actor = ActorNetwork(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            action_high=action_high,
-            action_low=action_low,
-            hidden_units=self.actor_hidden_units
-        )
+        # Inicializar modelos
+        self.key, actor_key, critic_key = jax.random.split(self.key, 3)
+        dummy_state = jnp.zeros((1, state_dim))
+        dummy_action = jnp.zeros((1, action_dim))
         
-        self.target_critic = CriticNetwork(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            hidden_units=self.critic_hidden_units
-        )
-        
-        # Asegurar que todos los modelos tienen forma inicializada
-        dummy_state = np.zeros((1, state_dim), dtype=np.float32)
-        dummy_action = np.zeros((1, action_dim), dtype=np.float32)
-        
-        self.actor(dummy_state)
-        self.critic([dummy_state, dummy_action])
-        self.target_actor(dummy_state)
-        self.target_critic([dummy_state, dummy_action])
-        
-        # Sincronizar pesos iniciales
-        self.target_actor.set_weights(self.actor.get_weights())
-        self.target_critic.set_weights(self.critic.get_weights())
+        actor_params = self.actor_def.init(actor_key, dummy_state)
+        critic_params = self.critic_def.init(critic_key, (dummy_state, dummy_action))
         
         # Optimizadores
-        self.actor_optimizer = Adam(learning_rate=actor_lr)
-        self.critic_optimizer = Adam(learning_rate=critic_lr)
+        actor_tx = optax.adam(learning_rate=actor_lr)
+        critic_tx = optax.adam(learning_rate=critic_lr)
+        
+        # Estado de entrenamiento
+        actor_state = train_state.TrainState.create(
+            apply_fn=self.actor_def.apply,
+            params=actor_params,
+            tx=actor_tx
+        )
+        critic_state = train_state.TrainState.create(
+            apply_fn=self.critic_def.apply,
+            params=critic_params,
+            tx=critic_tx
+        )
+        
+        # Parámetros target (inicializados con los mismos valores)
+        target_actor_params = actor_params
+        target_critic_params = critic_params
+        
+        # Crear estado de entrenamiento completo
+        self.train_state = DDPGTrainState(
+            actor=actor_state,
+            critic=critic_state,
+            target_actor_params=target_actor_params,
+            target_critic_params=target_critic_params,
+            key=self.key
+        )
         
         # Buffer de experiencias
         self.replay_buffer = ReplayBuffer(buffer_capacity)
@@ -490,45 +540,36 @@ class DDPG:
             std_deviation=noise_std * np.ones(action_dim),
             seed=seed
         )
-        
-        # Contador de pasos para actualización y métricas
-        self.step_counter = 0
-        self.actor_loss_sum = 0
-        self.critic_loss_sum = 0
-        self.q_value_sum = 0
-        self.updates_count = 0
     
-    def update_target_networks(self, tau: Optional[float] = None) -> None:
+    def update_target_networks(self, state: DDPGTrainState, tau: Optional[float] = None) -> DDPGTrainState:
         """
         Actualiza los pesos de las redes target usando soft update.
         
         Parámetros:
         -----------
+        state : ddpg_train_state
+            Estado actual del entrenamiento
         tau : Optional[float], opcional
             Factor de actualización suave (si None, usa el valor por defecto)
+            
+        Retorna:
+        --------
+        ddpg_train_state
+            Estado de entrenamiento actualizado
         """
         if tau is None:
             tau = self.tau
-            
-        # Actualizar pesos del actor target
-        actor_weights = self.actor.get_weights()
-        target_actor_weights = self.target_actor.get_weights()
-        new_target_actor_weights = []
         
-        for i, weight in enumerate(actor_weights):
-            new_target_actor_weights.append(tau * weight + (1 - tau) * target_actor_weights[i])
-            
-        self.target_actor.set_weights(new_target_actor_weights)
+        target_actor_params = soft_update(state.actor.params, state.target_actor_params, tau)
+        target_critic_params = soft_update(state.critic.params, state.target_critic_params, tau)
         
-        # Actualizar pesos del crítico target
-        critic_weights = self.critic.get_weights()
-        target_critic_weights = self.target_critic.get_weights()
-        new_target_critic_weights = []
-        
-        for i, weight in enumerate(critic_weights):
-            new_target_critic_weights.append(tau * weight + (1 - tau) * target_critic_weights[i])
-            
-        self.target_critic.set_weights(new_target_critic_weights)
+        return DDPGTrainState(
+            actor=state.actor,
+            critic=state.critic,
+            target_actor_params=target_actor_params,
+            target_critic_params=target_critic_params,
+            key=state.key
+        )
     
     def get_action(self, state: np.ndarray, add_noise: bool = True) -> np.ndarray:
         """
@@ -546,8 +587,13 @@ class DDPG:
         np.ndarray
             Acción seleccionada
         """
-        state_tensor = tf.convert_to_tensor(state[np.newaxis, :], dtype=tf.float32)
-        action = self.actor(state_tensor, training=False)[0].numpy()
+        state = jnp.array(state)[jnp.newaxis, :]
+        action = self.train_state.actor.apply_fn(
+            self.train_state.actor.params, 
+            state
+        )[0]
+        
+        action = np.array(action)
         
         if add_noise:
             noise = self.noise()
@@ -558,103 +604,132 @@ class DDPG:
         
         return action
     
-    @tf.function
-    def _update_networks(self, states: tf.Tensor, actions: tf.Tensor, rewards: tf.Tensor, 
-                        next_states: tf.Tensor, dones: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        """
-        Actualiza las redes del actor y crítico usando el algoritmo DDPG.
-        
-        Parámetros:
-        -----------
-        states : tf.Tensor
-            Estados actuales
-        actions : tf.Tensor
-            Acciones tomadas
-        rewards : tf.Tensor
-            Recompensas recibidas
-        next_states : tf.Tensor
-            Estados siguientes
-        dones : tf.Tensor
-            Indicadores de finalización
-            
-        Retorna:
-        --------
-        Tuple[tf.Tensor, tf.Tensor, tf.Tensor]
-            (critic_loss, actor_loss, q_values)
-        """
-        with tf.GradientTape() as tape:
-            # Predecir acciones target para los siguiente estados
-            target_actions = self.target_actor(next_states, training=False)
-            
-            # Predecir Q-values target
-            target_q_values = self.target_critic([next_states, target_actions], training=False)
-            
-            # Calcular Q-values objetivo usando la ecuación de Bellman
-            targets = rewards + (1 - dones) * self.gamma * target_q_values
-            
-            # Predecir Q-values actuales
-            current_q_values = self.critic([states, actions], training=True)
-            
-            # Calcular pérdida del crítico (error cuadrático medio)
-            critic_loss = tf.reduce_mean(tf.square(targets - current_q_values), axis=0)
-            
-        # Calcular gradientes y actualizar crítico
-        critic_gradients = tape.gradient(critic_loss, self.critic.trainable_variables)
-        self.critic_optimizer.apply_gradients(zip(critic_gradients, self.critic.trainable_variables))
-        
-        with tf.GradientTape() as tape:
-            # Predecir acciones para los estados actuales
-            actor_actions = self.actor(states, training=True)
-            
-            # Calcular Q-values para estas acciones
-            actor_q_values = self.critic([states, actor_actions], training=False)
-            
-            # Pérdida del actor (negativo del Q-value promedio)
-            # Queremos maximizar Q-value, así que minimizamos su negativo
-            actor_loss = -tf.reduce_mean(actor_q_values, axis=0)
-            
-        # Calcular gradientes y actualizar actor
-        actor_gradients = tape.gradient(actor_loss, self.actor.trainable_variables)
-        self.actor_optimizer.apply_gradients(zip(actor_gradients, self.actor.trainable_variables))
-        
-        return critic_loss, actor_loss, tf.reduce_mean(current_q_values, axis=0)
-    
-    def train_step(self) -> Tuple[float, float, float]:
+    def train_step(self, state: DDPGTrainState, batch: Tuple) -> Tuple[DDPGTrainState, Dict]:
         """
         Realiza un paso de entrenamiento DDPG con un lote de experiencias.
         
+        Parámetros:
+        -----------
+        state : ddpg_train_state
+            Estado actual del entrenamiento
+        batch : Tuple
+            Lote de experiencias (states, actions, rewards, next_states, dones)
+            
         Retorna:
         --------
-        Tuple[float, float, float]
-            (critic_loss, actor_loss, q_value)
+        Tuple[ddpg_train_state, Dict]
+            Estado actualizado y diccionario con métricas
         """
-        # Muestrear un lote del buffer
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+        states, actions, rewards, next_states, dones = [jnp.array(x) for x in batch]
         
-        # Convertir a tensores para TensorFlow
-        states = tf.convert_to_tensor(states, dtype=tf.float32)
-        actions = tf.convert_to_tensor(actions, dtype=tf.float32)
-        rewards = tf.convert_to_tensor(rewards, dtype=tf.float32)
-        next_states = tf.convert_to_tensor(next_states, dtype=tf.float32)
-        dones = tf.convert_to_tensor(dones, dtype=tf.float32)
+        # Dividir clave para operaciones aleatorias
+        key, _, _ = jax.random.split(state.key, 3)
+        new_state = DDPGTrainState(
+            actor=state.actor,
+            critic=state.critic,
+            target_actor_params=state.target_actor_params,
+            target_critic_params=state.target_critic_params,
+            key=key
+        )
         
-        # Reshape rewards y dones para que coincidan con la dimensión de Q-values
-        rewards = tf.reshape(rewards, (-1, 1))
-        dones = tf.reshape(dones, (-1, 1))
+        # Función para actualizar el crítico
+        def update_critic(cstate, inputs):
+            states, actions, rewards, next_states, dones = inputs
+            
+            # Predecir acciones target para los siguientes estados
+            target_actions = self.actor_def.apply(
+                new_state.target_actor_params, 
+                next_states
+            )
+            
+            # Predecir Q-values target
+            target_q_values = self.critic_def.apply(
+                new_state.target_critic_params, 
+                (next_states, target_actions)
+            )
+            
+            # Calcular Q-values objetivo usando la ecuación de Bellman
+            target_q = rewards[:, jnp.newaxis] + (1 - dones[:, jnp.newaxis]) * self.gamma * target_q_values
+            
+            # Función de pérdida del crítico
+            def critic_loss_fn(params):
+                # Predecir Q-values actuales
+                current_q = self.critic_def.apply(
+                    params, 
+                    (states, actions)
+                )
+                
+                # Calcular pérdida (error cuadrático medio)
+                loss = jnp.mean(jnp.square(target_q - current_q))
+                return loss, current_q
+            
+            # Calcular pérdida y gradientes
+            (critic_loss, current_q), grads = jax.value_and_grad(
+                critic_loss_fn, has_aux=True)(cstate.params)
+            
+            # Actualizar pesos del crítico
+            new_cstate = cstate.apply_gradients(grads=grads)
+            
+            return new_cstate, (critic_loss, jnp.mean(current_q))
         
-        # Actualizar redes
-        critic_loss, actor_loss, q_value = self._update_networks(states, actions, rewards, next_states, dones)
+        # Función para actualizar el actor
+        def update_actor(astate, states):
+            # Función de pérdida del actor
+            def actor_loss_fn(params):
+                # Predecir acciones para los estados actuales
+                actor_actions = self.actor_def.apply(
+                    params, 
+                    states
+                )
+                
+                # Calcular Q-values para estas acciones
+                actor_q_values = self.critic_def.apply(
+                    new_state.critic.params, 
+                    (states, actor_actions)
+                )
+                
+                # Pérdida del actor (negativo del Q-value promedio)
+                # Queremos maximizar Q-value, así que minimizamos su negativo
+                loss = -jnp.mean(actor_q_values)
+                return loss
+            
+            # Calcular pérdida y gradientes
+            actor_loss, grads = jax.value_and_grad(actor_loss_fn)(astate.params)
+            
+            # Actualizar pesos del actor
+            new_astate = astate.apply_gradients(grads=grads)
+            
+            return new_astate, actor_loss
         
-        # Actualizar redes target con soft update
-        self.update_target_networks()
+        # Actualizar crítico
+        new_critic, (critic_loss, q_value) = update_critic(
+            state.critic, 
+            (states, actions, rewards, next_states, dones)
+        )
         
-        # Actualizar métricas acumuladas
-        self.actor_loss_sum += actor_loss
-        self.critic_loss_sum += critic_loss
-        self.q_value_sum += q_value
-        self.updates_count += 1
+        # Actualizar actor
+        new_actor, actor_loss = update_actor(state.actor, states)
         
-        return critic_loss.numpy(), actor_loss.numpy(), q_value.numpy()
+        # Actualizar estado de entrenamiento
+        new_state = DDPGTrainState(
+            actor=new_actor,
+            critic=new_critic,
+            target_actor_params=state.target_actor_params,
+            target_critic_params=state.target_critic_params,
+            key=key
+        )
+        
+        # Actualizar redes target
+        new_state = self.update_target_networks(new_state)
+        
+        # Guardar métricas
+        metrics = {
+            'actor_loss': actor_loss,
+            'critic_loss': critic_loss,
+            'q_value': q_value
+        }
+        
+        return new_state, metrics
     
     def _select_action(self, state: np.ndarray, step_counter: int, warmup_steps: int) -> np.ndarray:
         """
@@ -675,13 +750,13 @@ class DDPG:
             Acción seleccionada
         """
         if step_counter < warmup_steps:
-            # Exploración inicial uniforme - usando el generador np.random.default_rng con semilla
-            # para asegurar reproducibilidad
-            rng = np.random.default_rng(seed=42)  # Using a default seed
-            return rng.uniform(
-                low=self.action_low,
-                high=self.action_high,
-                size=(self.action_dim,)
+            # Exploración inicial uniforme
+            self.key, subkey = jax.random.split(self.key)
+            return jax.random.uniform(
+                subkey, 
+                shape=(self.action_dim,),
+                minval=self.action_low,
+                maxval=self.action_high
             )
         else:
             # Política del actor con ruido
@@ -704,10 +779,20 @@ class DDPG:
             (actor_loss, critic_loss) o (None, None) si no se actualizó
         """
         if step_counter % update_every == 0:
-            if len(self.replay_buffer) > self.batch_size:
-                # Realizar actualización
-                critic_loss, actor_loss, _ = self.train_step()
-                return actor_loss, critic_loss
+            # Muestrear batch
+            batch = self.replay_buffer.sample(self.batch_size)
+            
+            # Realizar actualización
+            self.train_state, metrics = self.train_step(self.train_state, batch)
+            
+            # Actualizar métricas acumuladas
+            self.train_state.update_metrics(
+                metrics['actor_loss'],
+                metrics['critic_loss'],
+                metrics['q_value']
+            )
+            
+            return metrics['actor_loss'], metrics['critic_loss']
         return None, None
     
     def _update_history(self, history: Dict, episode_reward: float, 
@@ -734,24 +819,16 @@ class DDPG:
         history['episode_rewards'].append(episode_reward)
         
         # Obtener promedios de métricas
-        if self.updates_count > 0:
-            actor_loss_avg = self.actor_loss_sum / self.updates_count
-            critic_loss_avg = self.critic_loss_sum / self.updates_count
-            q_value_avg = self.q_value_sum / self.updates_count
-            
-            # Resetear métricas
-            self.actor_loss_sum = 0
-            self.critic_loss_sum = 0
-            self.q_value_sum = 0
-            self.updates_count = 0
-        else:
-            actor_loss_avg = float('nan')
-            critic_loss_avg = float('nan')
-            q_value_avg = float('nan')
+        actor_loss_avg, critic_loss_avg, q_value_avg = self.train_state.get_metrics()
         
-        history['actor_losses'].append(actor_loss_avg)
-        history['critic_losses'].append(critic_loss_avg)
-        history['avg_q_values'].append(q_value_avg)
+        if episode_actor_loss:
+            history['actor_losses'].append(actor_loss_avg)
+            history['critic_losses'].append(critic_loss_avg)
+            history['avg_q_values'].append(q_value_avg)
+        else:
+            history['actor_losses'].append(float('nan'))
+            history['critic_losses'].append(float('nan'))
+            history['avg_q_values'].append(float('nan'))
             
         return history
     
@@ -905,7 +982,8 @@ class DDPG:
             # Actualizar historial
             history = self._update_history(history, episode_reward, episode_actor_loss, episode_critic_loss)
             
-            # Resetear el ruido para el siguiente episodio
+            # Resetear métricas y ruido
+            self.train_state.reset_metrics()
             self.noise.reset()
             
             # Actualizar historial de recompensas
@@ -981,8 +1059,15 @@ class DDPG:
         critic_path : str
             Ruta para guardar el modelo del crítico
         """
-        self.actor.save_weights(actor_path)
-        self.critic.save_weights(critic_path)
+        import flax.serialization as serialization
+        
+        # Guardar parámetros
+        with open(actor_path, 'wb') as f:
+            f.write(serialization.to_bytes(self.train_state.actor.params))
+            
+        with open(critic_path, 'wb') as f:
+            f.write(serialization.to_bytes(self.train_state.critic.params))
+            
         print(f"Modelos guardados en {actor_path} y {critic_path}")
     
     def load_models(self, actor_path: str, critic_path: str) -> None:
@@ -996,12 +1081,35 @@ class DDPG:
         critic_path : str
             Ruta para cargar el modelo del crítico
         """
-        self.actor.load_weights(actor_path)
-        self.critic.load_weights(critic_path)
+        import flax.serialization as serialization
         
-        # Sincronizar modelos target
-        self.target_actor.set_weights(self.actor.get_weights())
-        self.target_critic.set_weights(self.critic.get_weights())
+        # Cargar parámetros
+        with open(actor_path, 'rb') as f:
+            actor_params = serialization.from_bytes(self.train_state.actor.params, f.read())
+            
+        with open(critic_path, 'rb') as f:
+            critic_params = serialization.from_bytes(self.train_state.critic.params, f.read())
+            
+        # Actualizar estados
+        self.train_state = DDPGTrainState(
+            actor=train_state.TrainState(
+                step=self.train_state.actor.step,
+                apply_fn=self.train_state.actor.apply_fn,
+                params=actor_params,
+                tx=self.train_state.actor.tx,
+                opt_state=self.train_state.actor.opt_state
+            ),
+            critic=train_state.TrainState(
+                step=self.train_state.critic.step,
+                apply_fn=self.train_state.critic.apply_fn,
+                params=critic_params,
+                tx=self.train_state.critic.tx,
+                opt_state=self.train_state.critic.opt_state
+            ),
+            target_actor_params=actor_params,
+            target_critic_params=critic_params,
+            key=self.train_state.key
+        )
         
         print(f"Modelos cargados desde {actor_path} y {critic_path}")
     
@@ -1016,6 +1124,8 @@ class DDPG:
         window_size : int, opcional
             Tamaño de ventana para suavizado (default: 10)
         """
+        import matplotlib.pyplot as plt
+        
         # Función para aplicar suavizado
         def smooth(data, window_size):
             kernel = np.ones(window_size) / window_size

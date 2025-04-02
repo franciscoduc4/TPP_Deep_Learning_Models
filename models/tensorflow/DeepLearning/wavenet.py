@@ -6,19 +6,35 @@ from tensorflow.keras.layers import (
     BatchNormalization, GlobalAveragePooling1D, Concatenate
 )
 from keras.saving import register_keras_serializable
+from typing import Tuple, Dict, List, Any, Optional, Union
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import WAVENET_CONFIG
 
-class WaveNetBlock(tf.keras.layers.Layer):
+@register_keras_serializable()
+class WavenetBlock(tf.keras.layers.Layer):
     """
     Bloque WaveNet mejorado con activaciones gated y escalado adaptativo.
+    
+    Parámetros:
+    -----------
+    filters : int
+        Número de filtros para las convoluciones
+    kernel_size : int
+        Tamaño del kernel convolucional
+    dilation_rate : int
+        Tasa de dilatación para la convolución
+    dropout_rate : float
+        Tasa de dropout
     """
-    def __init__(self, filters, kernel_size, dilation_rate, dropout_rate, **kwargs):
+    def __init__(self, filters: int, kernel_size: int, dilation_rate: int, dropout_rate: float, **kwargs):
         super().__init__(**kwargs)
         self.filters = filters
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.dropout_rate = dropout_rate
         
         # Gated convolutions
         self.filter_conv = Conv1D(
@@ -47,7 +63,22 @@ class WaveNetBlock(tf.keras.layers.Layer):
         self.residual_scale = WAVENET_CONFIG['use_residual_scale']
         self.use_skip_scale = WAVENET_CONFIG['use_skip_scale']
 
-    def call(self, inputs, training=None):
+    def call(self, inputs: tf.Tensor, training: Optional[bool] = None) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        Aplica un bloque WaveNet a la entrada.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de entrada
+        training : bool, opcional
+            Indica si está en modo entrenamiento
+            
+        Retorna:
+        --------
+        Tuple[tf.Tensor, tf.Tensor]
+            (salida_residual, salida_skip)
+        """
         # Gated activation
         filter_out = self.filter_conv(inputs)
         gate_out = self.gate_conv(inputs)
@@ -70,8 +101,27 @@ class WaveNetBlock(tf.keras.layers.Layer):
             skip_out = skip_out * tf.math.sqrt(self.residual_scale)
         
         return residual_out, skip_out
+    
+    def get_config(self) -> Dict[str, Any]:
+        """
+        Obtiene la configuración del bloque.
+        
+        Retorna:
+        --------
+        Dict[str, Any]
+            Configuración del bloque
+        """
+        config = super().get_config()
+        config.update({
+            'filters': self.filters,
+            'kernel_size': self.kernel_size,
+            'dilation_rate': self.dilation_rate,
+            'dropout_rate': self.dropout_rate
+        })
+        return config
 
-def create_wavenet_block(x, filters, kernel_size, dilation_rate, dropout_rate):
+def create_wavenet_block(x: tf.Tensor, filters: int, kernel_size: int, 
+                        dilation_rate: int, dropout_rate: float) -> Tuple[tf.Tensor, tf.Tensor]:
     """
     Crea un bloque WaveNet con conexiones residuales y skip connections.
 
@@ -90,8 +140,8 @@ def create_wavenet_block(x, filters, kernel_size, dilation_rate, dropout_rate):
 
     Retorna:
     --------
-    tf.Tensor
-        Tensor de salida del bloque WaveNet
+    Tuple[tf.Tensor, tf.Tensor]
+        (salida_residual, salida_skip)
     """
     # Convolución dilatada
     conv = Conv1D(filters=filters, kernel_size=kernel_size,
@@ -110,6 +160,29 @@ def create_wavenet_block(x, filters, kernel_size, dilation_rate, dropout_rate):
     
     return res, conv
 
+def apply_activation(x: tf.Tensor, activation_name: str) -> tf.Tensor:
+    """
+    Aplica la función de activación según su nombre.
+    
+    Parámetros:
+    -----------
+    x : tf.Tensor
+        Tensor de entrada
+    activation_name : str
+        Nombre de la activación
+        
+    Retorna:
+    --------
+    tf.Tensor
+        Tensor con activación aplicada
+    """
+    if activation_name == 'relu':
+        return tf.nn.relu(x)
+    elif activation_name == 'gelu':
+        return tf.nn.gelu(x)
+    else:
+        return tf.nn.relu(x)  # Default
+
 def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     """
     Crea un modelo WaveNet para predicción de series temporales.
@@ -117,9 +190,9 @@ def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> Model
     Parámetros:
     -----------
     cgm_shape : tuple
-        Forma de los datos CGM (samples, timesteps, features)
+        Forma de los datos CGM (muestras, pasos_temporales, características)
     other_features_shape : tuple
-        Forma de otras características (samples, features)
+        Forma de otras características (muestras, características)
 
     Retorna:
     --------
@@ -138,25 +211,26 @@ def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> Model
     # WaveNet stack
     for filters in WAVENET_CONFIG['filters']:
         for dilation in WAVENET_CONFIG['dilations']:
-            wavenet_block = WaveNetBlock(
+            wavenet = WavenetBlock(
                 filters=filters,
                 kernel_size=WAVENET_CONFIG['kernel_size'],
                 dilation_rate=dilation,
                 dropout_rate=WAVENET_CONFIG['dropout_rate']
             )
-            x, skip = wavenet_block(x)
+            x, skip = wavenet(x)
             skip_outputs.append(skip)
     
     # Combinar skip connections
     if skip_outputs:
         target_len = skip_outputs[-1].shape[1]
         aligned_skips = [skip[:, -target_len:, :] for skip in skip_outputs]
-        x = Add()(aligned_skips) / tf.sqrt(float(len(skip_outputs)))
+        x = Add()(aligned_skips)
+        x = x / tf.sqrt(float(len(skip_outputs)))  # Escalar apropiadamente
     
     # Post-procesamiento
-    x = Activation(WAVENET_CONFIG['activation'])(x)
+    x = apply_activation(x, WAVENET_CONFIG['activation'])
     x = Conv1D(WAVENET_CONFIG['filters'][-1], 1, padding='same')(x)
-    x = Activation(WAVENET_CONFIG['activation'])(x)
+    x = apply_activation(x, WAVENET_CONFIG['activation'])
     x = GlobalAveragePooling1D()(x)
     
     # Combinación con otras features
@@ -166,9 +240,10 @@ def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> Model
     skip = x
     x = Dense(128)(x)
     x = BatchNormalization()(x)
-    x = Activation(WAVENET_CONFIG['activation'])(x)
+    x = apply_activation(x, WAVENET_CONFIG['activation'])
     x = Dropout(WAVENET_CONFIG['dropout_rate'])(x)
     x = Dense(128)(x)
+    
     if skip.shape[-1] == 128:
         x = Add()([x, skip])
     

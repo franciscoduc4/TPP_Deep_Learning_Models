@@ -1,17 +1,15 @@
 import os, sys
-import tensorflow as tf
+import jax
+import jax.numpy as jnp
 import numpy as np
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input, Dense, Conv1D, Flatten, Concatenate,
-    BatchNormalization, Dropout, LayerNormalization
-)
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.losses import Huber
+import flax.linen as nn
+from flax.training import train_state
+import optax
+from typing import Dict, List, Tuple, Any, Optional, Callable, Union, Sequence
 from collections import deque
 import random
+from functools import partial
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple, Any, Optional, Union, Callable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -213,7 +211,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
             self.priorities[idx] = priority
 
 
-class QNetwork(Model):
+class QNetwork(nn.Module):
     """
     Red Q para DQN que mapea estados a valores Q.
     
@@ -221,11 +219,9 @@ class QNetwork(Model):
     
     Parámetros:
     -----------
-    state_dim : int
-        Dimensión del espacio de estados
     action_dim : int
         Dimensión del espacio de acciones
-    hidden_units : Optional[List[int]], opcional
+    hidden_units : Sequence[int], opcional
         Unidades en capas ocultas (default: None)
     dueling : bool, opcional
         Si usar arquitectura dueling (default: False)
@@ -234,198 +230,89 @@ class QNetwork(Model):
     dropout_rate : float, opcional
         Tasa de dropout para regularización (default: 0.0)
     """
-    def __init__(self, state_dim: int, action_dim: int, 
-                hidden_units: Optional[List[int]] = None,
-                dueling: bool = False,
-                activation: str = 'relu',
-                dropout_rate: float = 0.0) -> None:
-        super(QNetwork, self).__init__()
-        
-        # Valores predeterminados para capas ocultas
-        if hidden_units is None:
-            hidden_units = DQN_CONFIG['hidden_units']
-        
-        self.dueling = dueling
-        self.action_dim = action_dim
-        self.activation_name = activation
-        self.dropout_rate = dropout_rate
-        
-        # Capas para el procesamiento del estado
-        self.feature_layers = []
-        for i, units in enumerate(hidden_units):
-            self.feature_layers.append(Dense(
-                units, 
-                name=f'feature_dense_{i}'
-            ))
-            self.feature_layers.append(LayerNormalization(
-                epsilon=DQN_CONFIG['epsilon'],
-                name=f'feature_ln_{i}'
-            ))
-            self.feature_layers.append(Dropout(
-                dropout_rate,
-                name=f'feature_dropout_{i}'
-            ))
-        
-        # Para arquitectura Dueling DQN
-        if dueling:
-            # Ventaja: un valor por acción
-            self.advantage_layers = []
-            for i, units in enumerate(hidden_units[-2:]):
-                self.advantage_layers.append(Dense(
-                    units, 
-                    name=f'advantage_dense_{i}'
-                ))
-            self.advantage_output = Dense(action_dim, name='advantage')
-            
-            # Valor de estado: un valor único
-            self.value_layers = []
-            for i, units in enumerate(hidden_units[-2:]):
-                self.value_layers.append(Dense(
-                    units, 
-                    name=f'value_dense_{i}'
-                ))
-            self.value_output = Dense(1, name='value')
-        else:
-            # DQN clásica: predecir valor Q para cada acción
-            self.q_output = Dense(action_dim, name='q_values')
+    action_dim: int
+    hidden_units: Optional[Sequence[int]] = None
+    dueling: bool = False
+    activation: str = 'relu'
+    dropout_rate: float = 0.0
     
-    def _activation(self, x: tf.Tensor) -> tf.Tensor:
-        """
-        Aplica la función de activación especificada.
-        
-        Parámetros:
-        -----------
-        x : tf.Tensor
-            Tensor de entrada
-            
-        Retorna:
-        --------
-        tf.Tensor
-            Tensor con activación aplicada
-        """
-        if self.activation_name == 'relu':
-            return tf.nn.relu(x)
-        elif self.activation_name == 'tanh':
-            return tf.nn.tanh(x)
-        elif self.activation_name == 'leaky_relu':
-            return tf.nn.leaky_relu(x)
-        elif self.activation_name == 'gelu':
-            return tf.nn.gelu(x)
-        else:
-            # Por defecto usar ReLU
-            return tf.nn.relu(x)
-    
-    def _apply_layers(self, x: tf.Tensor, layers: List, training: bool = False) -> tf.Tensor:
-        """
-        Aplica una secuencia de capas al tensor de entrada.
-        
-        Parámetros:
-        -----------
-        x : tf.Tensor
-            Tensor de entrada
-        layers : List
-            Lista de capas a aplicar
-        training : bool, opcional
-            Indica si está en modo entrenamiento (default: False)
-            
-        Retorna:
-        --------
-        tf.Tensor
-            Tensor resultante
-        """
-        for layer in layers:
-            if isinstance(layer, Dense):
-                x = layer(x)
-                x = self._activation(x)
-            elif isinstance(layer, Dropout):
-                x = layer(x, training=training)
-            else:
-                x = layer(x)
-        return x
-    
-    def _process_dueling_network(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
-        """
-        Procesa las entradas a través de una arquitectura dueling.
-        
-        Parámetros:
-        -----------
-        x : tf.Tensor
-            Tensor de características
-        training : bool, opcional
-            Indica si está en modo entrenamiento (default: False)
-            
-        Retorna:
-        --------
-        tf.Tensor
-            Valores Q estimados
-        """
-        # Ventaja para cada acción
-        advantage = self._apply_layers(x, self.advantage_layers, training)
-        advantage = self.advantage_output(advantage)
-        
-        # Valor del estado
-        value = self._apply_layers(x, self.value_layers, training)
-        value = self.value_output(value)
-        
-        # Combinar ventaja y valor (restando la media de ventajas)
-        return value + (advantage - tf.reduce_mean(advantage, axis=1, keepdims=True))
-    
-    def call(self, inputs: tf.Tensor, training: bool = False) -> tf.Tensor:
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool = False) -> jnp.ndarray:
         """
         Pasa la entrada por la red Q.
         
         Parámetros:
         -----------
-        inputs : tf.Tensor
+        x : jnp.ndarray
             Tensor de entrada (estados)
         training : bool, opcional
             Indica si está en modo entrenamiento (default: False)
             
         Retorna:
         --------
-        tf.Tensor
+        jnp.ndarray
             Valores Q para cada acción
         """
-        # Procesar características de estado
-        x = self._apply_layers(inputs, self.feature_layers, training)
-        
-        # Aplicar arquitectura dueling o estándar
-        if self.dueling:
-            return self._process_dueling_network(x, training)
+        # Valores predeterminados para capas ocultas
+        if self.hidden_units is None:
+            hidden_units = DQN_CONFIG['hidden_units']
         else:
-            # DQN estándar
-            return self.q_output(x)
-    
-    def get_action(self, state: np.ndarray, epsilon: float = 0.0) -> int:
-        """
-        Obtiene una acción usando la política epsilon-greedy.
-        
-        Parámetros:
-        -----------
-        state : np.ndarray
-            Estado actual del entorno
-        epsilon : float, opcional
-            Probabilidad de exploración (0-1) (default: 0.0)
+            hidden_units = self.hidden_units
             
-        Retorna:
-        --------
-        int
-            Acción seleccionada según la política
-        """
-        rng = np.random.default_rng(seed=42)
-        if rng.random() < epsilon:
-            # Explorar: acción aleatoria
-            return int(rng.integers(0, self.action_dim))
+        # Función de activación
+        activation_fn = getattr(nn, self.activation)
+        
+        # Capas para el procesamiento del estado (feature extractor)
+        for i, units in enumerate(hidden_units):
+            x = nn.Dense(units, name=f'feature_dense_{i}')(x)
+            x = nn.LayerNorm(epsilon=DQN_CONFIG['epsilon'], name=f'feature_ln_{i}')(x)
+            x = activation_fn(x)
+            if self.dropout_rate > 0 and training:
+                x = nn.Dropout(rate=self.dropout_rate, deterministic=not training)(x)
+        
+        # Para arquitectura Dueling DQN
+        if self.dueling:
+            # Ventaja: un valor por acción
+            advantage = x
+            for i, units in enumerate(hidden_units[-2:]):
+                advantage = nn.Dense(units, name=f'advantage_dense_{i}')(advantage)
+                advantage = activation_fn(advantage)
+            advantage = nn.Dense(self.action_dim, name='advantage')(advantage)
+            
+            # Valor del estado: un valor único
+            value = x
+            for i, units in enumerate(hidden_units[-2:]):
+                value = nn.Dense(units, name=f'value_dense_{i}')(value)
+                value = activation_fn(value)
+            value = nn.Dense(1, name='value')(value)
+            
+            # Combinar ventaja y valor (restando la media de ventajas)
+            q_values = value + (advantage - advantage.mean(axis=-1, keepdims=True))
         else:
-            # Explotar: mejor acción según la red
-            state = tf.convert_to_tensor([state], dtype=tf.float32)
-            q_values = self(state)
-            return int(tf.argmax(q_values[0]).numpy())
+            # DQN clásica: predecir valor Q para cada acción
+            q_values = nn.Dense(self.action_dim, name='q_values')(x)
+            
+        return q_values
+
+
+class DQNTrainState(train_state.TrainState):
+    """
+    Estado de entrenamiento para DQN que extiende TrainState de Flax.
+    
+    Incluye el modelo target además del modelo principal.
+    
+    Atributos:
+    ----------
+    target_params : Any
+        Parámetros del modelo target
+    """
+    target_params: Any
+    rng: jax.random.PRNGKey
 
 
 class DQN:
     """
-    Implementación del algoritmo Deep Q-Network (DQN).
+    Implementación del algoritmo Deep Q-Network (DQN) usando JAX.
     
     Incluye mecanismos de Experience Replay y Target Network para
     mejorar la estabilidad del aprendizaje.
@@ -451,11 +338,6 @@ class DQN:
         hidden_units: Optional[List[int]] = None,
         seed: int = 42
     ) -> None:
-        # Configurar semillas para reproducibilidad
-        tf.random.set_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-        
         # Use provided config or default
         self.config = config or DQN_CONFIG
         
@@ -472,7 +354,6 @@ class DQN:
         self.double = self.config.get('double', False)
         self.prioritized = self.config.get('prioritized', False)
         dropout_rate = self.config.get('dropout_rate', 0.0)
-        activation = self.config.get('activation', 'relu')
         
         # Parámetros del entorno y del modelo
         self.state_dim = state_dim
@@ -482,41 +363,46 @@ class DQN:
         # Cantidad de actualizaciones realizadas
         self.update_counter = 0
         
+        # Configurar semillas para reproducibilidad
+        self.seed = seed
+        self.rng = jax.random.PRNGKey(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        
+        # Dividir la clave para inicialización y uso posterior
+        self.rng, init_rng = jax.random.split(self.rng)
+        
         # Valores predeterminados para capas ocultas
         if hidden_units is None:
             self.hidden_units = DQN_CONFIG['hidden_units']
         else:
             self.hidden_units = hidden_units
         
-        # Crear modelo Q y modelo Q Target
+        # Crear modelo Q
         self.q_network = QNetwork(
-            state_dim, 
-            action_dim, 
-            self.hidden_units, 
-            dueling,
-            activation,
-            dropout_rate
-        )
-        self.target_q_network = QNetwork(
-            state_dim, 
-            action_dim, 
-            self.hidden_units, 
-            dueling,
-            activation,
-            dropout_rate
+            action_dim=action_dim,
+            hidden_units=self.hidden_units,
+            dueling=dueling,
+            activation=DQN_CONFIG['activation'],
+            dropout_rate=dropout_rate
         )
         
-        # Asegurar que ambos modelos estén construidos
-        dummy_state = np.zeros((1, state_dim), dtype=np.float32)
-        _ = self.q_network(dummy_state)
-        _ = self.target_q_network(dummy_state)
+        # Inicializar parámetros con una muestra de estado
+        dummy_state = jnp.zeros((1, state_dim))
+        params = self.q_network.init(init_rng, dummy_state)
         
-        # Actualizar pesos del target para que sean iguales al modelo principal
-        self.update_target_network()
+        # Crear optimizador
+        tx = optax.adam(learning_rate=learning_rate)
         
-        # Optimizador y función de pérdida
-        self.optimizer = Adam(learning_rate=learning_rate)
-        self.loss_fn = Huber()  # Menos sensible a outliers que MSE
+        # Crear estado de entrenamiento
+        self.state = DQNTrainState(
+            step=0,
+            apply_fn=self.q_network.apply,
+            params=params,
+            target_params=params,  # Inicializar target = modelo principal
+            tx=tx,
+            rng=init_rng
+        )
         
         # Buffer de experiencias
         if self.prioritized:
@@ -533,86 +419,138 @@ class DQN:
         self.loss_sum = 0.0
         self.q_value_sum = 0.0
         self.updates_count = 0
-    
+        
+        # Precompilar funciones para entrenamiento
+        self._compile_jitted_functions()
+        
+    def _compile_jitted_functions(self) -> None:
+        """
+        Compila versiones JIT de las funciones principales para acelerar la ejecución.
+        """
+        self.update_target_jit = jax.jit(self._update_target)
+        self.train_step_jit = jax.jit(self._train_step)
+        
     def update_target_network(self) -> None:
         """
         Actualiza los pesos del modelo target con los del modelo principal.
         """
-        self.target_q_network.set_weights(self.q_network.get_weights())
+        self.state = self.update_target_jit(self.state)
     
-    @tf.function
-    def _train_step(self, states: tf.Tensor, actions: tf.Tensor, rewards: tf.Tensor, 
-                  next_states: tf.Tensor, dones: tf.Tensor, 
-                  importance_weights: Optional[tf.Tensor] = None) -> Tuple[tf.Tensor, tf.Tensor]:
+    def _update_target(self, state: DQNTrainState) -> DQNTrainState:
+        """
+        Actualiza los parámetros target.
+        
+        Parámetros:
+        -----------
+        state : dqn_train_state
+            Estado actual del entrenamiento
+            
+        Retorna:
+        --------
+        dqn_train_state
+            Nuevo estado con parámetros target actualizados
+        """
+        return state.replace(target_params=state.params)
+    
+    def _train_step(self, state: DQNTrainState, 
+                  batch: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+                  importance_weights: Optional[jnp.ndarray] = None) -> Tuple[DQNTrainState, jnp.ndarray, jnp.ndarray]:
         """
         Realiza un paso de entrenamiento para actualizar la red Q.
         
         Parámetros:
         -----------
-        states : tf.Tensor
-            Estados observados
-        actions : tf.Tensor
-            Acciones tomadas
-        rewards : tf.Tensor
-            Recompensas recibidas
-        next_states : tf.Tensor
-            Estados siguientes
-        dones : tf.Tensor
-            Indicadores de fin de episodio
-        importance_weights : Optional[tf.Tensor], opcional
-            Pesos de importancia para PER (default: None)
+        state : dqn_train_state
+            Estado actual del entrenamiento
+        batch : Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
+            (estados, acciones, recompensas, siguientes_estados, terminados)
+        importance_weights : Optional[jnp.ndarray], opcional
+            Pesos de importancia para muestreo prioritario (default: None)
             
         Retorna:
         --------
-        Tuple[tf.Tensor, tf.Tensor]
-            (pérdida, td_errors)
+        Tuple[dqn_train_state, jnp.ndarray, jnp.ndarray]
+            (nuevo_estado, pérdida, td_errors)
         """
-        # Convertir acciones a índices one-hot para gather
-        action_indices = tf.one_hot(actions, self.action_dim)
+        states, actions, rewards, next_states, dones = batch
         
-        with tf.GradientTape() as tape:
+        # Dividir rng para posibles necesidades estocásticas
+        new_rng, dropout_rng = jax.random.split(state.rng)
+        
+        # Función de pérdida y su gradiente
+        def loss_fn(params):
             # Q-values para los estados actuales
-            q_values = self.q_network(states, training=True)
-            q_values_for_actions = tf.reduce_sum(q_values * action_indices, axis=1)
+            q_values = state.apply_fn(params, states, rngs={'dropout': dropout_rng})
+            q_values_selected = q_values[jnp.arange(q_values.shape[0]), actions]
             
             # Q-values objetivos para los siguientes estados
             if self.double:
                 # Double DQN: seleccionar acción con red primaria
-                next_actions = tf.argmax(self.q_network(next_states), axis=1)
-                next_action_indices = tf.one_hot(next_actions, self.action_dim)
-                next_q_values = self.target_q_network(next_states)
-                next_q_values = tf.reduce_sum(next_q_values * next_action_indices, axis=1)
+                next_q_values_online = state.apply_fn(params, next_states)
+                next_actions = jnp.argmax(next_q_values_online, axis=1)
+                next_q_values_target = state.apply_fn(state.target_params, next_states)
+                next_q_values = next_q_values_target[jnp.arange(next_q_values_target.shape[0]), next_actions]
             else:
                 # DQN estándar: target Q-network para seleccionar y evaluar
-                next_q_values = tf.reduce_max(self.target_q_network(next_states), axis=1)
+                next_q_values = state.apply_fn(state.target_params, next_states)
+                next_q_values = jnp.max(next_q_values, axis=1)
                 
             # Calcular targets usando ecuación de Bellman
-            targets = rewards + (1 - dones) * self.gamma * next_q_values
+            targets = rewards + (1.0 - dones) * self.gamma * next_q_values
             
             # Calcular TD-error
-            td_errors = targets - q_values_for_actions
+            td_errors = targets - q_values_selected
             
             # Aplicar pesos de importancia para PER si es necesario
             if importance_weights is not None:
-                # Usar MSE ponderada para PER
-                loss = tf.reduce_mean(importance_weights * tf.square(td_errors), axis=0)
+                loss = jnp.mean(importance_weights * jnp.square(td_errors))
             else:
-                # Función Huber para DQN estándar
-                loss = self.loss_fn(targets, q_values_for_actions)
+                loss = jnp.mean(optax.huber_loss(q_values_selected, targets))
+            
+            metrics = {
+                'loss': loss,
+                'q_values': jnp.mean(q_values_selected),
+                'td_errors': td_errors
+            }
+            
+            return loss, metrics
         
-        # Calcular gradientes y actualizar pesos
-        grads = tape.gradient(loss, self.q_network.trainable_variables)
-        # Clipeo de gradientes opcional para estabilidad
-        if DQN_CONFIG.get('grad_clip', False):
-            grads, _ = tf.clip_by_global_norm(grads, DQN_CONFIG.get('max_grad_norm', 10.0))
-        self.optimizer.apply_gradients(zip(grads, self.q_network.trainable_variables))
+        # Calcular gradientes y actualizar parámetros
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, metrics), grads = grad_fn(state.params)
+        new_state = state.apply_gradients(grads=grads, rng=new_rng)
         
-        # Actualizar métricas acumuladas
-        self.loss_sum += loss
-        self.q_value_sum += tf.reduce_mean(q_values_for_actions, axis=0)
-        self.updates_count += 1
+        return new_state, loss, metrics['td_errors']
+    
+    def get_action(self, state: np.ndarray, epsilon: float = 0.0) -> int:
+        """
+        Obtiene una acción usando la política epsilon-greedy.
         
-        return loss, td_errors
+        Parámetros:
+        -----------
+        state : np.ndarray
+            Estado actual del entorno
+        epsilon : float, opcional
+            Probabilidad de exploración (0-1) (default: 0.0)
+            
+        Retorna:
+        --------
+        int
+            Acción seleccionada según la política
+        """
+        # Dividir clave para exploración
+        self.rng, explore_rng = jax.random.split(self.rng)
+        
+        # Exploración
+        if jax.random.uniform(explore_rng) < epsilon:
+            # Explorar: acción aleatoria
+            self.rng, action_rng = jax.random.split(self.rng)
+            return int(jax.random.randint(action_rng, (), 0, self.action_dim))
+        else:
+            # Explotar: mejor acción según la red
+            state_tensor = jnp.array([state], dtype=jnp.float32)
+            q_values = self.q_network.apply(self.state.params, state_tensor)
+            return int(jnp.argmax(q_values[0]))
     
     def _sample_batch(self) -> Tuple:
         """
@@ -629,15 +567,29 @@ class DQN:
                  self.batch_size, self.beta)
             self.beta = min(1.0, self.beta + self.beta_increment)
             
-            return (
-                states, actions, rewards, next_states, dones,
-                indices, importance_weights
+            # Convertir a JAX arrays
+            batch = (
+                jnp.array(states, dtype=jnp.float32),
+                jnp.array(actions, dtype=jnp.int32),
+                jnp.array(rewards, dtype=jnp.float32),
+                jnp.array(next_states, dtype=jnp.float32),
+                jnp.array(dones, dtype=jnp.float32)
             )
+            importance_weights_array = jnp.array(importance_weights, dtype=jnp.float32)
+            return batch, indices, importance_weights_array
         else:
             states, actions, rewards, next_states, dones = self.replay_buffer.sample(
                 self.batch_size)
             
-            return states, actions, rewards, next_states, dones, None, None
+            # Convertir a JAX arrays
+            batch = (
+                jnp.array(states, dtype=jnp.float32),
+                jnp.array(actions, dtype=jnp.int32),
+                jnp.array(rewards, dtype=jnp.float32),
+                jnp.array(next_states, dtype=jnp.float32),
+                jnp.array(dones, dtype=jnp.float32)
+            )
+            return batch, None, None
     
     def _update_model(self, episode_loss: List[float], update_every: int, update_after: int) -> None:
         """
@@ -659,28 +611,27 @@ class DQN:
             
             # Muestrear batch
             if self.prioritized:
-                states, actions, rewards, next_states, dones, indices, importance_weights = self._sample_batch()
+                batch, indices, importance_weights = self._sample_batch()
             else:
-                states, actions, rewards, next_states, dones, _, _ = self._sample_batch()
+                batch, _, _ = self._sample_batch()
                 importance_weights = None
             
-            # Convertir a tensores para TensorFlow
-            states = tf.convert_to_tensor(states, dtype=tf.float32)
-            actions = tf.convert_to_tensor(actions, dtype=tf.int32)
-            rewards = tf.convert_to_tensor(rewards, dtype=tf.float32)
-            next_states = tf.convert_to_tensor(next_states, dtype=tf.float32)
-            dones = tf.convert_to_tensor(dones, dtype=tf.float32)
-            if importance_weights is not None:
-                importance_weights = tf.convert_to_tensor(importance_weights, dtype=tf.float32)
-            
             # Entrenar red
-            loss, td_errors = self._train_step(
-                states, actions, rewards, next_states, dones, importance_weights)
-            episode_loss.append(float(loss.numpy()))
+            self.state, loss, td_errors = self.train_step_jit(self.state, batch, importance_weights)
+            episode_loss.append(float(loss))
+            
+            # Actualizar métricas acumuladas
+            self.loss_sum += float(loss)
+            # Calcular q_values del batch
+            states, actions = batch[0], batch[1]
+            q_values = self.q_network.apply(self.state.params, states)
+            q_values_selected = q_values[jnp.arange(q_values.shape[0]), actions]
+            self.q_value_sum += float(jnp.mean(q_values_selected))
+            self.updates_count += 1
             
             # Actualizar prioridades si es PER
             if self.prioritized and indices is not None:
-                priorities = np.abs(td_errors.numpy()) + 1e-6
+                priorities = np.abs(np.array(td_errors)) + 1e-6
                 self.replay_buffer.update_priorities(indices, priorities)
                 
         # Actualizar target network periódicamente
@@ -719,7 +670,7 @@ class DQN:
         
         for _ in range(max_steps):
             # Seleccionar acción
-            action = self.q_network.get_action(state, self.epsilon)
+            action = self.get_action(state, self.epsilon)
             
             # Ejecutar acción
             next_state, reward, done, _, _ = env.step(action)
@@ -779,7 +730,6 @@ class DQN:
         # Calcular y guardar promedio del valor Q
         if self.updates_count > 0:
             avg_q_value = self.q_value_sum / self.updates_count
-            avg_q_value = float(avg_q_value.numpy())
             self.q_value_sum = 0.0
             self.updates_count = 0
         else:
@@ -890,7 +840,7 @@ class DQN:
             
             while not done:
                 # Seleccionar acción determinística (sin exploración)
-                action = self.q_network.get_action(state)
+                action = self.get_action(state)
                 
                 # Ejecutar acción
                 next_state, reward, done, _, _ = env.step(action)
@@ -923,7 +873,9 @@ class DQN:
         filepath : str
             Ruta donde guardar el modelo
         """
-        self.q_network.save_weights(filepath)
+        import flax.serialization
+        with open(filepath, 'wb') as f:
+            f.write(flax.serialization.to_bytes(self.state.params))
         print(f"Modelo guardado en {filepath}")
     
     def load_model(self, filepath: str) -> None:
@@ -935,12 +887,12 @@ class DQN:
         filepath : str
             Ruta desde donde cargar el modelo
         """
-        # Asegurarse de que el modelo está construido primero
-        dummy_state = np.zeros((1, self.state_dim), dtype=np.float32)
-        _ = self.q_network(dummy_state)
+        import flax.serialization
+        with open(filepath, 'rb') as f:
+            params = flax.serialization.from_bytes(self.state.params, f.read())
         
-        self.q_network.load_weights(filepath)
-        self.update_target_network()  # Sincronizar target network
+        # Actualizar parámetros del modelo y del target
+        self.state = self.state.replace(params=params, target_params=params)
         print(f"Modelo cargado desde {filepath}")
     
     def visualize_training(self, history: Dict, window_size: int = 10) -> None:
