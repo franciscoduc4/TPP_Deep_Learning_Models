@@ -15,7 +15,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import ATTENTION_CONFIG
 
 @register_keras_serializable
-class relative_position_encoding(tf.keras.layers.Layer):
+class RelativePositionEncoding(tf.keras.layers.Layer):
     """
     Codificación de posición relativa para mejorar la atención temporal.
     
@@ -112,7 +112,7 @@ def create_attention_block(x: tf.Tensor, num_heads: int, key_dim: int,
     """
     # Codificación de posición relativa
     if ATTENTION_CONFIG['use_relative_attention']:
-        pos_encoding = relative_position_encoding(
+        pos_encoding = RelativePositionEncoding(
             ATTENTION_CONFIG['max_relative_position'],
             key_dim
         )(x)

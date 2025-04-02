@@ -14,7 +14,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import TCN_CONFIG
 
 @register_keras_serializable()
-class weight_normalization(tf.keras.layers.Wrapper):
+class WeightNormalization(tf.keras.layers.Wrapper):
     """
     Normalización de pesos para capas convolucionales.
     
@@ -83,7 +83,7 @@ class weight_normalization(tf.keras.layers.Wrapper):
         return config
 
 @register_keras_serializable()
-class causal_padding(tf.keras.layers.Layer):
+class CausalPadding(tf.keras.layers.Layer):
     """
     Capa personalizada para padding causal.
     
@@ -167,7 +167,7 @@ def create_tcn_block(input_layer: tf.Tensor, filters: int, kernel_size: int,
         Salida del bloque TCN
     """
     padding_size = (kernel_size - 1) * dilation_rate
-    padded_input = causal_padding(padding_size)(input_layer)
+    padded_input = CausalPadding(padding_size)(input_layer)
     
     # Convolución con weight normalization
     conv_layer = Conv1D(
@@ -179,7 +179,7 @@ def create_tcn_block(input_layer: tf.Tensor, filters: int, kernel_size: int,
     )
     
     if TCN_CONFIG['use_weight_norm']:
-        conv_layer = weight_normalization(conv_layer)
+        conv_layer = WeightNormalization(conv_layer)
     
     conv = conv_layer(padded_input)
     

@@ -848,7 +848,7 @@ class TRPO:
             return np.convolve(data, kernel, mode='valid')
         
         # Crear figura con múltiples subplots
-        fig, axs = plt.subplots(3, 2, figsize=(15, 12))
+        _, axs = plt.subplots(3, 2, figsize=(15, 12))
         
         # 1. Recompensas de episodio
         axs[0, 0].plot(history['mean_episode_rewards'], alpha=0.3, color='blue')

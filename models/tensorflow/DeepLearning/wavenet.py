@@ -14,7 +14,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import WAVENET_CONFIG
 
 @register_keras_serializable()
-class wavenet_block(tf.keras.layers.Layer):
+class WavenetBlock(tf.keras.layers.Layer):
     """
     Bloque WaveNet mejorado con activaciones gated y escalado adaptativo.
     
@@ -211,7 +211,7 @@ def create_wavenet_model(cgm_shape: tuple, other_features_shape: tuple) -> Model
     # WaveNet stack
     for filters in WAVENET_CONFIG['filters']:
         for dilation in WAVENET_CONFIG['dilations']:
-            wavenet = wavenet_block(
+            wavenet = WavenetBlock(
                 filters=filters,
                 kernel_size=WAVENET_CONFIG['kernel_size'],
                 dilation_rate=dilation,

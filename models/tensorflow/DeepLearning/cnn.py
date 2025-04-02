@@ -15,7 +15,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import CNN_CONFIG
 
 @register_keras_serializable()
-class squeeze_excitation_block(tf.keras.layers.Layer):
+class SqueezeExcitationBlock(tf.keras.layers.Layer):
     """
     Bloque Squeeze-and-Excitation como capa personalizada.
     
@@ -121,7 +121,7 @@ def create_residual_block(x: tf.Tensor, filters: int, dilation_rate: int = 1) ->
     
     # Squeeze-and-Excitation
     if CNN_CONFIG['use_se_block']:
-        x = squeeze_excitation_block(filters, CNN_CONFIG['se_ratio'])(x)
+        x = SqueezeExcitationBlock(filters, CNN_CONFIG['se_ratio'])(x)
     
     # Proyección del residual si es necesario
     if skip.shape[-1] != filters:

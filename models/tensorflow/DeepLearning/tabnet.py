@@ -14,7 +14,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import TABNET_CONFIG
 
 @register_keras_serializable()
-class glu(tf.keras.layers.Layer):
+class GLU(tf.keras.layers.Layer):
     """
     Gated Linear Unit como capa personalizada.
     
@@ -53,7 +53,7 @@ class glu(tf.keras.layers.Layer):
         return config
 
 @register_keras_serializable()
-class multi_head_feature_attention(tf.keras.layers.Layer):
+class MultiHeadFeatureAttention(tf.keras.layers.Layer):
     """
     Atención multi-cabeza para características.
     
@@ -107,7 +107,7 @@ class multi_head_feature_attention(tf.keras.layers.Layer):
         return config
 
 @register_keras_serializable()
-class enhanced_feature_transformer(tf.keras.layers.Layer):
+class EnhancedFeatureTransformer(tf.keras.layers.Layer):
     """
     Transformador de características mejorado con atención y ghost batch norm.
     
@@ -131,11 +131,11 @@ class enhanced_feature_transformer(tf.keras.layers.Layer):
         self.dropout_rate = dropout_rate
         
         # GLU layers
-        self.glu1 = glu(feature_dim)
-        self.glu2 = glu(feature_dim)
+        self.glu1 = GLU(feature_dim)
+        self.glu2 = GLU(feature_dim)
         
         # Attention layer
-        self.attention = multi_head_feature_attention(
+        self.attention = MultiHeadFeatureAttention(
             num_heads=num_heads,
             key_dim=feature_dim // num_heads,
             dropout=dropout_rate
@@ -203,7 +203,7 @@ def custom_softmax(x: tf.Tensor, axis: int = -1) -> tf.Tensor:
     exp_x = tf.exp(x - tf.reduce_max(x, axis=axis, keepdims=True))
     return exp_x / tf.reduce_sum(exp_x, axis=axis, keepdims=True)
 
-class tabnet_model(tf.keras.Model):
+class TabnetModel(tf.keras.Model):
     """
     Modelo TabNet personalizado con manejo de pérdidas de entropía.
     
@@ -224,7 +224,7 @@ class tabnet_model(tf.keras.Model):
         self.flatten = Flatten()
         self.feature_dropout = Dropout(TABNET_CONFIG['feature_dropout'])
         self.transformers = [
-            enhanced_feature_transformer(
+            EnhancedFeatureTransformer(
                 feature_dim=TABNET_CONFIG['feature_dim'],
                 num_heads=TABNET_CONFIG['num_attention_heads'],
                 virtual_batch_size=TABNET_CONFIG['virtual_batch_size'],
@@ -373,7 +373,7 @@ def create_tabnet_model(cgm_shape: tuple, other_features_shape: tuple) -> tf.ker
     tf.keras.Model
         Modelo TabNet compilado
     """
-    model = tabnet_model(cgm_shape, other_features_shape)
+    model = TabnetModel(cgm_shape, other_features_shape)
     
     # Build model
     dummy_cgm = Input(shape=cgm_shape[1:])

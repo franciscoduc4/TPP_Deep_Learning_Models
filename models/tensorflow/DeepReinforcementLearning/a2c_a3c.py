@@ -8,6 +8,7 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.optimizers import Adam
 import threading
+from typing import Tuple, Dict, List, Any, Optional, Union, Callable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -15,13 +16,25 @@ sys.path.append(PROJECT_ROOT)
 from models.config import A2C_A3C_CONFIG
 
 
-class ActorCriticModel(Model):
+class actor_critic_model(Model):
     """
     Modelo Actor-Crítico para A2C que divide la arquitectura en redes para
     política (actor) y valor (crítico).
+    
+    Parámetros:
+    -----------
+    state_dim : int
+        Dimensión del espacio de estados
+    action_dim : int
+        Dimensión del espacio de acciones
+    continuous : bool, opcional
+        Indica si el espacio de acciones es continuo o discreto
+    hidden_units : Optional[List[int]], opcional
+        Unidades ocultas en cada capa
     """
-    def __init__(self, state_dim, action_dim, continuous=True, hidden_units=None):
-        super(ActorCriticModel, self).__init__()
+    def __init__(self, state_dim: int, action_dim: int, continuous: bool = True, 
+                hidden_units: Optional[List[int]] = None) -> None:
+        super().__init__()
         
         # Valores predeterminados para capas ocultas
         if hidden_units is None:
@@ -61,7 +74,22 @@ class ActorCriticModel(Model):
         # Capa de salida del crítico (valor del estado)
         self.value = Dense(1, activation='linear', name='critic_value')
     
-    def call(self, inputs, training=False):
+    def call(self, inputs: tf.Tensor, training: bool = False) -> Tuple[Any, tf.Tensor]:
+        """
+        Pasa la entrada por el modelo Actor-Crítico.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de entrada con los estados
+        training : bool, opcional
+            Indica si está en modo entrenamiento
+            
+        Retorna:
+        --------
+        Tuple[Any, tf.Tensor]
+            (política, valor) - la política puede ser una tupla (mu, sigma) o logits
+        """
         x = inputs
         
         # Capas compartidas
@@ -102,15 +130,20 @@ class ActorCriticModel(Model):
         
         return policy, value
     
-    def get_action(self, state, deterministic=False):
+    def get_action(self, state: np.ndarray, deterministic: bool = False) -> np.ndarray:
         """
         Obtiene una acción basada en el estado actual.
         
-        Args:
-            state: El estado actual
-            deterministic: Si es True, devuelve la acción con máxima probabilidad
+        Parámetros:
+        -----------
+        state : np.ndarray
+            El estado actual
+        deterministic : bool, opcional
+            Si es True, devuelve la acción con máxima probabilidad
         
-        Returns:
+        Retorna:
+        --------
+        np.ndarray
             Una acción muestreada de la distribución de política
         """
         state = tf.convert_to_tensor([state], dtype=tf.float32)
@@ -119,11 +152,11 @@ class ActorCriticModel(Model):
         if self.continuous:
             mu, sigma = policy
             if deterministic:
-                return mu[0]
+                return mu[0].numpy()
             # Muestrear de la distribución normal
             dist = tf.random.normal(shape=mu.shape)
             action = mu + sigma * dist
-            return action[0]
+            return action[0].numpy()
         else:
             logits = policy
             if deterministic:
@@ -133,30 +166,39 @@ class ActorCriticModel(Model):
             action = tf.random.categorical(tf.math.log(probs), 1)
             return action[0, 0].numpy()
     
-    def get_value(self, state):
+    def get_value(self, state: np.ndarray) -> float:
         """
         Obtiene el valor estimado para un estado.
         
-        Args:
-            state: El estado para evaluar
+        Parámetros:
+        -----------
+        state : np.ndarray
+            El estado para evaluar
         
-        Returns:
+        Retorna:
+        --------
+        float
             El valor estimado del estado
         """
         state = tf.convert_to_tensor([state], dtype=tf.float32)
         _, value = self.call(state)
-        return value[0]
+        return value[0].numpy()
     
-    def evaluate_actions(self, states, actions):
+    def evaluate_actions(self, states: tf.Tensor, actions: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         Evalúa las acciones tomadas, devolviendo log_probs, valores y entropía.
         
-        Args:
-            states: Los estados observados
-            actions: Las acciones tomadas
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Los estados observados
+        actions : tf.Tensor
+            Las acciones tomadas
         
-        Returns:
-            Tuple con log_probs, valores y entropía
+        Retorna:
+        --------
+        Tuple[tf.Tensor, tf.Tensor, tf.Tensor]
+            (log_probs, valores, entropía)
         """
         policy, values = self.call(states)
         
@@ -192,25 +234,46 @@ class ActorCriticModel(Model):
         return log_probs, values, entropy
 
 
-class A2C:
+class a2c:
     """
     Implementación del algoritmo Advantage Actor-Critic (A2C).
     
     Este algoritmo utiliza un estimador de ventaja para actualizar la política
     y una red de valor para estimar los retornos esperados.
+    
+    Parámetros:
+    -----------
+    state_dim : int
+        Dimensión del espacio de estados
+    action_dim : int
+        Dimensión del espacio de acciones
+    continuous : bool, opcional
+        Indica si el espacio de acciones es continuo o discreto
+    learning_rate : float, opcional
+        Tasa de aprendizaje
+    gamma : float, opcional
+        Factor de descuento
+    entropy_coef : float, opcional
+        Coeficiente de entropía para exploración
+    value_coef : float, opcional
+        Coeficiente de pérdida de valor
+    max_grad_norm : float, opcional
+        Norma máxima para recorte de gradientes
+    hidden_units : Optional[List[int]], opcional
+        Unidades ocultas por capa
     """
     def __init__(
         self, 
-        state_dim, 
-        action_dim,
-        continuous=True,
-        learning_rate=A2C_A3C_CONFIG['learning_rate'],
-        gamma=A2C_A3C_CONFIG['gamma'],
-        entropy_coef=A2C_A3C_CONFIG['entropy_coef'],
-        value_coef=A2C_A3C_CONFIG['value_coef'],
-        max_grad_norm=A2C_A3C_CONFIG['max_grad_norm'],
-        hidden_units=None
-    ):
+        state_dim: int, 
+        action_dim: int,
+        continuous: bool = True,
+        learning_rate: float = A2C_A3C_CONFIG['learning_rate'],
+        gamma: float = A2C_A3C_CONFIG['gamma'],
+        entropy_coef: float = A2C_A3C_CONFIG['entropy_coef'],
+        value_coef: float = A2C_A3C_CONFIG['value_coef'],
+        max_grad_norm: float = A2C_A3C_CONFIG['max_grad_norm'],
+        hidden_units: Optional[List[int]] = None
+    ) -> None:
         # Parámetros del modelo
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -227,7 +290,7 @@ class A2C:
             self.hidden_units = hidden_units
         
         # Crear modelo y optimizador
-        self.model = ActorCriticModel(state_dim, action_dim, continuous, self.hidden_units)
+        self.model = actor_critic_model(state_dim, action_dim, continuous, self.hidden_units)
         self.optimizer = Adam(learning_rate=learning_rate)
         
         # Métricas
@@ -237,18 +300,26 @@ class A2C:
         self.total_loss_metric = tf.keras.metrics.Mean('total_loss')
     
     @tf.function
-    def train_step(self, states, actions, returns, advantages):
+    def train_step(self, states: tf.Tensor, actions: tf.Tensor, 
+                 returns: tf.Tensor, advantages: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         Realiza un paso de entrenamiento para actualizar el modelo.
         
-        Args:
-            states: Estados observados en el entorno
-            actions: Acciones tomadas para esos estados
-            returns: Retornos estimados (para entrenar el crítico)
-            advantages: Ventajas estimadas (para entrenar el actor)
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados observados en el entorno
+        actions : tf.Tensor
+            Acciones tomadas para esos estados
+        returns : tf.Tensor
+            Retornos estimados (para entrenar el crítico)
+        advantages : tf.Tensor
+            Ventajas estimadas (para entrenar el actor)
         
-        Returns:
-            Pérdida total, pérdida de política, pérdida de valor, entropía
+        Retorna:
+        --------
+        Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]
+            (pérdida_total, pérdida_política, pérdida_valor, pérdida_entropía)
         """
         with tf.GradientTape() as tape:
             # Evaluar acciones con el modelo actual
@@ -288,18 +359,26 @@ class A2C:
         
         return total_loss, policy_loss, value_loss, entropy_loss
     
-    def compute_returns_advantages(self, rewards, values, dones, next_value):
+    def compute_returns_advantages(self, rewards: np.ndarray, values: np.ndarray, 
+                                 dones: np.ndarray, next_value: float) -> Tuple[np.ndarray, np.ndarray]:
         """
         Calcula los retornos y ventajas para los estados visitados.
         
-        Args:
-            rewards: Recompensas recibidas
-            values: Valores estimados para los estados actuales
-            dones: Indicadores de fin de episodio
-            next_value: Valor estimado para el estado final
+        Parámetros:
+        -----------
+        rewards : np.ndarray
+            Recompensas recibidas
+        values : np.ndarray
+            Valores estimados para los estados actuales
+        dones : np.ndarray
+            Indicadores de fin de episodio
+        next_value : float
+            Valor estimado para el estado final
             
-        Returns:
-            returns y ventajas calculados
+        Retorna:
+        --------
+        Tuple[np.ndarray, np.ndarray]
+            (returns, advantages) calculados
         """
         # Añadir el valor del último estado
         values = np.append(values, next_value)
@@ -329,19 +408,29 @@ class A2C:
         
         return returns, advantages
     
-    def _collect_experience(self, env, state, n_steps, render=False, episode_reward=0, episode_rewards=None):
+    def _collect_experience(self, env, state: np.ndarray, n_steps: int, render: bool = False,
+                          episode_reward: float = 0, episode_rewards: Optional[List] = None) -> Tuple:
         """
         Recolecta experiencia en el entorno para una actualización.
         
-        Args:
-            env: Entorno donde recolectar datos
-            state: Estado inicial desde donde empezar
-            n_steps: Número de pasos a recolectar
-            render: Si se debe renderizar el entorno
-            episode_reward: Recompensa acumulada en el episodio actual
-            episode_rewards: Lista donde guardar recompensas de episodios completos
+        Parámetros:
+        -----------
+        env : gym.Env
+            Entorno donde recolectar datos
+        state : np.ndarray
+            Estado inicial desde donde empezar
+        n_steps : int
+            Número de pasos a recolectar
+        render : bool, opcional
+            Si se debe renderizar el entorno
+        episode_reward : float, opcional
+            Recompensa acumulada en el episodio actual
+        episode_rewards : List, opcional
+            Lista donde guardar recompensas de episodios completos
             
-        Returns:
+        Retorna:
+        --------
+        Tuple
             Datos recolectados y el estado actualizado
         """
         states, actions, rewards, dones, values = [], [], [], [], []
@@ -360,7 +449,7 @@ class A2C:
             actions.append(action)
             
             # Valor del estado actual
-            value = self.model.get_value(current_state).numpy()
+            value = self.model.get_value(current_state)
             values.append(value)
             
             # Ejecutar acción en el entorno
@@ -384,17 +473,33 @@ class A2C:
         
         return states, actions, rewards, dones, values, current_state, current_episode_reward
 
-    def _update_model(self, states, actions, rewards, dones, values, next_value, done):
+    def _update_model(self, states: List, actions: List, rewards: List, 
+                    dones: List, values: List, next_value: float, 
+                    done: bool) -> Tuple[float, float, float]:
         """
         Actualiza el modelo con los datos recolectados.
         
-        Args:
-            states, actions, rewards, dones, values: Datos recolectados
-            next_value: Valor estimado del último estado
-            done: Si el último estado es terminal
+        Parámetros:
+        -----------
+        states : List
+            Estados observados
+        actions : List
+            Acciones tomadas
+        rewards : List
+            Recompensas recibidas
+        dones : List
+            Indicadores de fin de episodio
+        values : List
+            Valores estimados para los estados
+        next_value : float
+            Valor estimado del último estado
+        done : bool
+            Si el último estado es terminal
             
-        Returns:
-            Pérdidas del entrenamiento
+        Retorna:
+        --------
+        Tuple[float, float, float]
+            Pérdidas del entrenamiento (policy_loss, value_loss, entropy_loss)
         """
         # Si el episodio no terminó, usar el valor estimado
         final_value = 0 if done else next_value
@@ -411,21 +516,39 @@ class A2C:
         
         # Actualizar modelo
         _, policy_loss, value_loss, entropy_loss = self.train_step(
-            states_np, actions_np, returns, advantages
+            tf.convert_to_tensor(states_np), 
+            tf.convert_to_tensor(actions_np), 
+            tf.convert_to_tensor(returns), 
+            tf.convert_to_tensor(advantages)
         )
         
-        return policy_loss, value_loss, entropy_loss
+        return policy_loss.numpy(), value_loss.numpy(), entropy_loss.numpy()
 
-    def _update_history(self, history, episode_rewards, epoch, epochs, policy_loss, value_loss):
+    def _update_history(self, history: Dict, episode_rewards: List, 
+                      epoch: int, epochs: int, policy_loss: float, 
+                      value_loss: float) -> List:
         """
         Actualiza y muestra las métricas de entrenamiento.
         
-        Args:
-            history: Historial de entrenamiento a actualizar
-            episode_rewards: Recompensas de episodios completados
-            epoch: Época actual
-            epochs: Total de épocas
-            policy_loss, value_loss: Pérdidas del modelo
+        Parámetros:
+        -----------
+        history : Dict
+            Historial de entrenamiento a actualizar
+        episode_rewards : List
+            Recompensas de episodios completados
+        epoch : int
+            Época actual
+        epochs : int
+            Total de épocas
+        policy_loss : float
+            Pérdida de política
+        value_loss : float
+            Pérdida de valor
+            
+        Retorna:
+        --------
+        List
+            Lista actualizada de recompensas de episodios
         """
         # Guardar estadísticas
         history['policy_losses'].append(self.policy_loss_metric.result().numpy())
@@ -452,17 +575,25 @@ class A2C:
         
         return episode_rewards
 
-    def train(self, env, n_steps=10, epochs=1000, render=False):
+    def train(self, env, n_steps: int = 10, epochs: int = 1000, 
+             render: bool = False) -> Dict:
         """
         Entrena el modelo A2C en el entorno dado.
         
-        Args:
-            env: Entorno donde entrenar
-            n_steps: Número de pasos por actualización
-            epochs: Número de épocas de entrenamiento
-            render: Si se debe renderizar el entorno
+        Parámetros:
+        -----------
+        env : gym.Env
+            Entorno donde entrenar
+        n_steps : int, opcional
+            Número de pasos por actualización
+        epochs : int, opcional
+            Número de épocas de entrenamiento
+        render : bool, opcional
+            Si se debe renderizar el entorno
             
-        Returns:
+        Retorna:
+        --------
+        Dict
             Historia de entrenamiento
         """
         # Historia de entrenamiento
@@ -486,7 +617,7 @@ class A2C:
             )
             
             # Obtener valor del último estado si es necesario
-            next_value = self.model.get_value(state).numpy() if not dones[-1] else 0
+            next_value = self.model.get_value(state) if not dones[-1] else 0
             
             # Actualizar modelo
             policy_loss, value_loss, _ = self._update_model(
@@ -500,41 +631,84 @@ class A2C:
         
         return history
     
-    def save_model(self, filepath):
-        """Guarda el modelo en un archivo."""
+    def save_model(self, filepath: str) -> None:
+        """
+        Guarda el modelo en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
         self.model.save_weights(filepath)
         
-    def load_model(self, filepath):
-        """Carga el modelo desde un archivo."""
+    def load_model(self, filepath: str) -> None:
+        """
+        Carga el modelo desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
         # Asegurarse de que el modelo está construido primero
         dummy_state = np.zeros((1, self.state_dim))
         self.model(dummy_state)
         self.model.load_weights(filepath)
 
 
-class A3C(A2C):
+class a3c(a2c):
     """
     Implementación de Asynchronous Advantage Actor-Critic (A3C).
     
     Extiende A2C para permitir entrenamiento asíncrono con múltiples trabajadores.
+    
+    Parámetros:
+    -----------
+    state_dim : int
+        Dimensión del espacio de estados
+    action_dim : int
+        Dimensión del espacio de acciones
+    continuous : bool, opcional
+        Indica si el espacio de acciones es continuo o discreto
+    n_workers : int, opcional
+        Número de trabajadores asíncronos
+    learning_rate : float, opcional
+        Tasa de aprendizaje
+    gamma : float, opcional
+        Factor de descuento
+    entropy_coef : float, opcional
+        Coeficiente de entropía para exploración
+    value_coef : float, opcional
+        Coeficiente de pérdida de valor
+    max_grad_norm : float, opcional
+        Norma máxima para recorte de gradientes
+    hidden_units : Optional[List[int]], opcional
+        Unidades ocultas por capa
     """
-    def __init__(self, state_dim, action_dim, continuous=True, n_workers=4, **kwargs):
-        super(A3C, self).__init__(state_dim, action_dim, continuous, **kwargs)
+    def __init__(self, state_dim: int, action_dim: int, continuous: bool = True, 
+                n_workers: int = 4, **kwargs):
+        super().__init__(state_dim, action_dim, continuous, **kwargs)
         self.n_workers = n_workers
         self.workers = []
     
-    def create_worker(self, env_fn, worker_id):
+    def create_worker(self, env_fn: Callable, worker_id: int) -> 'a3c_worker':
         """
         Crea un trabajador para entrenamiento asíncrono.
         
-        Args:
-            env_fn: Función que devuelve un entorno
-            worker_id: ID del trabajador
+        Parámetros:
+        -----------
+        env_fn : Callable
+            Función que devuelve un entorno
+        worker_id : int
+            ID del trabajador
             
-        Returns:
+        Retorna:
+        --------
+        a3c_worker
             Un trabajador A3C
         """
-        return A3CWorker(
+        return a3c_worker(
             self.model,
             self.optimizer,
             env_fn,
@@ -548,17 +722,25 @@ class A3C(A2C):
             self.continuous
         )
     
-    def train_async(self, env_fn, n_steps=10, total_steps=1000000, render=False):
+    def train_async(self, env_fn: Callable, n_steps: int = 10, 
+                   total_steps: int = 1000000, render: bool = False) -> Dict:
         """
         Entrena el modelo A3C con múltiples trabajadores asíncronos.
         
-        Args:
-            env_fn: Función que devuelve un entorno
-            n_steps: Pasos por actualización
-            total_steps: Total de pasos globales
-            render: Si se debe renderizar el entorno
+        Parámetros:
+        -----------
+        env_fn : Callable
+            Función que devuelve un entorno
+        n_steps : int, opcional
+            Pasos por actualización
+        total_steps : int, opcional
+            Total de pasos globales
+        render : bool, opcional
+            Si se debe renderizar el entorno
             
-        Returns:
+        Retorna:
+        --------
+        Dict
             Historia de entrenamiento
         """
         # Crear trabajadores
@@ -583,6 +765,7 @@ class A3C(A2C):
                 args=(n_steps, total_steps // self.n_workers, history, render)
             )
             threads.append(thread)
+            thread.daemon = True  # Terminar hilos cuando el programa principal termina
             thread.start()
         
         # Esperar a que terminen todos los hilos
@@ -592,24 +775,49 @@ class A3C(A2C):
         return history
 
 
-class A3CWorker:
+class a3c_worker:
     """
     Trabajador para el algoritmo A3C que entrena de forma asíncrona.
+    
+    Parámetros:
+    -----------
+    global_model : actor_critic_model
+        Modelo compartido global
+    optimizer : tf.keras.optimizers.Optimizer
+        Optimizador compartido
+    env_fn : Callable
+        Función que devuelve un entorno
+    worker_id : int
+        ID del trabajador
+    state_dim : int
+        Dimensión del espacio de estados
+    action_dim : int
+        Dimensión del espacio de acciones
+    gamma : float
+        Factor de descuento
+    entropy_coef : float
+        Coeficiente de entropía
+    value_coef : float
+        Coeficiente de pérdida de valor
+    max_grad_norm : float
+        Norma máxima para recorte de gradientes
+    continuous : bool
+        Indica si el espacio de acciones es continuo
     """
     def __init__(
         self,
-        global_model,
-        optimizer,
-        env_fn,
-        worker_id,
-        state_dim,
-        action_dim,
-        gamma=0.99,
-        entropy_coef=0.01,
-        value_coef=0.5,
-        max_grad_norm=0.5,
-        continuous=True
-    ):
+        global_model: actor_critic_model,
+        optimizer: tf.keras.optimizers.Optimizer,
+        env_fn: Callable,
+        worker_id: int,
+        state_dim: int,
+        action_dim: int,
+        gamma: float = 0.99,
+        entropy_coef: float = 0.01,
+        value_coef: float = 0.5,
+        max_grad_norm: float = 0.5,
+        continuous: bool = True
+    ) -> None:
         # Parámetros del trabajador
         self.worker_id = worker_id
         self.env = env_fn()
@@ -626,29 +834,39 @@ class A3CWorker:
         self.optimizer = optimizer
         
         # Modelo local para este trabajador
-        self.local_model = ActorCriticModel(
+        self.local_model = actor_critic_model(
             state_dim, action_dim, continuous, 
             hidden_units=A2C_A3C_CONFIG['hidden_units']
         )
         # Sincronizar pesos locales con globales
         self.update_local_model()
     
-    def update_local_model(self):
-        """Actualiza los pesos del modelo local desde el modelo global."""
+    def update_local_model(self) -> None:
+        """
+        Actualiza los pesos del modelo local desde el modelo global.
+        """
         self.local_model.set_weights(self.global_model.get_weights())
     
-    def compute_returns_advantages(self, rewards, values, dones, next_value):
+    def compute_returns_advantages(self, rewards: np.ndarray, values: np.ndarray, 
+                                 dones: np.ndarray, next_value: float) -> Tuple[np.ndarray, np.ndarray]:
         """
         Calcula los retornos y ventajas para los estados visitados.
         
-        Args:
-            rewards: Recompensas recibidas
-            values: Valores estimados para los estados actuales
-            dones: Indicadores de fin de episodio
-            next_value: Valor estimado para el estado final
+        Parámetros:
+        -----------
+        rewards : np.ndarray
+            Recompensas recibidas
+        values : np.ndarray
+            Valores estimados para los estados actuales
+        dones : np.ndarray
+            Indicadores de fin de episodio
+        next_value : float
+            Valor estimado para el estado final
             
-        Returns:
-            returns y ventajas calculados
+        Retorna:
+        --------
+        Tuple[np.ndarray, np.ndarray]
+            (returns, advantages) calculados
         """
         # Añadir el valor del último estado
         values = np.append(values, next_value)
@@ -678,18 +896,26 @@ class A3CWorker:
         
         return returns, advantages
     
-    def train_step(self, states, actions, returns, advantages):
+    def train_step(self, states: tf.Tensor, actions: tf.Tensor, 
+                  returns: tf.Tensor, advantages: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         Realiza un paso de entrenamiento asíncrono.
         
-        Args:
-            states: Estados observados
-            actions: Acciones tomadas
-            returns: Retornos calculados
-            advantages: Ventajas calculadas
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados observados
+        actions : tf.Tensor
+            Acciones tomadas
+        returns : tf.Tensor
+            Retornos calculados
+        advantages : tf.Tensor
+            Ventajas calculadas
             
-        Returns:
-            Pérdidas calculadas
+        Retorna:
+        --------
+        Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]
+            (total_loss, policy_loss, value_loss, entropy_loss)
         """
         with tf.GradientTape() as tape:
             # Evaluar acciones con el modelo local
@@ -725,40 +951,53 @@ class A3CWorker:
         
         return total_loss, policy_loss, value_loss, entropy_loss
     
-    def _collect_step_data(self, state, render):
+    def _collect_step_data(self, state: np.ndarray, render: bool) -> Tuple:
         """
         Recoge datos de un solo paso en el entorno.
         
-        Args:
-            state: Estado actual
-            render: Si se debe renderizar el entorno
+        Parámetros:
+        -----------
+        state : np.ndarray
+            Estado actual
+        render : bool
+            Si se debe renderizar el entorno
             
-        Returns:
-            Tuple con (state, action, value, reward, done)
+        Retorna:
+        --------
+        Tuple
+            (state, action, value, reward, done, next_state)
         """
         if render and self.worker_id == 0:  # Solo renderizar el primer trabajador
             self.env.render()
         
         # Obtener acción y valor con el modelo local
         action = self.local_model.get_action(state)
-        value = self.local_model.get_value(state).numpy()
+        value = self.local_model.get_value(state)
         
         # Ejecutar acción en el entorno
         next_state, reward, done, _, _ = self.env.step(action)
         
         return state, action, value, reward, done, next_state
     
-    def _handle_episode_end(self, episode_reward, steps_done, max_steps, shared_history):
+    def _handle_episode_end(self, episode_reward: float, steps_done: int, 
+                          max_steps: int, shared_history: Dict) -> Tuple[np.ndarray, float]:
         """
         Maneja el final de un episodio.
         
-        Args:
-            episode_reward: Recompensa acumulada en el episodio
-            steps_done: Pasos completados
-            max_steps: Pasos máximos
-            shared_history: Historial compartido
+        Parámetros:
+        -----------
+        episode_reward : float
+            Recompensa acumulada en el episodio
+        steps_done : int
+            Pasos completados
+        max_steps : int
+            Pasos máximos
+        shared_history : Dict
+            Historial compartido
             
-        Returns:
+        Retorna:
+        --------
+        Tuple[np.ndarray, float]
             Nuevo estado y recompensa de episodio reiniciada
         """
         state, _ = self.env.reset()
@@ -775,18 +1014,34 @@ class A3CWorker:
         
         return state, 0  # Nuevo estado y recompensa reiniciada
     
-    def _update_model_with_collected_data(self, states, actions, rewards, dones, values, done, next_state, shared_history):
+    def _update_model_with_collected_data(self, states: List, actions: List,
+                                        rewards: List, dones: List,
+                                        values: List, done: bool,
+                                        next_state: np.ndarray, shared_history: Dict) -> None:
         """
         Actualiza el modelo con los datos recolectados.
         
-        Args:
-            states, actions, rewards, dones, values: Datos recolectados
-            done: Si el episodio terminó
-            next_state: Estado final
-            shared_history: Historial compartido
+        Parámetros:
+        -----------
+        states : List
+            Estados recolectados
+        actions : List
+            Acciones tomadas
+        rewards : List
+            Recompensas recibidas
+        dones : List
+            Indicadores de fin de episodio
+        values : List
+            Valores estimados
+        done : bool
+            Si el episodio terminó
+        next_state : np.ndarray
+            Estado final
+        shared_history : Dict
+            Historial compartido
         """
         # Si el episodio no terminó, calcular valor del último estado
-        next_value = 0 if done else self.local_model.get_value(next_state).numpy()
+        next_value = 0.0 if done else self.local_model.get_value(next_state)
             
         # Convertir a arrays de numpy
         states_np = np.array(states, dtype=np.float32)
@@ -802,7 +1057,10 @@ class A3CWorker:
         
         # Actualizar modelo
         _, policy_loss, value_loss, entropy_loss = self.train_step(
-            states_np, actions_np, returns, advantages
+            tf.convert_to_tensor(states_np),
+            tf.convert_to_tensor(actions_np),
+            tf.convert_to_tensor(returns),
+            tf.convert_to_tensor(advantages)
         )
         
         # Guardar estadísticas
@@ -811,15 +1069,21 @@ class A3CWorker:
             shared_history['value_losses'].append(value_loss.numpy())
             shared_history['entropy_losses'].append(entropy_loss.numpy())
     
-    def train(self, n_steps, max_steps, shared_history, render=False):
+    def train(self, n_steps: int, max_steps: int, shared_history: Dict, 
+             render: bool = False) -> None:
         """
         Entrenamiento asíncrono del trabajador.
         
-        Args:
-            n_steps: Pasos por actualización
-            max_steps: Pasos máximos para este trabajador
-            shared_history: Diccionario compartido para seguimiento
-            render: Si se debe renderizar el entorno
+        Parámetros:
+        -----------
+        n_steps : int
+            Pasos por actualización
+        max_steps : int
+            Pasos máximos para este trabajador
+        shared_history : Dict
+            Diccionario compartido para seguimiento
+        render : bool, opcional
+            Si se debe renderizar el entorno
         """
         # Estado inicial
         state, _ = self.env.reset()
@@ -833,6 +1097,9 @@ class A3CWorker:
             
             # Recolectar experiencia durante n pasos
             for _ in range(n_steps):
+                if steps_done >= max_steps:
+                    break
+                    
                 # Recolectar datos de un paso
                 current_state, action, value, reward, done, next_state = self._collect_step_data(state, render)
                 
