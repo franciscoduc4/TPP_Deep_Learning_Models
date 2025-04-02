@@ -20,7 +20,8 @@ import matplotlib.pyplot as plt
 
 # %%
 # Los sujetos están en la raíz y cada archivo comienza con "Subject"
-subject_folder = os.path.join(os.getcwd(), "data", "Subjects")
+PROJECT_DIR = os.path.abspath(os.path.join(os.getcwd(), ".."))
+subject_folder = os.path.join(PROJECT_DIR, "data", "Subjects")
 subject_files = [f for f in os.listdir(subject_folder) if f.startswith("Subject") and f.endswith(".xlsx")]
 print(f"Total de sujetos: {len(subject_files)}")
 

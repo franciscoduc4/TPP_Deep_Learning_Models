@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
-%matplotlib inline
+
 import matplotlib.pyplot as plt
 import os
 from joblib import Parallel, delayed
@@ -17,6 +17,8 @@ from datetime import timedelta
 import time
 from tqdm import tqdm
 from sklearn.model_selection import KFold
+
+PROJECT_DIR = os.path.abspath(os.path.join(os.getcwd(), ".."))
 
 # Global configuration
 CONFIG = {
@@ -31,7 +33,7 @@ CONFIG = {
     "cap_bg": 300,
     "cap_iob": 5,
     "cap_carb": 150,
-    "data_path": os.path.join(os.getcwd(), "subjects")
+    "data_path": os.path.join(PROJECT_DIR, "data", "subjects")
 }
 
 # %% CELL: Device Check

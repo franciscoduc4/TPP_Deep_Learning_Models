@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 # %%
 # Obtener los archivos de los sujetos
 # Definición de la ruta del proyecto
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), ".."))
 SUBJECTS_RELATIVE_PATH = "data/Subjects"
 SUBJECTS_PATH = os.path.join(PROJECT_ROOT, SUBJECTS_RELATIVE_PATH)
 
