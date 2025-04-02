@@ -5,13 +5,42 @@ from tensorflow.keras.layers import (
     Input, Dense, Dropout, BatchNormalization, 
     LayerNormalization, Concatenate, Activation, Add
 )
+from typing import Dict, Any, Tuple, Optional, List, Union
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import FNN_CONFIG
 
-def create_residual_block(x, units, dropout_rate=0.2, activation='relu', use_layer_norm=True):
+def get_activation(x: tf.Tensor, activation_name: str) -> tf.Tensor:
+    """
+    Aplica la función de activación según su nombre.
+    
+    Parámetros:
+    -----------
+    x : tf.Tensor
+        Tensor al que aplicar la activación
+    activation_name : str
+        Nombre de la función de activación
+        
+    Retorna:
+    --------
+    tf.Tensor
+        Tensor con la activación aplicada
+    """
+    if activation_name == 'relu':
+        return tf.nn.relu(x)
+    elif activation_name == 'gelu':
+        return tf.nn.gelu(x)
+    elif activation_name == 'swish':
+        return tf.nn.swish(x)
+    elif activation_name == 'silu':
+        return tf.nn.silu(x)
+    else:
+        return tf.nn.relu(x)  # Valor por defecto
+
+def create_residual_block(x: tf.Tensor, units: int, dropout_rate: float = 0.2, 
+                         activation: str = 'relu', use_layer_norm: bool = True) -> tf.Tensor:
     """
     Crea un bloque residual para FNN con normalización y dropout.
     
@@ -63,7 +92,8 @@ def create_residual_block(x, units, dropout_rate=0.2, activation='relu', use_lay
     
     return x
 
-def create_fnn_model(input_shape, other_features_shape=None):
+def create_fnn_model(input_shape: tuple, 
+                    other_features_shape: Optional[tuple] = None) -> Model:
     """
     Crea un modelo de red neuronal feedforward (FNN) con características modernas.
     
@@ -118,7 +148,8 @@ def create_fnn_model(input_shape, other_features_shape=None):
     
     # Capas finales con estrechamiento progresivo
     for i, units in enumerate(FNN_CONFIG['final_units']):
-        x = Dense(units, activation=FNN_CONFIG['activation'])(x)
+        x = Dense(units)(x)
+        x = Activation(FNN_CONFIG['activation'])(x)
         if FNN_CONFIG['use_layer_norm']:
             x = LayerNormalization(epsilon=FNN_CONFIG['epsilon'])(x)
         else:
@@ -131,12 +162,14 @@ def create_fnn_model(input_shape, other_features_shape=None):
     else:
         output = Dense(FNN_CONFIG['num_classes'], activation='softmax')(x)
     
-    # Crear y compilar el modelo
+    # Crear el modelo
     model = Model(inputs=inputs, outputs=output)
     
     return model
 
-def compile_fnn_model(model, loss=None, metrics=None):
+def compile_fnn_model(model: Model, 
+                     loss: Optional[Union[str, tf.keras.losses.Loss]] = None, 
+                     metrics: Optional[List[Union[str, tf.keras.metrics.Metric]]] = None) -> Model:
     """
     Compila un modelo FNN con la configuración especificada.
     
@@ -175,7 +208,13 @@ def compile_fnn_model(model, loss=None, metrics=None):
     
     return model
 
-def train_fnn_model(model, x_train, y_train, x_val=None, y_val=None, batch_size=None, epochs=None):
+def train_fnn_model(model: Model, 
+                   x_train: Union[tf.Tensor, Tuple[tf.Tensor, ...], List[tf.Tensor]], 
+                   y_train: tf.Tensor, 
+                   x_val: Optional[Union[tf.Tensor, Tuple[tf.Tensor, ...], List[tf.Tensor]]] = None, 
+                   y_val: Optional[tf.Tensor] = None, 
+                   batch_size: Optional[int] = None, 
+                   epochs: Optional[int] = None) -> tf.keras.callbacks.History:
     """
     Entrena un modelo FNN con los datos proporcionados.
     

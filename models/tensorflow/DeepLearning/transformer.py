@@ -6,22 +6,39 @@ from tensorflow.keras.layers import (
     MultiHeadAttention, GlobalAveragePooling1D, Concatenate, Add
 )
 from keras.saving import register_keras_serializable
+from typing import Tuple, Dict, Any, Optional, List, Union, Callable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import TRANSFORMER_CONFIG
 
-class PositionEncoding(tf.keras.layers.Layer):
+@register_keras_serializable()
+class position_encoding(tf.keras.layers.Layer):
     """
     Codificación posicional para el Transformer.
+    
+    Parámetros:
+    -----------
+    max_position : int
+        Posición máxima a codificar
+    d_model : int
+        Dimensión del modelo
     """
     def __init__(self, max_position: int, d_model: int, **kwargs):
         super().__init__(**kwargs)
         self.max_position = max_position
         self.d_model = d_model
         
-    def build(self, input_shape):
+    def build(self, input_shape: Tuple) -> None:
+        """
+        Construye la capa de codificación posicional.
+        
+        Parámetros:
+        -----------
+        input_shape : Tuple
+            Forma de la entrada
+        """
         positions = tf.range(self.max_position, dtype=tf.float32)[:, tf.newaxis]
         dimensions = tf.range(self.d_model, dtype=tf.float32)[tf.newaxis, :]
         angle_rates = 1 / tf.pow(10000.0, (2 * (dimensions // 2)) / tf.cast(self.d_model, tf.float32))
@@ -35,12 +52,70 @@ class PositionEncoding(tf.keras.layers.Layer):
 
         self.pos_encoding = tf.reshape(pos_encoding, [self.max_position, self.d_model])
         
-    def call(self, inputs):
+    def call(self, inputs: tf.Tensor) -> tf.Tensor:
+        """
+        Aplica la codificación posicional a las entradas.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de entrada
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Tensor con codificación posicional añadida
+        """
         sequence_length = tf.shape(inputs)[1]
         return inputs + self.pos_encoding[:sequence_length, :]
+        
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración de la capa.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración de la capa
+        """
+        config = super().get_config()
+        config.update({
+            "max_position": self.max_position,
+            "d_model": self.d_model
+        })
+        return config
 
+def apply_activation(x: tf.Tensor, activation_name: str) -> tf.Tensor:
+    """
+    Aplica una función de activación a un tensor.
+    
+    Parámetros:
+    -----------
+    x : tf.Tensor
+        Tensor de entrada
+    activation_name : str
+        Nombre de la función de activación
+        
+    Retorna:
+    --------
+    tf.Tensor
+        Tensor con la activación aplicada
+    """
+    if activation_name == 'gelu':
+        return tf.nn.gelu(x)
+    elif activation_name == 'relu':
+        return tf.nn.relu(x)
+    elif activation_name == 'selu':
+        return tf.nn.selu(x)
+    elif activation_name == 'sigmoid':
+        return tf.nn.sigmoid(x)
+    elif activation_name == 'tanh':
+        return tf.nn.tanh(x)
+    else:
+        return tf.nn.relu(x)  # Por defecto
 
-def create_transformer_block(inputs, head_size, num_heads, ff_dim, dropout_rate, prenorm=True):
+def create_transformer_block(inputs: tf.Tensor, head_size: int, num_heads: int, 
+                           ff_dim: int, dropout_rate: float, prenorm: bool = True) -> tf.Tensor:
     """
     Crea un bloque Transformer mejorado con pre/post normalización.
     
@@ -65,7 +140,7 @@ def create_transformer_block(inputs, head_size, num_heads, ff_dim, dropout_rate,
         Tensor procesado
     """
     if prenorm:
-        # Pre-normalization architecture (better training stability)
+        # Pre-normalization architecture (mejor estabilidad de entrenamiento)
         x = LayerNormalization(epsilon=TRANSFORMER_CONFIG['epsilon'])(inputs)
         x = MultiHeadAttention(
             num_heads=num_heads,
@@ -77,9 +152,10 @@ def create_transformer_block(inputs, head_size, num_heads, ff_dim, dropout_rate,
         x = Dropout(dropout_rate)(x)
         res1 = Add()([inputs, x])
         
-        # Feed-forward network
+        # Red feed-forward
         x = LayerNormalization(epsilon=TRANSFORMER_CONFIG['epsilon'])(res1)
-        x = Dense(ff_dim, activation=TRANSFORMER_CONFIG['activation'])(x)
+        x = Dense(ff_dim)(x)
+        x = apply_activation(x, TRANSFORMER_CONFIG['activation'])
         x = Dropout(dropout_rate)(x)
         x = Dense(inputs.shape[-1])(x)
         x = Dropout(dropout_rate)(x)
@@ -96,8 +172,9 @@ def create_transformer_block(inputs, head_size, num_heads, ff_dim, dropout_rate,
         attn = Dropout(dropout_rate)(attn)
         res1 = LayerNormalization(epsilon=TRANSFORMER_CONFIG['epsilon'])(inputs + attn)
         
-        # Feed-forward network
-        ffn = Dense(ff_dim, activation=TRANSFORMER_CONFIG['activation'])(res1)
+        # Red feed-forward
+        ffn = Dense(ff_dim)(res1)
+        ffn = apply_activation(ffn, TRANSFORMER_CONFIG['activation'])
         ffn = Dropout(dropout_rate)(ffn)
         ffn = Dense(inputs.shape[-1])(ffn)
         ffn = Dropout(dropout_rate)(ffn)
@@ -110,9 +187,9 @@ def create_transformer_model(cgm_shape: tuple, other_features_shape: tuple) -> M
     Parámetros:
     -----------
     cgm_shape : tuple
-        Forma de los datos CGM (samples, timesteps, features)
+        Forma de los datos CGM (muestras, pasos_temporales, características)
     other_features_shape : tuple
-        Forma de otras características (samples, features)
+        Forma de otras características (muestras, características)
         
     Retorna:
     --------
@@ -125,7 +202,7 @@ def create_transformer_model(cgm_shape: tuple, other_features_shape: tuple) -> M
     # Proyección inicial y codificación posicional
     x = Dense(TRANSFORMER_CONFIG['key_dim'] * TRANSFORMER_CONFIG['num_heads'])(cgm_input)
     if TRANSFORMER_CONFIG['use_relative_pos']:
-        x = PositionEncoding(
+        x = position_encoding(
             TRANSFORMER_CONFIG['max_position'],
             TRANSFORMER_CONFIG['key_dim'] * TRANSFORMER_CONFIG['num_heads']
         )(x)
@@ -151,14 +228,20 @@ def create_transformer_model(cgm_shape: tuple, other_features_shape: tuple) -> M
     
     # MLP final con residual connections
     skip = x
-    x = Dense(128, activation=TRANSFORMER_CONFIG['activation'])(x)
+    x = Dense(128)(x)
+    x = apply_activation(x, TRANSFORMER_CONFIG['activation'])
     x = LayerNormalization(epsilon=TRANSFORMER_CONFIG['epsilon'])(x)
     x = Dropout(TRANSFORMER_CONFIG['dropout_rate'])(x)
-    x = Dense(128, activation=TRANSFORMER_CONFIG['activation'])(x)
+    
+    x = Dense(128)(x)
+    x = apply_activation(x, TRANSFORMER_CONFIG['activation'])
+    
+    # Skip connection si las dimensiones coinciden
     if skip.shape[-1] == 128:
         x = Add()([x, skip])
     
-    x = Dense(64, activation=TRANSFORMER_CONFIG['activation'])(x)
+    x = Dense(64)(x)
+    x = apply_activation(x, TRANSFORMER_CONFIG['activation'])
     x = LayerNormalization(epsilon=TRANSFORMER_CONFIG['epsilon'])(x)
     x = Dropout(TRANSFORMER_CONFIG['dropout_rate'])(x)
     

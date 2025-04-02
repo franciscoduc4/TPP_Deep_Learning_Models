@@ -6,11 +6,37 @@ from tensorflow.keras.layers import (
     Concatenate, Bidirectional, TimeDistributed, MaxPooling1D
 )
 from keras.saving import register_keras_serializable
+from typing import Tuple, Dict, Any, Optional, List, Callable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import RNN_CONFIG
+
+def get_activation_fn(activation_name: str) -> Callable:
+    """
+    Obtiene la función de activación según su nombre.
+    
+    Parámetros:
+    -----------
+    activation_name : str
+        Nombre de la función de activación
+        
+    Retorna:
+    --------
+    Callable
+        Función de activación
+    """
+    if activation_name == 'relu':
+        return tf.nn.relu
+    elif activation_name == 'tanh':
+        return tf.nn.tanh
+    elif activation_name == 'sigmoid':
+        return tf.nn.sigmoid
+    elif activation_name == 'swish':
+        return tf.nn.swish
+    else:
+        return tf.nn.relu  # Por defecto
 
 def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     """
@@ -34,7 +60,9 @@ def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     
     # Procesamiento temporal distribuido inicial
     if RNN_CONFIG['use_time_distributed']:
-        x = TimeDistributed(Dense(32, activation=RNN_CONFIG['activation']))(cgm_input)
+        # Usar función de activación explícita en lugar de string
+        x = TimeDistributed(Dense(32))(cgm_input)
+        x = tf.keras.layers.Activation(get_activation_fn(RNN_CONFIG['activation']))(x)
         x = TimeDistributed(BatchNormalization(epsilon=RNN_CONFIG['epsilon']))(x)
     else:
         x = cgm_input
@@ -81,7 +109,8 @@ def create_rnn_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
     x = Concatenate()([x, other_input])
     
     # Reducir capas densas
-    x = Dense(32, activation=RNN_CONFIG['activation'])(x)
+    x = Dense(32)(x)
+    x = tf.keras.layers.Activation(get_activation_fn(RNN_CONFIG['activation']))(x)
     x = BatchNormalization(epsilon=RNN_CONFIG['epsilon'])(x)
     x = Dropout(RNN_CONFIG['dropout_rate'])(x)
     

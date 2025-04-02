@@ -2,87 +2,189 @@ import os, sys
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
-    Input, Dense, BatchNormalization, Concatenate, Activation
+    Input, Dense, BatchNormalization, Concatenate, Activation,
+    LayerNormalization, Dropout, Add, Flatten
 )
 from keras.saving import register_keras_serializable
+from typing import Tuple, Dict, Any, Optional, List, Union
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import TABNET_CONFIG
 
-class GLU(tf.keras.layers.Layer):
+@register_keras_serializable()
+class glu(tf.keras.layers.Layer):
     """
     Gated Linear Unit como capa personalizada.
+    
+    Parámetros:
+    -----------
+    units : int
+        Número de unidades de salida
     """
-    def __init__(self, units, **kwargs):
+    def __init__(self, units: int, **kwargs):
         super().__init__(**kwargs)
         self.units = units
         self.dense = Dense(units * 2)
 
-    def call(self, inputs):
+    def call(self, inputs: tf.Tensor) -> tf.Tensor:
+        """
+        Aplica la capa GLU a las entradas.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de entrada
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Tensor procesado
+        """
         x = self.dense(inputs)
         return x[:, :self.units] * tf.nn.sigmoid(x[:, self.units:])
+    
+    def get_config(self) -> Dict:
+        config = super().get_config()
+        config.update({
+            "units": self.units
+        })
+        return config
 
-class MultiHeadFeatureAttention(tf.keras.layers.Layer):
+@register_keras_serializable()
+class multi_head_feature_attention(tf.keras.layers.Layer):
     """
     Atención multi-cabeza para características.
+    
+    Parámetros:
+    -----------
+    num_heads : int
+        Número de cabezas de atención
+    key_dim : int
+        Dimensión de las claves
+    dropout : float
+        Tasa de dropout
     """
     def __init__(self, num_heads: int, key_dim: int, dropout: float = 0.0, **kwargs):
         super().__init__(**kwargs)
         self.num_heads = num_heads
         self.key_dim = key_dim
+        self.dropout = dropout
         self.attention = tf.keras.layers.MultiHeadAttention(
             num_heads=num_heads,
             key_dim=key_dim,
             dropout=dropout
         )
-        self.layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm = LayerNormalization(epsilon=1e-6)
     
-    def call(self, inputs, training=None):
+    def call(self, inputs: tf.Tensor, training: Optional[bool] = None) -> tf.Tensor:
+        """
+        Aplica atención multi-cabeza a las entradas.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de entrada
+        training : bool, opcional
+            Indica si está en modo entrenamiento
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Tensor procesado
+        """
         attention_output = self.attention(inputs, inputs, training=training)
         return self.layernorm(inputs + attention_output)
+    
+    def get_config(self) -> Dict:
+        config = super().get_config()
+        config.update({
+            "num_heads": self.num_heads,
+            "key_dim": self.key_dim,
+            "dropout": self.dropout
+        })
+        return config
 
-class EnhancedFeatureTransformer(tf.keras.layers.Layer):
+@register_keras_serializable()
+class enhanced_feature_transformer(tf.keras.layers.Layer):
     """
     Transformador de características mejorado con atención y ghost batch norm.
+    
+    Parámetros:
+    -----------
+    feature_dim : int
+        Dimensión de las características
+    num_heads : int
+        Número de cabezas de atención
+    virtual_batch_size : int
+        Tamaño del batch virtual
+    dropout_rate : float
+        Tasa de dropout
     """
     def __init__(self, feature_dim: int, num_heads: int, 
-                 virtual_batch_size: int, dropout_rate: float = 0.1, **kwargs):
+                virtual_batch_size: int, dropout_rate: float = 0.1, **kwargs):
         super().__init__(**kwargs)
         self.feature_dim = feature_dim
+        self.num_heads = num_heads
         self.virtual_batch_size = virtual_batch_size
+        self.dropout_rate = dropout_rate
         
         # GLU layers
-        self.glu1 = GLU(feature_dim)
-        self.glu2 = GLU(feature_dim)
+        self.glu1 = glu(feature_dim)
+        self.glu2 = glu(feature_dim)
         
         # Attention layer
-        self.attention = MultiHeadFeatureAttention(
+        self.attention = multi_head_feature_attention(
             num_heads=num_heads,
             key_dim=feature_dim // num_heads,
             dropout=dropout_rate
         )
         
         # Ghost Batch Normalization
-        self.ghost_bn1 = tf.keras.layers.BatchNormalization(
+        self.ghost_bn1 = BatchNormalization(
             virtual_batch_size=virtual_batch_size
         )
-        self.ghost_bn2 = tf.keras.layers.BatchNormalization(
+        self.ghost_bn2 = BatchNormalization(
             virtual_batch_size=virtual_batch_size
         )
         
-        self.dropout = tf.keras.layers.Dropout(dropout_rate)
+        self.dropout = Dropout(dropout_rate)
 
-    def call(self, inputs, training=None):
+    def call(self, inputs: tf.Tensor, training: Optional[bool] = None) -> tf.Tensor:
+        """
+        Aplica transformación a las características.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de entrada
+        training : bool, opcional
+            Indica si está en modo entrenamiento
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Tensor transformado
+        """
         x = self.glu1(inputs)
         x = self.ghost_bn1(x, training=training)
         x = self.attention(x, training=training)
         x = self.glu2(x)
         x = self.ghost_bn2(x, training=training)
         return self.dropout(x, training=training)
+    
+    def get_config(self) -> Dict:
+        config = super().get_config()
+        config.update({
+            "feature_dim": self.feature_dim,
+            "num_heads": self.num_heads,
+            "virtual_batch_size": self.virtual_batch_size,
+            "dropout_rate": self.dropout_rate
+        })
+        return config
 
-def custom_softmax(x: tf.Tensor, axis: int=-1) -> tf.Tensor:
+def custom_softmax(x: tf.Tensor, axis: int = -1) -> tf.Tensor:
     """
     Implementación de softmax con estabilidad numérica.
 
@@ -96,67 +198,33 @@ def custom_softmax(x: tf.Tensor, axis: int=-1) -> tf.Tensor:
     Retorna:
     --------
     tf.Tensor
-        Tensor normal
+        Tensor normalizado
     """
     exp_x = tf.exp(x - tf.reduce_max(x, axis=axis, keepdims=True))
     return exp_x / tf.reduce_sum(exp_x, axis=axis, keepdims=True)
 
-def glu(x: tf.Tensor, n_units: int) -> tf.Tensor:
-    """
-    Gated Linear Unit.
-    
-    Parámetros:
-    -----------
-    x : tf.Tensor
-        Tensor de entrada
-    n_units : int
-        Número de unidades
-
-    Retorna:
-    --------
-    tf.Tensor
-        Tensor GLU
-    """
-    return x[:, :n_units] * tf.nn.sigmoid(x[:, n_units:])
-
-def feature_transformer(x: tf.Tensor, feature_dim: int, batch_momentum: float=0.98) -> tf.Tensor:
-    """
-    Transformador de características.
-
-    Parámetros:
-    -----------
-    x : tf.Tensor
-        Tensor de entrada
-    feature_dim : int
-        Dimensión de las características
-    batch_momentum : float
-        Momento de la normalización por lotes
-    
-    Retorna:
-    --------
-    tf.Tensor
-        Tensor transform
-    """
-    transform = Dense(feature_dim * 2)(x)
-    transform = glu(transform, feature_dim)
-    return BatchNormalization(momentum=batch_momentum)(transform)
-
-
-class TabNetModel(tf.keras.Model):
+class tabnet_model(tf.keras.Model):
     """
     Modelo TabNet personalizado con manejo de pérdidas de entropía.
+    
+    Parámetros:
+    -----------
+    cgm_shape : tuple
+        Forma de los datos CGM
+    other_features_shape : tuple
+        Forma de otras características
     """
-    def __init__(self, cgm_shape, other_features_shape, **kwargs):
+    def __init__(self, cgm_shape: tuple, other_features_shape: tuple, **kwargs):
         super().__init__(**kwargs)
         self.cgm_shape = cgm_shape
         self.other_shape = other_features_shape
         self.entropy_tracker = tf.keras.metrics.Mean(name='entropy_loss')
         
         # Definir capas
-        self.flatten = tf.keras.layers.Flatten()
-        self.feature_dropout = tf.keras.layers.Dropout(TABNET_CONFIG['feature_dropout'])
+        self.flatten = Flatten()
+        self.feature_dropout = Dropout(TABNET_CONFIG['feature_dropout'])
         self.transformers = [
-            EnhancedFeatureTransformer(
+            enhanced_feature_transformer(
                 feature_dim=TABNET_CONFIG['feature_dim'],
                 num_heads=TABNET_CONFIG['num_attention_heads'],
                 virtual_batch_size=TABNET_CONFIG['virtual_batch_size'],
@@ -165,15 +233,34 @@ class TabNetModel(tf.keras.Model):
         ]
         
         # Capas finales
-        self.final_dense1 = Dense(TABNET_CONFIG['output_dim'], activation='selu')
-        self.final_norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.final_dropout = tf.keras.layers.Dropout(TABNET_CONFIG['attention_dropout'])
-        self.final_dense2 = Dense(TABNET_CONFIG['output_dim'] // 2, activation='selu')
-        self.final_norm2 = tf.keras.layers.LayerNormalization()
-        self.final_dense3 = Dense(TABNET_CONFIG['output_dim'], activation='selu')
-        self.output_layer = Dense(1)
+        self.final_dense1 = Dense(TABNET_CONFIG['output_dim'])
+        self.final_activation1 = Activation('selu')
+        self.final_norm1 = LayerNormalization(epsilon=1e-6)
+        self.final_dropout = Dropout(TABNET_CONFIG['attention_dropout'])
+        self.final_dense2 = Dense(TABNET_CONFIG['output_dim'] // 2)
+        self.final_activation2 = Activation('selu')
+        self.final_norm2 = LayerNormalization()
+        self.final_dense3 = Dense(TABNET_CONFIG['output_dim'])
+        self.final_activation3 = Activation('selu')
+        self.add_layer = Add()
+        self.output_dense = Dense(1)
 
-    def call(self, inputs, training=None):
+    def call(self, inputs: Tuple[tf.Tensor, tf.Tensor], training: Optional[bool] = None) -> tf.Tensor:
+        """
+        Aplica el modelo TabNet a las entradas.
+        
+        Parámetros:
+        -----------
+        inputs : Tuple[tf.Tensor, tf.Tensor]
+            Tupla de (cgm_input, other_input)
+        training : bool, opcional
+            Indica si está en modo entrenamiento
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones del modelo
+        """
         cgm_input, other_input = inputs
         
         # Procesamiento inicial
@@ -182,7 +269,7 @@ class TabNetModel(tf.keras.Model):
         
         # Feature masking
         if training:
-            feature_mask = self.feature_dropout(tf.ones_like(x))
+            feature_mask = self.feature_dropout(tf.ones_like(x), training=True)
             x = tf.multiply(x, feature_mask)
         
         # Pasos de decisión
@@ -224,38 +311,73 @@ class TabNetModel(tf.keras.Model):
         
         # Capas finales con residual
         x = self.final_dense1(x)
+        x = self.final_activation1(x)
         x = self.final_norm1(x)
         x = self.final_dropout(x, training=training)
         
         skip = x
         x = self.final_dense2(x)
+        x = self.final_activation2(x)
         x = self.final_norm2(x)
         x = self.final_dense3(x)
-        x = tf.keras.layers.Add()([x, skip])
+        x = self.final_activation3(x)
+        x = self.add_layer([x, skip])
         
-        return self.output_layer(x)
+        return self.output_dense(x)
+        
+    def train_step(self, data: Tuple[Tuple[tf.Tensor, tf.Tensor], tf.Tensor]) -> Dict[str, float]:
+        """
+        Paso de entrenamiento personalizado con manejo de pérdida de entropía.
+        
+        Parámetros:
+        -----------
+        data : Tuple[Tuple[tf.Tensor, tf.Tensor], tf.Tensor]
+            Tupla de ((cgm_input, other_input), targets)
+            
+        Retorna:
+        --------
+        Dict[str, float]
+            Diccionario con métricas
+        """
+        inputs, targets = data
+        
+        with tf.GradientTape() as tape:
+            predictions = self(inputs, training=True)
+            loss = self.compiled_loss(targets, predictions, regularization_losses=self.losses)
+            
+        gradients = tape.gradient(loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        
+        # Actualizar métricas
+        self.compiled_metrics.update_state(targets, predictions)
+        metrics = {m.name: m.result() for m in self.metrics}
+        
+        # Añadir pérdida de entropía
+        metrics['entropy_loss'] = self.entropy_tracker.result()
+        
+        return metrics
 
-def create_tabnet_model(cgm_shape: tuple, other_features_shape: tuple) -> Model:
+def create_tabnet_model(cgm_shape: tuple, other_features_shape: tuple) -> tf.keras.Model:
     """
     Crea un modelo TabNet mejorado.
     
     Parámetros:
     -----------
     cgm_shape : tuple
-        Forma de los datos CGM
+        Forma de los datos CGM (muestras, pasos_temporales, características)
     other_features_shape : tuple
-        Forma de otras características
+        Forma de otras características (muestras, características)
         
     Retorna:
     --------
-    Model
+    tf.keras.Model
         Modelo TabNet compilado
     """
-    model = TabNetModel(cgm_shape, other_features_shape)
+    model = tabnet_model(cgm_shape, other_features_shape)
     
     # Build model
-    dummy_cgm = tf.keras.layers.Input(shape=cgm_shape[1:])
-    dummy_other = tf.keras.layers.Input(shape=(other_features_shape[1],))
+    dummy_cgm = Input(shape=cgm_shape[1:])
+    dummy_other = Input(shape=(other_features_shape[1],))
     model([dummy_cgm, dummy_other])
     
     return model
