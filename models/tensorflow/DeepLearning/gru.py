@@ -1,10 +1,15 @@
+import os, sys
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, GRU, Dense, Dropout, LayerNormalization, Concatenate,
     MultiHeadAttention, Add, GlobalAveragePooling1D
 )
 from keras.saving import register_keras_serializable
-from ..config import GRU_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import GRU_CONFIG
 
 def create_gru_attention_block(x, units, num_heads=4):
     """

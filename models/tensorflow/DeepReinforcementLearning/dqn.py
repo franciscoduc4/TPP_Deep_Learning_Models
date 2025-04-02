@@ -1,3 +1,4 @@
+import os, sys
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras.models import Model
@@ -9,7 +10,11 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import Huber
 from collections import deque
 import random
-from ..config import DQN_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import DQN_CONFIG
 
 
 class ReplayBuffer:
@@ -107,40 +112,35 @@ class QNetwork(Model):
             # DQN clásica: predecir valor Q para cada acción
             self.q_output = Dense(action_dim, name='q_values')
     
-    def call(self, inputs, training=False):
-        x = inputs
-        
-        # Procesar características de estado
-        for layer in self.feature_layers:
-            # Para capas de Dropout, pasamos el parámetro training
+    def _apply_layers(self, x, layers, training=False):
+        """Helper method to apply a sequence of layers to input tensor."""
+        for layer in layers:
             if isinstance(layer, Dropout):
                 x = layer(x, training=training)
             else:
                 x = layer(x)
+        return x
+    
+    def _process_dueling_network(self, x, training=False):
+        """Process inputs through dueling network architecture."""
+        # Ventaja para cada acción
+        advantage = self._apply_layers(x, self.advantage_layers, training)
+        advantage = self.advantage_output(advantage)
         
-        # Arquitectura dueling o estándar
+        # Valor del estado
+        value = self._apply_layers(x, self.value_layers, training)
+        value = self.value_output(value)
+        
+        # Combinar ventaja y valor (restando la media de ventajas)
+        return value + (advantage - tf.reduce_mean(advantage, axis=1, keepdims=True))
+    
+    def call(self, inputs, training=False):
+        # Procesar características de estado
+        x = self._apply_layers(inputs, self.feature_layers, training)
+        
+        # Aplicar arquitectura dueling o estándar
         if self.dueling:
-            # Ventaja para cada acción
-            advantage = x
-            for layer in self.advantage_layers:
-                if isinstance(layer, Dropout):
-                    advantage = layer(advantage, training=training)
-                else:
-                    advantage = layer(advantage)
-            advantage = self.advantage_output(advantage)
-            
-            # Valor del estado
-            value = x
-            for layer in self.value_layers:
-                if isinstance(layer, Dropout):
-                    value = layer(value, training=training)
-                else:
-                    value = layer(value)
-            value = self.value_output(value)
-            
-            # Combinar ventaja y valor (restando la media de ventajas)
-            q_values = value + (advantage - tf.reduce_mean(advantage, axis=1, keepdims=True))
-            return q_values
+            return self._process_dueling_network(x, training)
         else:
             # DQN estándar
             return self.q_output(x)
@@ -156,9 +156,10 @@ class QNetwork(Model):
         Returns:
             Acción seleccionada según la política
         """
-        if np.random.random() < epsilon:
+        rng = np.random.default_rng(seed=42)
+        if rng.random() < epsilon:
             # Explorar: acción aleatoria
-            return np.random.randint(0, self.action_dim)
+            return rng.integers(0, self.action_dim)
         else:
             # Explotar: mejor acción según la red
             state = tf.convert_to_tensor([state], dtype=tf.float32)
@@ -177,19 +178,24 @@ class DQN:
         self, 
         state_dim, 
         action_dim,
-        learning_rate=DQN_CONFIG['learning_rate'],
-        gamma=DQN_CONFIG['gamma'],
-        epsilon_start=DQN_CONFIG['epsilon_start'],
-        epsilon_end=DQN_CONFIG['epsilon_end'],
-        epsilon_decay=DQN_CONFIG['epsilon_decay'],
-        buffer_capacity=DQN_CONFIG['buffer_capacity'],
-        batch_size=DQN_CONFIG['batch_size'],
-        target_update_freq=DQN_CONFIG['target_update_freq'],
+        config=None,
         hidden_units=None,
-        dueling=DQN_CONFIG['dueling'],
-        double=DQN_CONFIG['double'],
-        prioritized=DQN_CONFIG['prioritized']
     ):
+        # Use provided config or default DQN_CONFIG
+        self.config = config or DQN_CONFIG
+        
+        # Extract configuration parameters
+        learning_rate = self.config.get('learning_rate', 0.001)
+        gamma = self.config.get('gamma', 0.99)
+        epsilon_start = self.config.get('epsilon_start', 1.0)
+        epsilon_end = self.config.get('epsilon_end', 0.01)
+        epsilon_decay = self.config.get('epsilon_decay', 0.995)
+        buffer_capacity = self.config.get('buffer_capacity', 10000)
+        batch_size = self.config.get('batch_size', 64)
+        target_update_freq = self.config.get('target_update_freq', 100)
+        dueling = self.config.get('dueling', False)
+        double = self.config.get('double', False)
+        prioritized = self.config.get('prioritized', False)
         # Parámetros del entorno y del modelo
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -285,7 +291,7 @@ class DQN:
             
             # Aplicar pesos de importancia para PER si es necesario
             if importance_weights is not None:
-                loss = tf.reduce_mean(importance_weights * tf.square(td_errors))
+                loss = tf.reduce_mean(importance_weights * tf.square(td_errors), axis=0)
             else:
                 loss = self.loss_fn(targets, q_values_for_actions)
         
@@ -295,10 +301,113 @@ class DQN:
         
         # Actualizar métricas
         self.loss_metric.update_state(loss)
-        self.q_metric.update_state(tf.reduce_mean(q_values_for_actions))
+        self.q_metric.update_state(q_values_for_actions)
         
         return loss, td_errors
     
+    def _sample_batch(self):
+        """Helper method to sample a batch from replay buffer."""
+        if self.prioritized:
+            (states, actions, rewards, next_states, dones, 
+             indices, importance_weights) = self.replay_buffer.sample(
+                 self.batch_size, self.beta)
+            self.beta = min(1.0, self.beta + self.beta_increment)
+        else:
+            states, actions, rewards, next_states, dones = self.replay_buffer.sample(
+                self.batch_size)
+            importance_weights = None
+            indices = None
+            
+        return states, actions, rewards, next_states, dones, indices, importance_weights
+    
+    def _update_model(self, episode_loss, update_every):
+        """Helper method to update the model if necessary."""
+        # Entrenar modelo si hay suficientes datos
+        if (len(self.replay_buffer) > self.batch_size and 
+            self.update_counter >= self.update_after and 
+            self.update_counter % update_every == 0):
+            
+            # Muestrear batch
+            states, actions, rewards, next_states, dones, indices, importance_weights = self._sample_batch()
+            
+            # Entrenar red
+            loss, td_errors = self.train_step(
+                states, actions, rewards, next_states, dones, importance_weights)
+            episode_loss.append(loss.numpy())
+            
+            # Actualizar prioridades si es PER
+            if self.prioritized:
+                priorities = np.abs(td_errors.numpy()) + 1e-6
+                self.replay_buffer.update_priorities(indices, priorities)
+                
+        # Actualizar target network periódicamente
+        if self.update_counter % self.target_update_freq == 0 and self.update_counter > 0:
+            self.update_target_network()
+        
+        self.update_counter += 1
+            
+    def _run_episode(self, env, max_steps, render, update_every):
+        """Helper method to run a single episode."""
+        state, _ = env.reset()
+        state = np.array(state, dtype=np.float32)
+        episode_reward = 0
+        episode_loss = []
+        
+        for _ in range(max_steps):
+            # Seleccionar acción
+            action = self.q_network.get_action(state, self.epsilon)
+            
+            # Ejecutar acción
+            next_state, reward, done, _, _ = env.step(action)
+            next_state = np.array(next_state, dtype=np.float32)
+            
+            # Renderizar si es necesario
+            if render:
+                env.render()
+            
+            # Guardar transición en buffer
+            self.replay_buffer.add(state, action, reward, next_state, done)
+            
+            # Actualizar estado y recompensa
+            state = next_state
+            episode_reward += reward
+            
+            # Actualizar modelo
+            self._update_model(episode_loss, update_every)
+            
+            if done:
+                break
+                
+        return episode_reward, episode_loss
+        
+    def _update_history(self, history, episode_reward, episode_loss, episode_reward_history, log_interval):
+        """Helper method to update training history and metrics."""
+        # Almacenar métricas
+        history['episode_rewards'].append(episode_reward)
+        history['epsilons'].append(self.epsilon)
+        if episode_loss:
+            history['losses'].append(np.mean(episode_loss))
+        else:
+            history['losses'].append(0)
+        history['avg_q_values'].append(self.q_metric.result().numpy())
+        
+        # Actualizar epsilon (decaimiento)
+        self.epsilon = max(
+            self.epsilon_end, 
+            self.epsilon * self.epsilon_decay
+        )
+        
+        # Resetear métricas
+        self.loss_metric.reset_states()
+        self.q_metric.reset_states()
+        
+        # Guardar últimas recompensas para promedio
+        episode_reward_history.append(episode_reward)
+        if len(episode_reward_history) > log_interval:
+            episode_reward_history.pop(0)
+            
+        return episode_reward_history
+        
     def train(self, env, episodes=1000, max_steps=1000, update_after=1000, 
              update_every=4, render=False, log_interval=10):
         """
@@ -326,93 +435,17 @@ class DQN:
         # Variables para seguimiento de progreso
         best_reward = -float('inf')
         episode_reward_history = []
+        self.update_after = update_after
         
         for episode in range(episodes):
-            state, _ = env.reset()
-            state = np.array(state, dtype=np.float32)
-            episode_reward = 0
-            episode_loss = []
+            # Ejecutar un episodio
+            episode_reward, episode_loss = self._run_episode(env, max_steps, render, update_every)
             
-            for _ in range(max_steps):
-                # Seleccionar acción
-                action = self.q_network.get_action(state, self.epsilon)
-                
-                # Ejecutar acción
-                next_state, reward, done, _, _ = env.step(action)
-                next_state = np.array(next_state, dtype=np.float32)
-                
-                # Renderizar si es necesario
-                if render:
-                    env.render()
-                
-                # Guardar transición en buffer
-                self.replay_buffer.add(state, action, reward, next_state, done)
-                
-                # Actualizar estado y recompensa
-                state = next_state
-                episode_reward += reward
-                
-                # Entrenar modelo si hay suficientes datos
-                if (len(self.replay_buffer) > self.batch_size and 
-                    self.update_counter >= update_after and 
-                    self.update_counter % update_every == 0):
-                    
-                    # Muestrear batch
-                    if self.prioritized:
-                        (states, actions, rewards, next_states, dones, 
-                         indices, importance_weights) = self.replay_buffer.sample(
-                             self.batch_size, self.beta)
-                        self.beta = min(1.0, self.beta + self.beta_increment)
-                    else:
-                        states, actions, rewards, next_states, dones = self.replay_buffer.sample(
-                            self.batch_size)
-                        importance_weights = None
-                        indices = None
-                    
-                    # Entrenar red
-                    loss, td_errors = self.train_step(
-                        states, actions, rewards, next_states, dones, importance_weights)
-                    episode_loss.append(loss.numpy())
-                    
-                    # Actualizar prioridades si es PER
-                    if self.prioritized:
-                        priorities = np.abs(td_errors.numpy()) + 1e-6
-                        self.replay_buffer.update_priorities(indices, priorities)
-                
-                # Actualizar target network periódicamente
-                if self.update_counter % self.target_update_freq == 0 and self.update_counter > 0:
-                    self.update_target_network()
-                
-                self.update_counter += 1
-                
-                if done:
-                    break
+            # Actualizar historial
+            episode_reward_history = self._update_history(
+                history, episode_reward, episode_loss, episode_reward_history, log_interval)
             
-            # Almacenar métricas
-            history['episode_rewards'].append(episode_reward)
-            history['epsilons'].append(self.epsilon)
-            if episode_loss:
-                history['losses'].append(np.mean(episode_loss))
-            else:
-                history['losses'].append(0)
-            history['avg_q_values'].append(self.q_metric.result().numpy())
-            
-            # Actualizar epsilon (decaimiento)
-            self.epsilon = max(
-                self.epsilon_end, 
-                self.epsilon * self.epsilon_decay
-            )
-            
-            # Resetear métricas
-            self.loss_metric.reset_states()
-            self.q_metric.reset_states()
-            
-            # Guardar últimas recompensas para promedio
-            episode_reward_history.append(episode_reward)
-            if len(episode_reward_history) > log_interval:
-                episode_reward_history.pop(0)
-            
-            # Calcular y mostrar progreso periódicamente
+            # Mostrar progreso periódicamente
             if (episode + 1) % log_interval == 0:
                 avg_reward = np.mean(episode_reward_history)
                 print(f"Episode {episode+1}/{episodes} - Average Reward: {avg_reward:.2f}, "
@@ -482,7 +515,8 @@ class PrioritizedReplayBuffer(ReplayBuffer):
             probabilities /= np.sum(probabilities)
             
             # Muestreo según distribución
-            idx = np.random.choice(len(self.buffer), batch_size, p=probabilities)
+            rng = np.random.default_rng(seed=42)
+            idx = rng.choice(len(self.buffer), batch_size, p=probabilities)
         
         # Extraer batch
         states, actions, rewards, next_states, dones = [], [], [], [], []

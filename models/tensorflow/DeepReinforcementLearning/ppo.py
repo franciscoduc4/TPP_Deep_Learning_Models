@@ -1,3 +1,4 @@
+import os, sys
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras.models import Model
@@ -8,7 +9,11 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanSquaredError
 from tensorflow.keras.callbacks import EarlyStopping
-from ..config import PPO_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import PPO_CONFIG
 
 
 class ActorCriticModel(Model):

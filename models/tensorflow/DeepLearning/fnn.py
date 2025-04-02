@@ -1,10 +1,15 @@
+import os, sys
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, Dropout, BatchNormalization, 
     LayerNormalization, Concatenate, Activation, Add
 )
-from ..config import FNN_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import FNN_CONFIG
 
 def create_residual_block(x, units, dropout_rate=0.2, activation='relu', use_layer_norm=True):
     """

@@ -1,5 +1,7 @@
+import os, sys
 import tensorflow as tf
 import numpy as np
+import time
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, Conv1D, LSTM, Flatten, Concatenate,
@@ -7,8 +9,11 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanSquaredError
-from ..config import TRPO_CONFIG
-import time
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import TRPO_CONFIG
 
 
 class ActorCriticModel:
@@ -266,7 +271,7 @@ class ActorCriticModel:
         start_idx = 0
         for var in self.actor.trainable_variables:
             shape = var.shape
-            size = tf.reduce_prod(shape)
+            size = tf.reduce_prod(shape, axis=0)
             var.assign(tf.reshape(flat_params[start_idx:start_idx + size], shape))
             start_idx += size
 
@@ -483,7 +488,7 @@ class TRPO:
         full_step = step_direction / lm
         
         # Línea de búsqueda para asegurar mejora y restricción KL
-        expected_improve = -np.dot(flat_policy_grad.numpy(), full_step)
+        _ = -np.dot(flat_policy_grad.numpy(), full_step)
         
         # Guardar parámetros actuales
         current_params = old_params.numpy()
@@ -552,9 +557,13 @@ class TRPO:
         indices = np.arange(dataset_size)
         losses = []
         
+        # Create a Generator instance with a fixed seed for reproducibility
+        seed = TRPO_CONFIG.get('seed', 42)  # Use config seed or default to 42
+        rng = np.random.default_rng(seed)
+        
         for _ in range(epochs):
-            # Mezclar datos en cada época
-            np.random.shuffle(indices)
+            # Mezclar datos en cada época usando the Generator
+            rng.shuffle(indices)
             
             for start_idx in range(0, dataset_size, batch_size):
                 # Obtener lote

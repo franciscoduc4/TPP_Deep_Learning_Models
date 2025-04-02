@@ -1,3 +1,4 @@
+import os, sys
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras.models import Model
@@ -8,7 +9,11 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.optimizers import Adam
 from collections import deque
 import random
-from ..config import DDPG_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import DDPG_CONFIG
 
 
 class ReplayBuffer:
@@ -55,12 +60,14 @@ class OUActionNoise:
     Este ruido añade correlación temporal a las acciones para una exploración más efectiva
     en espacios continuos.
     """
-    def __init__(self, mean, std_deviation, theta=0.15, dt=1e-2, x_initial=None):
+    def __init__(self, mean, std_deviation, theta=0.15, dt=1e-2, x_initial=None, seed=42):
         self.theta = theta
         self.mean = mean
         self.std_dev = std_deviation
         self.dt = dt
         self.x_initial = x_initial
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
         self.reset()
         
     def __call__(self):
@@ -68,7 +75,7 @@ class OUActionNoise:
         x = (
             self.x_prev
             + self.theta * (self.mean - self.x_prev) * self.dt
-            + self.std_dev * np.sqrt(self.dt) * np.random.normal(size=self.mean.shape)
+            + self.std_dev * np.sqrt(self.dt) * self.rng.normal(size=self.mean.shape)
         )
         self.x_prev = x
         return x
@@ -378,6 +385,105 @@ class DDPG:
         
         return actor_loss, critic_loss
     
+    def _select_action(self, state, step_counter, warmup_steps):
+        """Selecciona una acción basada en el estado actual y fase de entrenamiento."""
+        if step_counter < warmup_steps:
+            # Using the same seed as the OUActionNoise for consistency
+            rng = np.random.default_rng(seed=42)
+            return rng.uniform(self.action_low, self.action_high, self.action_dim)
+        else:
+            return self.get_action(state, add_noise=True)
+    
+    def _update_model(self, step_counter, update_every):
+        """Actualiza los modelos si es momento de hacerlo."""
+        if step_counter % update_every == 0:
+            # Muestrear batch
+            states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+            
+            # Realizar actualización
+            actor_loss, critic_loss = self.train_step(
+                tf.convert_to_tensor(states, dtype=tf.float32),
+                tf.convert_to_tensor(actions, dtype=tf.float32),
+                tf.convert_to_tensor(rewards, dtype=tf.float32),
+                tf.convert_to_tensor(next_states, dtype=tf.float32),
+                tf.convert_to_tensor(dones, dtype=tf.float32)
+            )
+            
+            # Actualizar redes target
+            self.update_target_networks()
+            
+            return actor_loss.numpy(), critic_loss.numpy()
+        return None, None
+    
+    def _update_history(self, history, episode_reward, episode_actor_loss, episode_critic_loss):
+        """Actualiza el historial de entrenamiento con los resultados del episodio."""
+        history['episode_rewards'].append(episode_reward)
+        if episode_actor_loss:
+            history['actor_losses'].append(np.mean(episode_actor_loss))
+            history['critic_losses'].append(np.mean(episode_critic_loss))
+            history['avg_q_values'].append(self.q_value_metric.result().numpy())
+        else:
+            history['actor_losses'].append(float('nan'))
+            history['critic_losses'].append(float('nan'))
+            history['avg_q_values'].append(float('nan'))
+        return history
+    
+    def _log_progress(self, episode, episodes, episode_reward_history, history, log_interval, best_reward):
+        """Registra y muestra el progreso del entrenamiento periódicamente."""
+        if (episode + 1) % log_interval == 0:
+            avg_reward = np.mean(episode_reward_history)
+            print(f"Episode {episode+1}/{episodes} - Average Reward: {avg_reward:.2f}, "
+                  f"Actor Loss: {history['actor_losses'][-1]:.4f}, "
+                  f"Critic Loss: {history['critic_losses'][-1]:.4f}")
+            
+            # Verificar si es el mejor modelo
+            if avg_reward > best_reward:
+                best_reward = avg_reward
+                print(f"Nuevo mejor modelo con recompensa: {best_reward:.2f}")
+        
+        return best_reward
+    
+    def _run_episode(self, env, max_steps, step_counter, warmup_steps, update_every, render):
+        """Ejecuta un episodio completo de entrenamiento."""
+        state, _ = env.reset()
+        state = np.array(state, dtype=np.float32)
+        episode_reward = 0
+        episode_actor_loss = []
+        episode_critic_loss = []
+        
+        for _ in range(max_steps):
+            step_counter += 1
+            
+            # Seleccionar acción
+            action = self._select_action(state, step_counter, warmup_steps)
+            
+            # Ejecutar acción
+            next_state, reward, done, _, _ = env.step(action)
+            next_state = np.array(next_state, dtype=np.float32)
+            
+            # Renderizar si es necesario
+            if render:
+                env.render()
+            
+            # Guardar transición en buffer
+            self.replay_buffer.add(state, action, reward, next_state, float(done))
+            
+            # Actualizar estado y recompensa
+            state = next_state
+            episode_reward += reward
+            
+            # Entrenar modelo si hay suficientes datos
+            if len(self.replay_buffer) > self.batch_size and step_counter >= warmup_steps:
+                actor_loss, critic_loss = self._update_model(step_counter, update_every)
+                if actor_loss is not None:
+                    episode_actor_loss.append(actor_loss)
+                    episode_critic_loss.append(critic_loss)
+            
+            if done:
+                break
+                
+        return episode_reward, episode_actor_loss, episode_critic_loss, step_counter
+    
     def train(self, env, episodes=1000, max_steps=1000, warmup_steps=1000, 
              update_every=1, render=False, log_interval=10):
         """
@@ -408,96 +514,29 @@ class DDPG:
         step_counter = 0
         
         for episode in range(episodes):
-            state, _ = env.reset()
-            state = np.array(state, dtype=np.float32)
-            episode_reward = 0
-            episode_actor_loss = []
-            episode_critic_loss = []
+            # Ejecutar un episodio completo
+            episode_reward, episode_actor_loss, episode_critic_loss, step_counter = self._run_episode(
+                env, max_steps, step_counter, warmup_steps, update_every, render
+            )
             
-            for _ in range(max_steps):
-                step_counter += 1
-                
-                # Si estamos en fase de warm-up, tomamos acciones aleatorias
-                if step_counter < warmup_steps:
-                    action = np.random.uniform(self.action_low, self.action_high, self.action_dim)
-                else:
-                    # Seleccionar acción usando la política actual
-                    action = self.get_action(state, add_noise=True)
-                
-                # Ejecutar acción
-                next_state, reward, done, _, _ = env.step(action)
-                next_state = np.array(next_state, dtype=np.float32)
-                
-                # Renderizar si es necesario
-                if render:
-                    env.render()
-                
-                # Guardar transición en buffer
-                self.replay_buffer.add(state, action, reward, next_state, float(done))
-                
-                # Actualizar estado y recompensa
-                state = next_state
-                episode_reward += reward
-                
-                # Entrenar modelo si hay suficientes datos y no estamos en fase de warm-up
-                if len(self.replay_buffer) > self.batch_size and step_counter >= warmup_steps:
-                    if step_counter % update_every == 0:
-                        # Muestrear batch
-                        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-                        
-                        # Realizar actualización
-                        actor_loss, critic_loss = self.train_step(
-                            tf.convert_to_tensor(states, dtype=tf.float32),
-                            tf.convert_to_tensor(actions, dtype=tf.float32),
-                            tf.convert_to_tensor(rewards, dtype=tf.float32),
-                            tf.convert_to_tensor(next_states, dtype=tf.float32),
-                            tf.convert_to_tensor(dones, dtype=tf.float32)
-                        )
-                        
-                        episode_actor_loss.append(actor_loss.numpy())
-                        episode_critic_loss.append(critic_loss.numpy())
-                        
-                        # Actualizar redes target
-                        self.update_target_networks()
-                
-                if done:
-                    break
+            # Actualizar historial
+            history = self._update_history(history, episode_reward, episode_actor_loss, episode_critic_loss)
             
-                        # Almacenar métricas
-            history['episode_rewards'].append(episode_reward)
-            if episode_actor_loss:
-                history['actor_losses'].append(np.mean(episode_actor_loss))
-                history['critic_losses'].append(np.mean(episode_critic_loss))
-                history['avg_q_values'].append(self.q_value_metric.result().numpy())
-            else:
-                history['actor_losses'].append(float('nan'))
-                history['critic_losses'].append(float('nan'))
-                history['avg_q_values'].append(float('nan'))
-            
-            # Resetear métricas
+            # Resetear métricas y ruido
             self.actor_loss_metric.reset_states()
             self.critic_loss_metric.reset_states()
             self.q_value_metric.reset_states()
-            
-            # Resetear el ruido para el siguiente episodio
             self.noise.reset()
             
-            # Guardar últimas recompensas para promedio
+            # Actualizar historial de recompensas
             episode_reward_history.append(episode_reward)
             if len(episode_reward_history) > log_interval:
                 episode_reward_history.pop(0)
             
-            # Calcular y mostrar progreso periódicamente
-            if (episode + 1) % log_interval == 0:
-                avg_reward = np.mean(episode_reward_history)
-                print(f"Episode {episode+1}/{episodes} - Average Reward: {avg_reward:.2f}, "
-                      f"Actor Loss: {history['actor_losses'][-1]:.4f}, "
-                      f"Critic Loss: {history['critic_losses'][-1]:.4f}")
-                
-                # Guardar mejor modelo
-                if avg_reward > best_reward:
-                    best_reward = avg_reward
-                    print(f"Nuevo mejor modelo con recompensa: {best_reward:.2f}")
+            # Registrar progreso
+            best_reward = self._log_progress(
+                episode, episodes, episode_reward_history, history, log_interval, best_reward
+            )
         
         return history
     

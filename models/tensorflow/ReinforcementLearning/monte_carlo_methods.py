@@ -1,9 +1,14 @@
+import os, sys
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 from typing import Dict, List, Tuple, Optional, Union
 import pickle
-from ..config import MONTE_CARLO_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import MONTE_CARLO_CONFIG
 
 class MonteCarlo:
     """
