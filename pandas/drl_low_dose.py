@@ -14,7 +14,8 @@ from joblib import Parallel, delayed
 import time
 from tqdm import tqdm
 from datetime import timedelta
-
+from sklearn.ensemble import RandomForestRegressor
+from datetime import datetime
 # DRL-specific imports
 import gym
 import gymnasium as gym
@@ -33,7 +34,7 @@ CONFIG = {
     "cap_bg": 300,
     "cap_iob": 5,
     "cap_carb": 150,
-    "data_path": os.path.join(PROJECT_DIR, "data", "subjects"),
+    "data_path": os.path.join(PROJECT_DIR, "subjects"),
     "low_dose_threshold": 7.0  # Clinical threshold for low-dose insulin
 }
 
@@ -94,7 +95,7 @@ def process_subject(subject_path, idx):
         if cgm_window is not None:
             iob = calculate_iob(bolus_time, basal_df)
             iob = iob_median if iob == 0 else iob
-            hour_of_day = bolus_time.hour / 23.0
+            hour_of_day = bolus_time.hour
             bg_input = row['bgInput'] if pd.notna(row['bgInput']) else cgm_window[-1]
             normal = row['normal'] if pd.notna(row['normal']) else 0.0
             normal = np.clip(normal, 0, CONFIG["cap_normal"])
@@ -106,16 +107,49 @@ def process_subject(subject_path, idx):
             carb_input = row['carbInput'] if pd.notna(row['carbInput']) else 0.0
             carb_input = carb_median if carb_input == 0 else carb_input
             carb_input = np.clip(carb_input, 0, CONFIG["cap_carb"])
+            icr = np.clip(row['insulinCarbRatio'] if pd.notna(row['insulinCarbRatio']) else 10.0, 5, 20)
+
+            # New CGM Features
+            cgm_mean = np.mean(cgm_window)
+            cgm_std = np.std(cgm_window)
+            cgm_cv = (cgm_std / cgm_mean) * 100 if cgm_mean != 0 else 0.0
+            cgm_slope = np.polyfit(np.arange(5), cgm_window[-5:], 1)[0] if len(cgm_window) >= 5 else 0.0
+            tir = np.mean((cgm_window >= 70) & (cgm_window <= 180)) * 100
+            hypo_risk = 1 if np.any(cgm_window < 70) else 0
+
+            # Cyclical Encoding for Hour of Day
+            hour_sin = np.sin(2 * np.pi * hour_of_day / 24)
+            hour_cos = np.cos(2 * np.pi * hour_of_day / 24)
+
+            # Interaction Term
+            carb_insulin_ratio = carb_input / icr if icr != 0 else 0.0
+
+            # Recent Bolus History
+            recent_bolus_window = bolus_df[(bolus_df['date'] >= bolus_time - timedelta(hours=4)) & 
+                                           (bolus_df['date'] < bolus_time)]
+            num_recent_boluses = len(recent_bolus_window)
+            total_recent_insulin = recent_bolus_window['normal'].sum() if not recent_bolus_window.empty else 0.0
+
             features = {
                 'subject_id': idx,
                 'cgm_window': cgm_window,
                 'carbInput': carb_input,
                 'bgInput': bg_input,
-                'insulinCarbRatio': np.clip(row['insulinCarbRatio'] if pd.notna(row['insulinCarbRatio']) else 10.0, 5, 20),
+                'insulinCarbRatio': icr,
                 'insulinSensitivityFactor': isf_custom,
                 'insulinOnBoard': iob,
-                'hour_of_day': hour_of_day,
-                'normal': normal
+                'hour_sin': hour_sin,
+                'hour_cos': hour_cos,
+                'normal': normal,
+                'cgm_mean': cgm_mean,
+                'cgm_std': cgm_std,
+                'cgm_cv': cgm_cv,
+                'cgm_slope': cgm_slope,
+                'tir': tir,
+                'hypo_risk': hypo_risk,
+                'carb_insulin_ratio': carb_insulin_ratio,
+                'num_recent_boluses': num_recent_boluses,
+                'total_recent_insulin': total_recent_insulin
             }
             processed_data.append(features)
 
@@ -139,10 +173,9 @@ def preprocess_data(subject_folder):
     print(df_processed.head())
     print(f"Total de muestras: {len(df_processed)}")
 
-    df_processed['normal'] = np.log1p(df_processed['normal'])
-    df_processed['carbInput'] = np.log1p(df_processed['carbInput'])
-    df_processed['insulinOnBoard'] = np.log1p(df_processed['insulinOnBoard'])
-    df_processed['bgInput'] = np.log1p(df_processed['bgInput'])
+    # Apply logarithmic transformations
+    for col in ['normal', 'carbInput', 'insulinOnBoard', 'bgInput', 'cgm_mean', 'cgm_std', 'cgm_cv', 'total_recent_insulin']:
+        df_processed[col] = np.log1p(df_processed[col])
     df_processed['cgm_window'] = df_processed['cgm_window'].apply(lambda x: np.log1p(x))
 
     cgm_columns = [f'cgm_{i}' for i in range(24)]
@@ -238,7 +271,9 @@ def split_data(df_final):
     scaler_y = StandardScaler()
     cgm_columns = [f'cgm_{i}' for i in range(24)]
     other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
-                      'insulinSensitivityFactor', 'hour_of_day']
+                      'insulinSensitivityFactor', 'hour_sin', 'hour_cos', 'cgm_mean', 
+                      'cgm_std', 'cgm_cv', 'cgm_slope', 'tir', 'hypo_risk', 
+                      'carb_insulin_ratio', 'num_recent_boluses', 'total_recent_insulin']
 
     X_cgm_train = scaler_cgm.fit_transform(df_final.loc[train_mask, cgm_columns]).reshape(-1, 24, 1)
     X_cgm_val = scaler_cgm.transform(df_final.loc[val_mask, cgm_columns]).reshape(-1, 24, 1)
@@ -313,7 +348,8 @@ def plot_evaluation(y_test, y_pred_ppo, y_rule, subject_test, scaler_y):
     plt.ylabel('Predicted Dose (units)', fontsize=10)
     plt.title('PPO: Predictions vs Real (Density)', fontsize=12)
     plt.legend()
-    plt.show()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    plt.savefig(f'plots/ppo_predictions_vs_real_{timestamp}.png', bbox_inches='tight')
 
     plt.figure(figsize=(10, 6))
     residuals_ppo = y_test_denorm - y_pred_ppo
@@ -325,7 +361,8 @@ def plot_evaluation(y_test, y_pred_ppo, y_rule, subject_test, scaler_y):
     plt.title('Residual Distribution (KDE)', fontsize=12)
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.3)
-    plt.show()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    plt.savefig(f'plots/residual_distribution_{timestamp}.png', bbox_inches='tight')
 
     plt.figure(figsize=(10, 6))
     test_subjects = np.unique(subject_test)
@@ -347,7 +384,8 @@ def plot_evaluation(y_test, y_pred_ppo, y_rule, subject_test, scaler_y):
     plt.title('MAE by Subject', fontsize=12)
     plt.legend(fontsize=8)
     plt.grid(True, axis='y', alpha=0.3)
-    plt.show()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    plt.savefig(f'plots/mae_by_subject_{timestamp}.png', bbox_inches='tight')
 
     elapsed_time = time.time() - start_time
     print(f"Visualización completa en {elapsed_time:.2f} segundos")
@@ -362,6 +400,7 @@ class InsulinDoseEnv(gym.Env):
         self.scaler_y = scaler_y
         self.current_step = 0
         self.n_samples = len(X_cgm)
+        # Update state dimension to account for new features
         state_dim = X_cgm.shape[2] * X_cgm.shape[1] + X_other.shape[1]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(state_dim,), dtype=np.float32)
         self.action_space = spaces.Box(low=-3, high=3, shape=(1,), dtype=np.float32)
@@ -379,9 +418,14 @@ class InsulinDoseEnv(gym.Env):
         true_dose = self.scaler_y.inverse_transform(self.y[self.current_step].reshape(-1, 1)).flatten()[0]
         predicted_dose = self.scaler_y.inverse_transform(action.reshape(-1, 1)).flatten()[0]
         error = predicted_dose - true_dose
-        # Modified reward: Emphasize low-dose accuracy with logarithmic weighting
+        # Modified reward: Softer penalty for small errors, clinical penalty for hypoglycemia risk
         weight = 1.0 / (1.0 + np.log1p(max(true_dose, 0.1)))
-        reward = -min(abs(error), 2.0) * weight
+        base_reward = -np.tanh(abs(error)) * weight  # Use tanh to smooth the penalty
+        # Add a penalty if predicted dose is too high and could cause hypoglycemia
+        hypo_penalty = 0.0
+        if predicted_dose > true_dose and true_dose < 1.0:  # Very low true dose
+            hypo_penalty = -0.5 * (predicted_dose - true_dose)  # Penalize overprediction
+        reward = base_reward + hypo_penalty
         reward = float(reward)
         done = True
         truncated = False
@@ -418,7 +462,7 @@ class RewardCallback(BaseCallback):
 # %% CELL: Main Execution - Preprocess and Filter Low-Dose Data
 # Preprocess the full dataset
 df_final = preprocess_data(CONFIG["data_path"])
-df_final.to_csv('df_final.csv', index=False)
+# df_final.to_csv('df_final.csv', index=False)
 # df_final = pd.read_csv('df_final.csv')
 
 # First split to get the scaler
@@ -450,11 +494,35 @@ print(f"Total low-dose samples after outlier removal: {len(df_low_dose_clean)}")
  scaler_cgm_low, scaler_other_low, scaler_y_low) = split_data(df_low_dose_clean)
 
 # %% CELL: Feature Importance Analysis for Low-Dose Data
+# Feature importance analysis using Random Forest
+# cgm_columns = [f'cgm_{i}' for i in range(24)]
+# other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
+#                   'insulinSensitivityFactor', 'hour_of_day']
+# X_low = df_low_dose_clean[other_features + cgm_columns]
+# y_low = df_low_dose_clean['normal']
+
+# rf = RandomForestRegressor(n_estimators=100, random_state=42)
+# rf.fit(X_low, y_low)
+
+# importances = rf.feature_importances_
+# feature_names = other_features + cgm_columns
+# plt.figure(figsize=(12, 6))
+# sns.barplot(x=importances, y=feature_names)
+# timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+# plt.title('Feature Importances for Low-Dose Predictions')
+# plt.savefig(f'plots/feature_importances_low_dose_{timestamp}.png', bbox_inches='tight')    
+# plt.close()
+
+# Feature Importance Analysis for Low-Dose Data
 from sklearn.ensemble import RandomForestRegressor
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 cgm_columns = [f'cgm_{i}' for i in range(24)]
 other_features = ['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 
-                  'insulinSensitivityFactor', 'hour_of_day']
+                 'insulinSensitivityFactor', 'hour_sin', 'hour_cos', 'cgm_mean', 
+                 'cgm_std', 'cgm_cv', 'cgm_slope', 'tir', 'hypo_risk', 
+                 'carb_insulin_ratio', 'num_recent_boluses', 'total_recent_insulin'] 
 X_low = df_low_dose_clean[other_features + cgm_columns]
 y_low = df_low_dose_clean['normal']
 
@@ -463,10 +531,24 @@ rf.fit(X_low, y_low)
 
 importances = rf.feature_importances_
 feature_names = other_features + cgm_columns
-plt.figure(figsize=(12, 6))
+
+# Plot feature importances
+plt.figure(figsize=(12, 8))
 sns.barplot(x=importances, y=feature_names)
-plt.title('Feature Importances for Low-Dose Predictions')
-plt.show()
+plt.title('Feature Importances for Low-Dose Predictions (Updated)')
+plt.xlabel('Importance')
+plt.ylabel('Feature')
+plt.tight_layout()
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+plt.savefig(f'plots/feature_importances_low_dose_updated_{timestamp}.png', bbox_inches='tight')
+plt.close()
+
+# Print top 10 features for inspection
+feature_importance_df = pd.DataFrame({'Feature': feature_names, 'Importance': importances})
+feature_importance_df = feature_importance_df.sort_values(by='Importance', ascending=False)
+print("Top 10 Features by Importance:")
+print(feature_importance_df.head(10))
+
 
 # %% CELL: DRL (PPO) Training for Low-Dose Data
 train_env_ppo_low = InsulinDoseEnv(X_cgm_train_low, X_other_train_low, y_train_low, scaler_y_low)
@@ -475,20 +557,21 @@ callback_low = RewardCallback(val_env=val_env_ppo_low)
 
 check_env(train_env_ppo_low)
 
-# Initialize PPO with tuned hyperparameters for low-dose sensitivity
+# Initialize PPO with updated hyperparameters for low-dose data
 model_ppo_low = PPO("MlpPolicy", 
                     train_env_ppo_low, 
                     verbose=1, 
-                    learning_rate=5e-5,  # Reduced for finer updates
-                    n_steps=2048, 
+                    learning_rate=3e-5,  # Further reduced for stability
+                    n_steps=4096,        # Increased for more data per update
                     batch_size=64, 
-                    clip_range=0.1,  # More conservative updates
-                    ent_coef=0.005)  # Reduced to focus on exploitation
+                    clip_range=0.2,      # Slightly increased for more exploration
+                    ent_coef=0.01)       # Increased to encourage exploration
 
 # Train the model for more timesteps
-total_timesteps = 100000
+total_timesteps = 200000
 model_ppo_low.learn(total_timesteps=total_timesteps, callback=callback_low)
 
+#%%
 # Plot training and validation rewards
 plt.plot(callback_low.train_rewards, label='Train Reward')
 plt.plot(np.arange(len(callback_low.val_rewards)) * 1000, callback_low.val_rewards, label='Val Reward')
@@ -496,8 +579,11 @@ plt.xlabel('Timestep')
 plt.ylabel('Reward')
 plt.legend()
 plt.title('PPO Training vs Validation Reward (Low-Dose)')
-plt.show()
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+plt.savefig(f'plots/ppo_training_validation_reward_low_dose_{timestamp}.png', bbox_inches='tight')
+plt.close()
 
+# %%
 # Function to generate predictions with PPO
 def predict_with_ppo(model, X_cgm, X_other):
     predictions = []
@@ -511,37 +597,39 @@ def predict_with_ppo(model, X_cgm, X_other):
         predictions.append(predicted_dose)
     return np.array(predictions)
 
-# Generate predictions
+# Generate predictions with updated model
 y_pred_ppo_low_train = predict_with_ppo(model_ppo_low, X_cgm_train_low, X_other_train_low)
 y_pred_ppo_low_val = predict_with_ppo(model_ppo_low, X_cgm_val_low, X_other_val_low)
 y_pred_ppo_low = predict_with_ppo(model_ppo_low, X_cgm_test_low, X_other_test_low)
 y_rule_low = rule_based_prediction(X_other_test_low, scaler_other_low, scaler_y_low)
 
-# %% CELL: Metrics for Low-Dose Model
+# Metrics for Low-Dose Model
 # Train set
 mae_ppo_train = mean_absolute_error(scaler_y_low.inverse_transform(y_train_low.reshape(-1, 1)), y_pred_ppo_low_train)
 rmse_ppo_train = np.sqrt(mean_squared_error(scaler_y_low.inverse_transform(y_train_low.reshape(-1, 1)), y_pred_ppo_low_train))
 r2_ppo_train = r2_score(scaler_y_low.inverse_transform(y_train_low.reshape(-1, 1)), y_pred_ppo_low_train)
-print(f"Low-Dose PPO Train - MAE: {mae_ppo_train:.2f}, RMSE: {rmse_ppo_train:.2f}, R²: {r2_ppo_train:.2f}")
+print(f"Updated Low-Dose PPO Train - MAE: {mae_ppo_train:.2f}, RMSE: {rmse_ppo_train:.2f}, R²: {r2_ppo_train:.2f}")
 
 # Validation set
 mae_ppo_val = mean_absolute_error(scaler_y_low.inverse_transform(y_val_low.reshape(-1, 1)), y_pred_ppo_low_val)
 rmse_ppo_val = np.sqrt(mean_squared_error(scaler_y_low.inverse_transform(y_val_low.reshape(-1, 1)), y_pred_ppo_low_val))
 r2_ppo_val = r2_score(scaler_y_low.inverse_transform(y_val_low.reshape(-1, 1)), y_pred_ppo_low_val)
-print(f"Low-Dose PPO Val - MAE: {mae_ppo_val:.2f}, RMSE: {rmse_ppo_val:.2f}, R²: {r2_ppo_val:.2f}")
+print(f"Updated Low-Dose PPO Val - MAE: {mae_ppo_val:.2f}, RMSE: {rmse_ppo_val:.2f}, R²: {r2_ppo_val:.2f}")
 
 # Test set
 mae_ppo = mean_absolute_error(scaler_y_low.inverse_transform(y_test_low.reshape(-1, 1)), y_pred_ppo_low)
 rmse_ppo = np.sqrt(mean_squared_error(scaler_y_low.inverse_transform(y_test_low.reshape(-1, 1)), y_pred_ppo_low))
 r2_ppo = r2_score(scaler_y_low.inverse_transform(y_test_low.reshape(-1, 1)), y_pred_ppo_low)
-print(f"Low-Dose PPO Test - MAE: {mae_ppo:.2f}, RMSE: {rmse_ppo:.2f}, R²: {r2_ppo:.2f}")
+print(f"Updated Low-Dose PPO Test - MAE: {mae_ppo:.2f}, RMSE: {rmse_ppo:.2f}, R²: {r2_ppo:.2f}")
 
-# Rule-based model
+# Rule-based model (for comparison)
 mae_rule = mean_absolute_error(scaler_y_low.inverse_transform(y_test_low.reshape(-1, 1)), y_rule_low)
 rmse_rule = np.sqrt(mean_squared_error(scaler_y_low.inverse_transform(y_test_low.reshape(-1, 1)), y_rule_low))
 r2_rule = r2_score(scaler_y_low.inverse_transform(y_test_low.reshape(-1, 1)), y_rule_low)
-print(f"Low-Dose Rules Test - MAE: {mae_rule:.2f}, RMSE: {rmse_rule:.2f}, R²: {r2_rule:.2f}")
+print(f"Updated Low-Dose Rules Test - MAE: {mae_rule:.2f}, RMSE: {rmse_rule:.2f}, R²: {r2_rule:.2f}")
 
-# %% CELL: Visualization for Low-Dose Model
+# %%
+# Visualization
 plot_evaluation(y_test_low, y_pred_ppo_low, y_rule_low, subject_test_low, scaler_y_low)
+
 
