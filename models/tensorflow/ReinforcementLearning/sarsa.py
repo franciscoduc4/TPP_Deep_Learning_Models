@@ -1,9 +1,14 @@
+import os, sys
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import time
 from typing import Dict, List, Tuple, Optional, Union
-from ..config import SARSA_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import SARSA_CONFIG
 
 class SARSA:
     """
@@ -24,68 +29,93 @@ class SARSA:
         self.env = env
         self.config = config or SARSA_CONFIG
         
-        # Parámetros de aprendizaje
+        # Inicializar parámetros básicos
+        self._init_learning_params()
+        self._validate_action_space()
+        
+        # Configurar espacio de estados y tabla Q
+        self.discrete_state_space = hasattr(env.observation_space, 'n')
+        
+        if self.discrete_state_space:
+            self._setup_discrete_state_space()
+        else:
+            self._setup_continuous_state_space()
+        
+        # Métricas para seguimiento del entrenamiento
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.epsilon_history = []
+        
+    def _init_learning_params(self):
+        """Inicializa los parámetros de aprendizaje desde la configuración"""
         self.alpha = self.config['learning_rate']
         self.gamma = self.config['gamma']
         self.epsilon = self.config['epsilon_start']
         self.epsilon_min = self.config['epsilon_end']
         self.epsilon_decay = self.config['epsilon_decay']
         self.decay_type = self.config['epsilon_decay_type']
-        
-        # Verificar que el espacio de acción es discreto
-        if not hasattr(env.action_space, 'n'):
+    
+    def _validate_action_space(self):
+        """Valida que el espacio de acción sea compatible con SARSA"""
+        if not hasattr(self.env.action_space, 'n'):
             raise ValueError("SARSA requiere un espacio de acción discreto")
-        self.action_space_size = env.action_space.n
+        self.action_space_size = self.env.action_space.n
+    
+    def _setup_discrete_state_space(self):
+        """Configura SARSA para un espacio de estados discreto"""
+        self.state_space_size = self.env.observation_space.n
+        self.q_table = np.zeros((self.state_space_size, self.action_space_size))
         
-        # Determinar tipo de espacio de estados y configurar discretización si es necesario
-        self.discrete_state_space = hasattr(env.observation_space, 'n')
+        if self.config['optimistic_initialization']:
+            self.q_table += self.config['optimistic_initial_value']
         
-        if self.discrete_state_space:
-            # Espacio de estados discreto
-            self.state_space_size = env.observation_space.n
-            self.q_table = np.zeros((self.state_space_size, self.action_space_size))
-            if self.config['optimistic_initialization']:
-                self.q_table += self.config['optimistic_initial_value']
-            
-            # Función para obtener índice de estado
-            self.get_state_index = lambda state: state
-                
+        # Función para obtener índice de estado
+        self.get_state_index = lambda state: state
+    
+    def _setup_continuous_state_space(self):
+        """Configura SARSA para un espacio de estados continuo con discretización"""
+        self.state_dim = self.env.observation_space.shape[0]
+        self.bins_per_dim = self.config['bins']
+        
+        # Configurar límites de estado y bins
+        self._setup_state_bounds()
+        self._create_discretization_bins()
+        
+        # Crear y configurar tabla Q
+        q_shape = tuple([self.bins_per_dim] * self.state_dim + [self.action_space_size])
+        self.q_table = np.zeros(q_shape)
+        
+        if self.config['optimistic_initialization']:
+            self.q_table += self.config['optimistic_initial_value']
+    
+    def _setup_state_bounds(self):
+        """Determina los límites para cada dimensión del espacio de estados"""
+        if self.config['state_bounds'] is None:
+            self.state_bounds = self._get_default_state_bounds()
         else:
-            # Espacio de estados continuo que requiere discretización
-            self.state_dim = env.observation_space.shape[0]
-            self.bins_per_dim = self.config['bins']
+            self.state_bounds = self.config['state_bounds']
+    
+    def _get_default_state_bounds(self):
+        """Calcula límites predeterminados para cada dimensión del estado"""
+        bounds = []
+        for i in range(self.state_dim):
+            low = self.env.observation_space.low[i]
+            high = self.env.observation_space.high[i]
             
-            # Obtener límites para cada dimensión
-            if self.config['state_bounds'] is None:
-                # Usar límites del entorno o valores predeterminados
-                self.state_bounds = []
-                for i in range(self.state_dim):
-                    low = env.observation_space.low[i]
-                    high = env.observation_space.high[i]
-                    # Manejar valores infinitos
-                    if low == float("-inf") or low < -1e6:
-                        low = -10.0
-                    if high == float("inf") or high > 1e6:
-                        high = 10.0
-                    self.state_bounds.append((low, high))
-            else:
-                self.state_bounds = self.config['state_bounds']
-            
-            # Crear bins para discretización
-            self.discrete_states = []
-            for low, high in self.state_bounds:
-                self.discrete_states.append(np.linspace(low, high, self.bins_per_dim + 1)[1:-1])
-            
-            # Crear tabla Q con dimensiones apropiadas
-            q_shape = tuple([self.bins_per_dim] * self.state_dim + [self.action_space_size])
-            self.q_table = np.zeros(q_shape)
-            if self.config['optimistic_initialization']:
-                self.q_table += self.config['optimistic_initial_value']
-        
-        # Métricas para seguimiento del entrenamiento
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.epsilon_history = []
+            # Manejar valores infinitos
+            if low == float("-inf") or low < -1e6:
+                low = -10.0
+            if high == float("inf") or high > 1e6:
+                high = 10.0
+                
+            bounds.append((low, high))
+        return bounds
+    
+    def _create_discretization_bins(self):
+        """Crea bins para discretización del espacio de estados continuo"""
+        self.discrete_states = []
+        for low, high in self.state_bounds:
+            self.discrete_states.append(np.linspace(low, high, self.bins_per_dim + 1)[1:-1])
     
     def discretize_state(self, state):
         """
@@ -127,8 +157,8 @@ class SARSA:
         discrete_state = self.discretize_state(state)
         
         # Exploración con probabilidad epsilon
-        if explore and np.random.random() < self.epsilon:
-            return np.random.randint(0, self.action_space_size)
+        if explore and self.rng.random() < self.epsilon:
+            return self.rng.integers(0, self.action_space_size)
         
         # Explotación: elegir acción con mayor valor Q
         return np.argmax(self.q_table[discrete_state])

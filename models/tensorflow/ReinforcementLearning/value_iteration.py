@@ -1,9 +1,14 @@
+import os, sys
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 from typing import Dict, List, Tuple, Optional, Union
 import pickle
-from ..config import VALUE_ITERATION_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import VALUE_ITERATION_CONFIG
 
 class ValueIteration:
     """

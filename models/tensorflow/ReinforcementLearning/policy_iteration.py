@@ -1,9 +1,14 @@
+import os, sys
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 from typing import Dict, List, Tuple, Optional, Union
 import pickle
-from ..config import POLICY_ITERATION_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import POLICY_ITERATION_CONFIG
 
 class PolicyIteration:
     """
@@ -13,6 +18,8 @@ class PolicyIteration:
     de valor para la política actual) y Mejora de Política (hacer la política codiciosa
     respecto a la función de valor actual).
     """
+    # Constants for plot labels
+    ITERATION_LABEL = 'Iteración'
     
     def __init__(
         self,
@@ -53,6 +60,31 @@ class PolicyIteration:
         self.policy_iteration_times = []
         self.eval_iteration_counts = []
     
+    def _calculate_state_value(self, env, state, policy, V):
+        """
+        Calcula el valor de un estado dado según la política actual.
+        
+        Args:
+            env: Entorno con dinámicas de transición
+            state: Estado a evaluar
+            policy: Política actual
+            V: Función de valor actual
+            
+        Returns:
+            Nuevo valor del estado
+        """
+        v_new = 0
+        
+        # Calcular valor esperado al seguir la política en el estado
+        for a in range(self.n_actions):
+            if policy[state, a] > 0:  # Solo considerar acciones con probabilidad no cero
+                # Obtener información del siguiente estado y recompensa
+                for prob, next_s, r, done in env.P[state][a]:
+                    # Actualizar valor del estado usando la ecuación de Bellman
+                    v_new += policy[state, a] * prob * (r + self.gamma * V[next_s] * (not done))
+        
+        return v_new
+    
     def policy_evaluation(self, env, policy: np.ndarray) -> np.ndarray:
         """
         Evalúa la política actual calculando su función de valor.
@@ -71,18 +103,8 @@ class PolicyIteration:
             
             for s in range(self.n_states):
                 v_old = V[s]
-                v_new = 0
-                
-                # Calcular valor esperado al seguir la política en el estado s
-                for a in range(self.n_actions):
-                    if policy[s, a] > 0:  # Solo considerar acciones con probabilidad no cero
-                        # Obtener información del siguiente estado y recompensa
-                        for prob, next_s, r, done in env.P[s][a]:
-                            # Actualizar valor del estado usando la ecuación de Bellman
-                            v_new += policy[s, a] * prob * (r + self.gamma * V[next_s] * (not done))
-                
-                V[s] = v_new
-                delta = max(delta, abs(v_old - v_new))
+                V[s] = self._calculate_state_value(env, s, policy, V)
+                delta = max(delta, abs(v_old - V[s]))
             
             # Verificar convergencia
             if delta < self.theta:
@@ -369,27 +391,27 @@ class PolicyIteration:
         
         # Gráfico de cambios en la política
         if history['policy_changes']:
-            axs[0, 0].plot(range(1, len(history['policy_changes']) + 1), 
-                          history['policy_changes'])
             axs[0, 0].set_title('Cambios en la Política')
-            axs[0, 0].set_xlabel('Iteración')
+            axs[0, 0].set_xlabel(self.ITERATION_LABEL)
+            axs[0, 0].set_ylabel('Cambio de Política')
+            axs[0, 0].grid(True)
             axs[0, 0].set_ylabel('Cambio de Política')
             axs[0, 0].grid(True)
         
         # Gráfico de cambios en la función de valor
         if history['value_changes']:
-            axs[0, 1].plot(range(1, len(history['value_changes']) + 1), 
-                          history['value_changes'])
             axs[0, 1].set_title('Cambios en la Función de Valor')
-            axs[0, 1].set_xlabel('Iteración')
+            axs[0, 1].set_xlabel(self.ITERATION_LABEL)
+            axs[0, 1].set_ylabel('Cambio Promedio de Valor')
+            axs[0, 1].grid(True)
             axs[0, 1].set_ylabel('Cambio Promedio de Valor')
             axs[0, 1].grid(True)
         
         # Gráfico de tiempos de iteración
-        axs[1, 0].plot(range(1, len(history['iteration_times']) + 1), 
-                      history['iteration_times'])
         axs[1, 0].set_title('Tiempos de Iteración')
-        axs[1, 0].set_xlabel('Iteración')
+        axs[1, 0].set_xlabel(self.ITERATION_LABEL)
+        axs[1, 0].set_ylabel('Tiempo (segundos)')
+        axs[1, 0].grid(True)
         axs[1, 0].set_ylabel('Tiempo (segundos)')
         axs[1, 0].grid(True)
         

@@ -1,3 +1,4 @@
+import os, sys
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
@@ -6,7 +7,11 @@ from tensorflow.keras.layers import (
     Activation, Add
 )
 from keras.saving import register_keras_serializable
-from ..config import CNN_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import CNN_CONFIG
 
 @register_keras_serializable()
 class SqueezeExcitationBlock(tf.keras.layers.Layer):

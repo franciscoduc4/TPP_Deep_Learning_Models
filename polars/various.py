@@ -38,7 +38,7 @@ from datetime import timedelta
 import matplotlib
 matplotlib.use('Agg')
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), ".."))
+PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.DeepLearning.attention_only import create_attention_model

@@ -1,9 +1,16 @@
+import os, sys
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 from typing import Dict, List, Tuple, Optional, Union
 import random
-from ..config import QLEARNING_CONFIG
+
+rng = np.random.default_rng(seed=42)
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import QLEARNING_CONFIG
 
 class QLearning:
     """
@@ -56,9 +63,6 @@ class QLearning:
         
         # Métricas
         self.rewards_history = []
-        self.epsilon_history = []
-        self.total_steps = 0
-    
     def get_action(self, state: int) -> int:
         """
         Selecciona una acción usando la política epsilon-greedy.
@@ -69,9 +73,9 @@ class QLearning:
         Returns:
             Acción seleccionada
         """
-        if np.random.random() < self.epsilon:
+        if rng.random() < self.epsilon:
             # Explorar: acción aleatoria
-            return np.random.randint(0, self.n_actions)
+            return rng.integers(0, self.n_actions)
         else:
             # Explotar: mejor acción según la tabla Q
             return np.argmax(self.q_table[state])
@@ -128,6 +132,71 @@ class QLearning:
             # Sin decaimiento
             pass
     
+    def _run_episode(self, env, max_steps: int, render: bool) -> Tuple[float, int]:
+        """
+        Ejecuta un episodio de entrenamiento.
+        
+        Args:
+            env: Entorno compatible con OpenAI Gym
+            max_steps: Máximo número de pasos por episodio
+            render: Si renderizar el entorno durante el entrenamiento
+            
+        Returns:
+            Recompensa total y número de pasos del episodio
+        """
+        state, _ = env.reset()
+        episode_reward = 0
+        steps = 0
+        
+        for _ in range(max_steps):
+            if render:
+                env.render()
+            
+            # Seleccionar y ejecutar acción
+            action = self.get_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # Actualizar tabla Q
+            self.update(state, action, reward, next_state, done)
+            
+            # Actualizar contadores y estadísticas
+            state = next_state
+            episode_reward += reward
+            steps += 1
+            self.total_steps += 1
+            
+            # Actualizar epsilon por paso si corresponde
+            if self.use_decay_schedule:
+                self.update_epsilon(self.total_steps)
+            
+            if done:
+                break
+                
+        return episode_reward, steps
+    
+    def _update_history(self, history: Dict[str, List[float]], episode_reward: float, 
+                      steps: int, episode_rewards_window: List[float], log_interval: int) -> float:
+        """
+        Actualiza el historial de entrenamiento con los resultados del episodio.
+        
+        Returns:
+            Recompensa promedio actual
+        """
+        history['episode_rewards'].append(episode_reward)
+        history['episode_lengths'].append(steps)
+        history['epsilons'].append(self.epsilon)
+        
+        # Mantener una ventana de recompensas para promedio móvil
+        episode_rewards_window.append(episode_reward)
+        if len(episode_rewards_window) > log_interval:
+            episode_rewards_window.pop(0)
+        
+        avg_reward = np.mean(episode_rewards_window)
+        history['avg_rewards'].append(avg_reward)
+        
+        return avg_reward
+    
     def train(
         self, 
         env, 
@@ -149,6 +218,10 @@ class QLearning:
         Returns:
             Historia de entrenamiento
         """
+        # Inicializar contador total de pasos si no existe
+        if not hasattr(self, 'total_steps'):
+            self.total_steps = 0
+            
         history = {
             'episode_rewards': [],
             'episode_lengths': [],
@@ -161,53 +234,16 @@ class QLearning:
         start_time = time.time()
         
         for episode in range(episodes):
-            state, _ = env.reset()
-            episode_reward = 0
-            steps = 0
-            
-            for _ in range(max_steps):
-                if render:
-                    env.render()
-                
-                # Seleccionar acción
-                action = self.get_action(state)
-                
-                # Ejecutar acción
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                
-                # Actualizar tabla Q
-                self.update(state, action, reward, next_state, done)
-                
-                # Actualizar contadores y estadísticas
-                state = next_state
-                episode_reward += reward
-                steps += 1
-                self.total_steps += 1
-                
-                # Actualizar epsilon después de cada paso
-                if self.use_decay_schedule:
-                    self.update_epsilon(self.total_steps)
-                
-                if done:
-                    break
+            # Ejecutar episodio
+            episode_reward, steps = self._run_episode(env, max_steps, render)
             
             # Actualizar epsilon después de cada episodio si no se hace por paso
             if not self.use_decay_schedule:
                 self.update_epsilon()
             
-            # Guardar estadísticas
-            history['episode_rewards'].append(episode_reward)
-            history['episode_lengths'].append(steps)
-            history['epsilons'].append(self.epsilon)
-            
-            # Mantener una ventana de recompensas para promedio móvil
-            episode_rewards_window.append(episode_reward)
-            if len(episode_rewards_window) > log_interval:
-                episode_rewards_window.pop(0)
-            
-            avg_reward = np.mean(episode_rewards_window)
-            history['avg_rewards'].append(avg_reward)
+            # Actualizar estadísticas
+            avg_reward = self._update_history(history, episode_reward, steps, 
+                                            episode_rewards_window, log_interval)
             
             # Mostrar progreso
             if (episode + 1) % log_interval == 0:
@@ -344,29 +380,10 @@ class QLearning:
         plt.tight_layout()
         plt.show()
     
-    def visualize_policy(self, env, grid_size: Tuple[int, int] = None) -> None:
-        """
-        Visualiza la política aprendida para entornos de tipo rejilla.
-        
-        Args:
-            env: Entorno, preferentemente de tipo rejilla
-            grid_size: Tamaño de la rejilla (filas, columnas)
-        """
-        if grid_size is None:
-            try:
-                grid_size = (env.nrow, env.ncol)  # Para FrozenLake
-            except:
-                print("El entorno no parece ser una rejilla o no se proporcionó grid_size")
-                return
-        
-        rows, cols = grid_size
-        
-        # Crear un mapa de flechas para visualizar la política
-        _, ax = plt.subplots(figsize=(10, 10))
+    def _setup_grid_visualization(self, ax, rows, cols):
+        """Helper method to setup grid visualization"""
         ax.set_xlim(0, cols)
         ax.set_ylim(0, rows)
-        
-        # Invertir eje Y para que 0,0 esté arriba a la izquierda
         ax.invert_yaxis()
         
         # Dibujar líneas de cuadrícula
@@ -374,9 +391,48 @@ class QLearning:
             ax.axhline(i, color='black', alpha=0.3)
         for j in range(cols+1):
             ax.axvline(j, color='black', alpha=0.3)
+    
+    def _draw_policy_arrows(self, ax, row, col, state, arrows):
+        """Helper method to draw policy arrows for a state"""
+        if np.all(self.q_table[state] == 0):
+            # Si todas las acciones son iguales, no hay preferencia clara
+            for action in range(self.n_actions):
+                dx, dy = arrows[action]
+                ax.arrow(col + 0.5, row + 0.5, dx, dy, head_width=0.1, head_length=0.1, 
+                        fc='gray', ec='gray', alpha=0.3)
+        else:
+            # Dibujar la acción con mayor valor Q
+            best_action = np.argmax(self.q_table[state])
+            dx, dy = arrows[best_action]
+            ax.arrow(col + 0.5, row + 0.5, dx, dy, head_width=0.1, head_length=0.1, 
+                    fc='blue', ec='blue')
+            
+            # Mostrar el valor Q
+            ax.text(col + 0.5, row + 0.7, f"{np.max(self.q_table[state]):.2f}", 
+                   ha='center', va='center', fontsize=8)
+    
+    def visualize_policy(self, env, grid_size: Tuple[int, int] = None) -> None:
+        """
+        Visualiza la política aprendida para entornos de tipo grilla.
+        
+        Args:
+            env: Entorno, preferentemente de tipo grilla
+            grid_size: Tamaño de la grilla (filas, columnas)
+        """
+        if grid_size is None:
+            try:
+                grid_size = (env.nrow, env.ncol)  # Para FrozenLake
+            except AttributeError:
+                print("El entorno no parece ser una grilla o no se proporcionó grid_size")
+                return
+        
+        rows, cols = grid_size
+        
+        # Crear un mapa de flechas para visualizar la política
+        _, ax = plt.subplots(figsize=(10, 10))
+        self._setup_grid_visualization(ax, rows, cols)
         
         # Mapeo de acciones a flechas: 0=izquierda, 1=abajo, 2=derecha, 3=arriba
-        # Ajustar según el entorno específico
         arrows = {
             0: (-0.2, 0),   # Izquierda
             1: (0, 0.2),    # Abajo
@@ -388,24 +444,7 @@ class QLearning:
         for row in range(rows):
             for col in range(cols):
                 state = row * cols + col  # Esto puede variar según cómo se mapeen los estados
-                
-                # Obtener la mejor acción para este estado
-                if np.all(self.q_table[state] == 0):
-                    # Si todas las acciones son iguales, no hay preferencia clara
-                    for action in range(self.n_actions):
-                        dx, dy = arrows[action]
-                        ax.arrow(col + 0.5, row + 0.5, dx, dy, head_width=0.1, head_length=0.1, 
-                                fc='gray', ec='gray', alpha=0.3)
-                else:
-                    # Dibujar la acción con mayor valor Q
-                    best_action = np.argmax(self.q_table[state])
-                    dx, dy = arrows[best_action]
-                    ax.arrow(col + 0.5, row + 0.5, dx, dy, head_width=0.1, head_length=0.1, 
-                            fc='blue', ec='blue')
-                    
-                    # Mostrar el valor Q
-                    ax.text(col + 0.5, row + 0.7, f"{np.max(self.q_table[state]):.2f}", 
-                           ha='center', va='center', fontsize=8)
+                self._draw_policy_arrows(ax, row, col, state, arrows)
         
         plt.title('Política Aprendida')
         plt.tight_layout()
@@ -413,17 +452,17 @@ class QLearning:
     
     def visualize_value_function(self, env, grid_size: Tuple[int, int] = None) -> None:
         """
-        Visualiza la función de valor aprendida para entornos de tipo rejilla.
+        Visualiza la función de valor aprendida para entornos de tipo grilla.
         
         Args:
-            env: Entorno, preferentemente de tipo rejilla
-            grid_size: Tamaño de la rejilla (filas, columnas)
+            env: Entorno, preferentemente de tipo grilla
+            grid_size: Tamaño de la grilla (filas, columnas)
         """
         if grid_size is None:
             try:
                 grid_size = (env.nrow, env.ncol)  # Para FrozenLake
-            except:
-                print("El entorno no parece ser una rejilla o no se proporcionó grid_size")
+            except AttributeError:
+                print("El entorno no parece ser una grilla o no se proporcionó grid_size")
                 return
         
         rows, cols = grid_size

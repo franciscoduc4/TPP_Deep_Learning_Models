@@ -1,3 +1,4 @@
+import os, sys
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras.models import Model
@@ -7,7 +8,11 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.optimizers import Adam
 import threading
-from ..config import A2C_A3C_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import A2C_A3C_CONFIG
 
 
 class ActorCriticModel(Model):
@@ -324,6 +329,129 @@ class A2C:
         
         return returns, advantages
     
+    def _collect_experience(self, env, state, n_steps, render=False, episode_reward=0, episode_rewards=None):
+        """
+        Recolecta experiencia en el entorno para una actualización.
+        
+        Args:
+            env: Entorno donde recolectar datos
+            state: Estado inicial desde donde empezar
+            n_steps: Número de pasos a recolectar
+            render: Si se debe renderizar el entorno
+            episode_reward: Recompensa acumulada en el episodio actual
+            episode_rewards: Lista donde guardar recompensas de episodios completos
+            
+        Returns:
+            Datos recolectados y el estado actualizado
+        """
+        states, actions, rewards, dones, values = [], [], [], [], []
+        current_state = state
+        current_episode_reward = episode_reward
+        
+        for _ in range(n_steps):
+            if render:
+                env.render()
+            
+            # Guardar estado actual
+            states.append(current_state)
+            
+            # Obtener acción y valor
+            action = self.model.get_action(current_state)
+            actions.append(action)
+            
+            # Valor del estado actual
+            value = self.model.get_value(current_state).numpy()
+            values.append(value)
+            
+            # Ejecutar acción en el entorno
+            next_state, reward, done, _, _ = env.step(action)
+            
+            # Guardar recompensa y done
+            rewards.append(reward)
+            dones.append(done)
+            
+            # Actualizar recompensa acumulada
+            current_episode_reward += reward
+            
+            # Si el episodio termina, resetear
+            if done:
+                current_state, _ = env.reset()
+                if episode_rewards is not None:
+                    episode_rewards.append(current_episode_reward)
+                current_episode_reward = 0
+            else:
+                current_state = next_state
+        
+        return states, actions, rewards, dones, values, current_state, current_episode_reward
+
+    def _update_model(self, states, actions, rewards, dones, values, next_value, done):
+        """
+        Actualiza el modelo con los datos recolectados.
+        
+        Args:
+            states, actions, rewards, dones, values: Datos recolectados
+            next_value: Valor estimado del último estado
+            done: Si el último estado es terminal
+            
+        Returns:
+            Pérdidas del entrenamiento
+        """
+        # Si el episodio no terminó, usar el valor estimado
+        final_value = 0 if done else next_value
+                
+        # Convertir a arrays de numpy
+        states_np = np.array(states, dtype=np.float32)
+        actions_np = np.array(actions, dtype=np.float32 if self.continuous else np.int32)
+        rewards_np = np.array(rewards, dtype=np.float32)
+        dones_np = np.array(dones, dtype=np.float32)
+        values_np = np.array(values, dtype=np.float32)
+        
+        # Calcular retornos y ventajas
+        returns, advantages = self.compute_returns_advantages(rewards_np, values_np, dones_np, final_value)
+        
+        # Actualizar modelo
+        _, policy_loss, value_loss, entropy_loss = self.train_step(
+            states_np, actions_np, returns, advantages
+        )
+        
+        return policy_loss, value_loss, entropy_loss
+
+    def _update_history(self, history, episode_rewards, epoch, epochs, policy_loss, value_loss):
+        """
+        Actualiza y muestra las métricas de entrenamiento.
+        
+        Args:
+            history: Historial de entrenamiento a actualizar
+            episode_rewards: Recompensas de episodios completados
+            epoch: Época actual
+            epochs: Total de épocas
+            policy_loss, value_loss: Pérdidas del modelo
+        """
+        # Guardar estadísticas
+        history['policy_losses'].append(self.policy_loss_metric.result().numpy())
+        history['value_losses'].append(self.value_loss_metric.result().numpy())
+        history['entropy_losses'].append(self.entropy_metric.result().numpy())
+        
+        # Resetear métricas
+        self.policy_loss_metric.reset_states()
+        self.value_loss_metric.reset_states()
+        self.entropy_metric.reset_states()
+        self.total_loss_metric.reset_states()
+        
+        # Añadir recompensas de episodios completados
+        if episode_rewards:
+            history['episode_rewards'].extend(episode_rewards)
+            avg_reward = np.mean(episode_rewards)
+            
+            # Mostrar progreso cada 10 épocas
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch+1}/{epochs} - Avg Reward: {avg_reward:.2f}, "
+                      f"Policy Loss: {policy_loss:.4f}, Value Loss: {value_loss:.4f}")
+            
+            return []  # Resetear lista de recompensas
+        
+        return episode_rewards
+
     def train(self, env, n_steps=10, epochs=1000, render=False):
         """
         Entrena el modelo A2C en el entorno dado.
@@ -352,85 +480,23 @@ class A2C:
         state, _ = env.reset()
         
         for epoch in range(epochs):
-            # Almacenar transiciones
-            states, actions, rewards, dones, values = [], [], [], [], []
-            
-            # Recolectar experiencia durante n pasos
-            for _ in range(n_steps):
-                if render:
-                    env.render()
-                
-                # Guardar estado actual
-                states.append(state)
-                
-                # Obtener acción y valor
-                action = self.model.get_action(state)
-                actions.append(action)
-                
-                # Valor del estado actual
-                value = self.model.get_value(state).numpy()
-                values.append(value)
-                
-                # Ejecutar acción en el entorno
-                next_state, reward, done, _, _ = env.step(action)
-                
-                # Guardar recompensa y done
-                rewards.append(reward)
-                dones.append(done)
-                
-                # Actualizar recompensa acumulada
-                episode_reward += reward
-                
-                # Si el episodio termina, resetear
-                if done:
-                    state, _ = env.reset()
-                    episode_rewards.append(episode_reward)
-                    episode_reward = 0
-                else:
-                    state = next_state
-                    
-            # Si el episodio no terminó, calcular valor del último estado
-            if not done:
-                next_value = self.model.get_value(state).numpy()
-            else:
-                next_value = 0
-                
-            # Convertir a arrays de numpy
-            states = np.array(states, dtype=np.float32)
-            actions = np.array(actions, dtype=np.float32 if self.continuous else np.int32)
-            rewards = np.array(rewards, dtype=np.float32)
-            dones = np.array(dones, dtype=np.float32)
-            values = np.array(values, dtype=np.float32)
-            
-            # Calcular retornos y ventajas
-            returns, advantages = self.compute_returns_advantages(rewards, values, dones, next_value)
-            
-            # Actualizar modelo
-            _, policy_loss, value_loss, _ = self.train_step(
-                states, actions, returns, advantages
+            # Recolectar experiencia
+            states, actions, rewards, dones, values, state, episode_reward = self._collect_experience(
+                env, state, n_steps, render, episode_reward, episode_rewards
             )
             
-            # Guardar estadísticas
-            history['policy_losses'].append(self.policy_loss_metric.result().numpy())
-            history['value_losses'].append(self.value_loss_metric.result().numpy())
-            history['entropy_losses'].append(self.entropy_metric.result().numpy())
+            # Obtener valor del último estado si es necesario
+            next_value = self.model.get_value(state).numpy() if not dones[-1] else 0
             
-            # Resetear métricas
-            self.policy_loss_metric.reset_states()
-            self.value_loss_metric.reset_states()
-            self.entropy_metric.reset_states()
-            self.total_loss_metric.reset_states()
+            # Actualizar modelo
+            policy_loss, value_loss, _ = self._update_model(
+                states, actions, rewards, dones, values, next_value, dones[-1]
+            )
             
-            # Añadir recompensas de episodios completados
-            if episode_rewards:
-                history['episode_rewards'].extend(episode_rewards)
-                avg_reward = np.mean(episode_rewards)
-                episode_rewards = []
-                
-                # Mostrar progreso cada 10 épocas
-                if (epoch + 1) % 10 == 0:
-                    print(f"Epoch {epoch+1}/{epochs} - Avg Reward: {avg_reward:.2f}, "
-                          f"Policy Loss: {policy_loss:.4f}, Value Loss: {value_loss:.4f}")
+            # Actualizar historial y mostrar progreso
+            episode_rewards = self._update_history(
+                history, episode_rewards, epoch, epochs, policy_loss, value_loss
+            )
         
         return history
     
@@ -501,8 +567,7 @@ class A3C(A2C):
             worker = self.create_worker(env_fn, i)
             workers.append(worker)
         
-        # Variables para seguimiento
-        global_step = 0
+        # Variables para seguimiento de recompensas y pérdidas
         history = {
             'episode_rewards': [],
             'policy_losses': [],
@@ -660,6 +725,92 @@ class A3CWorker:
         
         return total_loss, policy_loss, value_loss, entropy_loss
     
+    def _collect_step_data(self, state, render):
+        """
+        Recoge datos de un solo paso en el entorno.
+        
+        Args:
+            state: Estado actual
+            render: Si se debe renderizar el entorno
+            
+        Returns:
+            Tuple con (state, action, value, reward, done)
+        """
+        if render and self.worker_id == 0:  # Solo renderizar el primer trabajador
+            self.env.render()
+        
+        # Obtener acción y valor con el modelo local
+        action = self.local_model.get_action(state)
+        value = self.local_model.get_value(state).numpy()
+        
+        # Ejecutar acción en el entorno
+        next_state, reward, done, _, _ = self.env.step(action)
+        
+        return state, action, value, reward, done, next_state
+    
+    def _handle_episode_end(self, episode_reward, steps_done, max_steps, shared_history):
+        """
+        Maneja el final de un episodio.
+        
+        Args:
+            episode_reward: Recompensa acumulada en el episodio
+            steps_done: Pasos completados
+            max_steps: Pasos máximos
+            shared_history: Historial compartido
+            
+        Returns:
+            Nuevo estado y recompensa de episodio reiniciada
+        """
+        state, _ = self.env.reset()
+        
+        # Guardar recompensa de episodio completado
+        with threading.Lock():  # Proteger acceso compartido
+            shared_history['episode_rewards'].append(episode_reward)
+        
+        # Mostrar progreso del trabajador
+        if self.worker_id == 0 and len(shared_history['episode_rewards']) % 10 == 0:
+            avg_reward = np.mean(shared_history['episode_rewards'][-10:])
+            print(f"Worker {self.worker_id} - Episode {len(shared_history['episode_rewards'])}, "
+                  f"Avg Reward: {avg_reward:.2f}, Steps: {steps_done}/{max_steps}")
+        
+        return state, 0  # Nuevo estado y recompensa reiniciada
+    
+    def _update_model_with_collected_data(self, states, actions, rewards, dones, values, done, next_state, shared_history):
+        """
+        Actualiza el modelo con los datos recolectados.
+        
+        Args:
+            states, actions, rewards, dones, values: Datos recolectados
+            done: Si el episodio terminó
+            next_state: Estado final
+            shared_history: Historial compartido
+        """
+        # Si el episodio no terminó, calcular valor del último estado
+        next_value = 0 if done else self.local_model.get_value(next_state).numpy()
+            
+        # Convertir a arrays de numpy
+        states_np = np.array(states, dtype=np.float32)
+        actions_np = np.array(actions, dtype=np.float32 if self.continuous else np.int32)
+        rewards_np = np.array(rewards, dtype=np.float32)
+        dones_np = np.array(dones, dtype=np.float32)
+        values_np = np.array(values, dtype=np.float32)
+        
+        # Calcular retornos y ventajas
+        returns, advantages = self.compute_returns_advantages(
+            rewards_np, values_np, dones_np, next_value
+        )
+        
+        # Actualizar modelo
+        _, policy_loss, value_loss, entropy_loss = self.train_step(
+            states_np, actions_np, returns, advantages
+        )
+        
+        # Guardar estadísticas
+        with threading.Lock():  # Proteger acceso compartido
+            shared_history['policy_losses'].append(policy_loss.numpy())
+            shared_history['value_losses'].append(value_loss.numpy())
+            shared_history['entropy_losses'].append(entropy_loss.numpy())
+    
     def train(self, n_steps, max_steps, shared_history, render=False):
         """
         Entrenamiento asíncrono del trabajador.
@@ -673,89 +824,39 @@ class A3CWorker:
         # Estado inicial
         state, _ = self.env.reset()
         episode_reward = 0
-        episode_step = 0
-        
         steps_done = 0
         
         while steps_done < max_steps:
             # Almacenar transiciones
             states, actions, rewards, dones, values = [], [], [], [], []
+            done = False
             
             # Recolectar experiencia durante n pasos
             for _ in range(n_steps):
-                if render and self.worker_id == 0:  # Solo renderizar el primer trabajador
-                    self.env.render()
+                # Recolectar datos de un paso
+                current_state, action, value, reward, done, next_state = self._collect_step_data(state, render)
                 
-                # Guardar estado actual
-                states.append(state)
-                
-                # Obtener acción y valor con el modelo local
-                action = self.local_model.get_action(state)
+                # Guardar datos
+                states.append(current_state)
                 actions.append(action)
-                
-                # Valor del estado actual
-                value = self.local_model.get_value(state).numpy()
                 values.append(value)
-                
-                # Ejecutar acción en el entorno
-                next_state, reward, done, _, _ = self.env.step(action)
-                
-                # Guardar recompensa y done
                 rewards.append(reward)
                 dones.append(done)
                 
-                # Actualizar recompensa acumulada
+                # Actualizar contadores
                 episode_reward += reward
-                episode_step += 1
                 steps_done += 1
+                state = next_state
                 
                 # Si el episodio termina, resetear
                 if done:
-                    state, _ = self.env.reset()
-                    
-                    # Guardar recompensa de episodio completado
-                    with threading.Lock():  # Proteger acceso compartido
-                        shared_history['episode_rewards'].append(episode_reward)
-                    
-                    # Mostrar progreso del trabajador
-                    if self.worker_id == 0 and len(shared_history['episode_rewards']) % 10 == 0:
-                        avg_reward = np.mean(shared_history['episode_rewards'][-10:])
-                        print(f"Worker {self.worker_id} - Episode {len(shared_history['episode_rewards'])}, "
-                              f"Avg Reward: {avg_reward:.2f}, Steps: {steps_done}/{max_steps}")
-                    
-                    episode_reward = 0
-                    episode_step = 0
+                    state, episode_reward = self._handle_episode_end(
+                        episode_reward, steps_done, max_steps, shared_history
+                    )
                     break
-                else:
-                    state = next_state
             
             # Si recolectamos suficientes pasos, actualizar modelo
-            if len(states) > 0:
-                # Si el episodio no terminó, calcular valor del último estado
-                if not done:
-                    next_value = self.local_model.get_value(state).numpy()
-                else:
-                    next_value = 0
-                    
-                # Convertir a arrays de numpy
-                states_np = np.array(states, dtype=np.float32)
-                actions_np = np.array(actions, dtype=np.float32 if self.continuous else np.int32)
-                rewards_np = np.array(rewards, dtype=np.float32)
-                dones_np = np.array(dones, dtype=np.float32)
-                values_np = np.array(values, dtype=np.float32)
-                
-                # Calcular retornos y ventajas
-                returns, advantages = self.compute_returns_advantages(
-                    rewards_np, values_np, dones_np, next_value
+            if states:
+                self._update_model_with_collected_data(
+                    states, actions, rewards, dones, values, done, state, shared_history
                 )
-                
-                # Actualizar modelo
-                _, policy_loss, value_loss, entropy_loss = self.train_step(
-                    states_np, actions_np, returns, advantages
-                )
-                
-                # Guardar estadísticas
-                with threading.Lock():  # Proteger acceso compartido
-                    shared_history['policy_losses'].append(policy_loss.numpy())
-                    shared_history['value_losses'].append(value_loss.numpy())
-                    shared_history['entropy_losses'].append(entropy_loss.numpy())

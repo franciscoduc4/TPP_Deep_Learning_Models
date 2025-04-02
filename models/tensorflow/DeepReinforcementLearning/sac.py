@@ -1,3 +1,4 @@
+import os, sys
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras.models import Model
@@ -8,8 +9,11 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.optimizers import Adam
 from collections import deque
 import random
-import os
-from ..config import SAC_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import SAC_CONFIG
 
 class ReplayBuffer:
     """
@@ -253,18 +257,34 @@ class SAC:
         action_dim,
         action_high,
         action_low,
-        actor_lr=SAC_CONFIG['actor_lr'],
-        critic_lr=SAC_CONFIG['critic_lr'],
-        alpha_lr=SAC_CONFIG['alpha_lr'],
-        gamma=SAC_CONFIG['gamma'],
-        tau=SAC_CONFIG['tau'],
-        buffer_capacity=SAC_CONFIG['buffer_capacity'],
-        batch_size=SAC_CONFIG['batch_size'],
-        initial_alpha=SAC_CONFIG['initial_alpha'],
-        target_entropy=None,
-        actor_hidden_units=None,
-        critic_hidden_units=None
+        config=None
     ):
+        """
+        Initialize SAC agent with environment dimensions and optional config.
+        
+        Args:
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_high: Upper bound of action space
+            action_low: Lower bound of action space
+            config: Optional dictionary with configuration parameters
+        """
+        # Use default config if none provided
+        if config is None:
+            config = {}
+            
+        # Set parameters from config with defaults from SAC_CONFIG
+        actor_lr = config.get('actor_lr', SAC_CONFIG['actor_lr'])
+        critic_lr = config.get('critic_lr', SAC_CONFIG['critic_lr'])
+        alpha_lr = config.get('alpha_lr', SAC_CONFIG['alpha_lr'])
+        gamma = config.get('gamma', SAC_CONFIG['gamma'])
+        tau = config.get('tau', SAC_CONFIG['tau'])
+        buffer_capacity = config.get('buffer_capacity', SAC_CONFIG['buffer_capacity'])
+        batch_size = config.get('batch_size', SAC_CONFIG['batch_size'])
+        initial_alpha = config.get('initial_alpha', SAC_CONFIG['initial_alpha'])
+        target_entropy = config.get('target_entropy', None)
+        actor_hidden_units = config.get('actor_hidden_units', None)
+        critic_hidden_units = config.get('critic_hidden_units', None)
         # Parámetros del entorno y del modelo
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -384,7 +404,7 @@ class SAC:
         
         return alpha_loss
     
-    @tf.function
+    @tf.function(experimental_relax_shapes=True)
     def update_critics(self, states, actions, rewards, next_states, dones):
         """
         Actualiza las redes de crítica.
@@ -399,6 +419,8 @@ class SAC:
         Returns:
             Pérdida de los críticos
         """
+        # Usar gamma como tensor constante
+        gamma = tf.constant(self.gamma, dtype=tf.float32)
         # Obtener alpha actual
         alpha = tf.exp(self.log_alpha)
         
@@ -413,9 +435,9 @@ class SAC:
         q_next = tf.minimum(q1_next, q2_next)
         
         # Añadir término de entropía al Q-target
-        soft_q_next = q_next - alpha * next_log_probs
-        
         # Calcular target usando ecuación de Bellman
+        # No considerar siguiente estado si el episodio terminó
+        q_target = rewards + (1 - dones) * gamma * soft_q_next
         # No considerar siguiente estado si el episodio terminó
         q_target = rewards + (1 - dones) * self.gamma * soft_q_next
         

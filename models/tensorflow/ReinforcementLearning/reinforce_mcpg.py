@@ -1,3 +1,4 @@
+import os, sys
 import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,7 +8,11 @@ from tensorflow.keras.layers import (
     Input, Dense, LayerNormalization, Dropout, Activation
 )
 from tensorflow.keras.optimizers import Adam
-from ..config import REINFORCE_CONFIG
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import REINFORCE_CONFIG
 
 
 class PolicyNetwork(Model):
@@ -339,6 +344,112 @@ class REINFORCE:
         
         return returns
     
+    def _run_episode(self, env, render=False):
+        """
+        Ejecuta un episodio completo y recolecta la experiencia.
+        
+        Args:
+            env: Entorno de OpenAI Gym o compatible
+            render: Si renderizar el entorno durante entrenamiento
+            
+        Returns:
+            Tupla con (estados, acciones, recompensas, recompensa_total, longitud_episodio)
+        """
+        state, _ = env.reset()
+        done = False
+        
+        # Almacenar datos del episodio
+        states = []
+        actions = []
+        rewards = []
+        
+        # Interactuar con el entorno hasta finalizar episodio
+        while not done:
+            if render:
+                env.render()
+            
+            # Seleccionar acción según política actual
+            action = self.policy.get_action(state)
+            
+            # Dar paso en el entorno
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # Guardar transición
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
+            
+            # Avanzar al siguiente estado
+            state = next_state
+        
+        return states, actions, rewards, sum(rewards), len(rewards)
+    
+    def _update_networks(self, states, actions, rewards):
+        """
+        Actualiza las redes de política y valor.
+        
+        Args:
+            states: Lista de estados
+            actions: Lista de acciones
+            rewards: Lista de recompensas
+            
+        Returns:
+            Tupla con (pérdida_política, entropía)
+        """
+        # Calcular retornos
+        returns = self.compute_returns(rewards)
+        
+        # Convertir a tensores
+        states = np.array(states, dtype=np.float32)
+        if self.continuous:
+            actions = np.array(actions, dtype=np.float32)
+        else:
+            actions = np.array(actions, dtype=np.int32)
+        returns = np.array(returns, dtype=np.float32)
+        
+        # Actualizar política
+        policy_loss, entropy = self.train_policy_step(
+            tf.convert_to_tensor(states), 
+            tf.convert_to_tensor(actions), 
+            tf.convert_to_tensor(returns)
+        )
+        
+        # Actualizar baseline si se usa
+        if self.use_baseline:
+            self.train_baseline_step(
+                tf.convert_to_tensor(states), 
+                tf.convert_to_tensor(returns)
+            )
+        
+        return policy_loss, entropy
+    
+    def _update_history(self, history, episode_reward, episode_length):
+        """
+        Actualiza la historia de entrenamiento con las métricas actuales.
+        
+        Args:
+            history: Diccionario de historia
+            episode_reward: Recompensa total del episodio
+            episode_length: Longitud del episodio
+            policy_loss: Pérdida de política
+            entropy: Entropía
+        """
+        history['episode_rewards'].append(episode_reward)
+        history['episode_lengths'].append(episode_length)
+        history['policy_losses'].append(self.policy_loss_metric.result().numpy())
+        if self.use_baseline:
+            history['baseline_losses'].append(self.baseline_loss_metric.result().numpy())
+        history['entropies'].append(self.entropy_metric.result().numpy())
+        history['mean_returns'].append(self.returns_metric.result().numpy())
+        
+        # Resetear métricas
+        self.policy_loss_metric.reset_states()
+        self.entropy_metric.reset_states()
+        self.returns_metric.reset_states()
+        if self.use_baseline:
+            self.baseline_loss_metric.reset_states()
+    
     def train(self, env, episodes=None, render=False):
         """
         Entrena el agente REINFORCE en el entorno dado.
@@ -366,79 +477,14 @@ class REINFORCE:
         start_time = time.time()
         
         for episode in range(episodes):
-            # Inicializar episodio
-            state, _ = env.reset()
-            done = False
+            # Ejecutar episodio
+            states, actions, rewards, episode_reward, episode_length = self._run_episode(env, render)
             
-            # Almacenar datos del episodio
-            states = []
-            actions = []
-            rewards = []
+            # Actualizar redes
+            policy_loss, entropy = self._update_networks(states, actions, rewards)
             
-            # Interactuar con el entorno hasta finalizar episodio
-            while not done:
-                if render:
-                    env.render()
-                
-                # Seleccionar acción según política actual
-                action = self.policy.get_action(state)
-                
-                # Dar paso en el entorno
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                
-                # Guardar transición
-                states.append(state)
-                actions.append(action)
-                rewards.append(reward)
-                
-                # Avanzar al siguiente estado
-                state = next_state
-            
-            # Calcular métricas del episodio
-            episode_reward = sum(rewards)
-            episode_length = len(rewards)
-            
-            # Calcular retornos
-            returns = self.compute_returns(rewards)
-            
-            # Convertir a tensores
-            states = np.array(states, dtype=np.float32)
-            if self.continuous:
-                actions = np.array(actions, dtype=np.float32)
-            else:
-                actions = np.array(actions, dtype=np.int32)
-            returns = np.array(returns, dtype=np.float32)
-            
-            # Actualizar política
-            policy_loss, entropy = self.train_policy_step(
-                tf.convert_to_tensor(states), 
-                tf.convert_to_tensor(actions), 
-                tf.convert_to_tensor(returns)
-            )
-            
-            # Actualizar baseline si se usa
-            if self.use_baseline:
-                self.train_baseline_step(
-                    tf.convert_to_tensor(states), 
-                    tf.convert_to_tensor(returns)
-                )
-            
-            # Guardar métricas
-            history['episode_rewards'].append(episode_reward)
-            history['episode_lengths'].append(episode_length)
-            history['policy_losses'].append(self.policy_loss_metric.result().numpy())
-            if self.use_baseline:
-                history['baseline_losses'].append(self.baseline_loss_metric.result().numpy())
-            history['entropies'].append(self.entropy_metric.result().numpy())
-            history['mean_returns'].append(self.returns_metric.result().numpy())
-            
-            # Resetear métricas
-            self.policy_loss_metric.reset_states()
-            self.entropy_metric.reset_states()
-            self.returns_metric.reset_states()
-            if self.use_baseline:
-                self.baseline_loss_metric.reset_states()
+            # Actualizar historia
+            self._update_history(history, episode_reward, episode_length)
             
             # Mostrar progreso periódicamente
             if (episode + 1) % REINFORCE_CONFIG['log_interval'] == 0:
