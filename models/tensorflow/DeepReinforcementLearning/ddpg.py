@@ -18,7 +18,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import DDPG_CONFIG
 
 
-class replay_buffer:
+class ReplayBuffer:
     """
     Buffer de experiencias para el algoritmo DDPG.
     
@@ -95,7 +95,7 @@ class replay_buffer:
         return len(self.buffer)
 
 
-class ou_action_noise:
+class OUActionNoise:
     """
     Implementa el proceso de ruido de Ornstein-Uhlenbeck para exploración.
     
@@ -185,7 +185,7 @@ def activation_function(x: tf.Tensor, name: str) -> tf.Tensor:
         return tf.nn.relu(x)
 
 
-class actor_network(Model):
+class ActorNetwork(Model):
     """
     Red de Actor para DDPG que mapea estados a acciones determinísticas.
     
@@ -276,7 +276,7 @@ class actor_network(Model):
         return scaled_actions
 
 
-class critic_network(Model):
+class CriticNetwork(Model):
     """
     Red de Crítico para DDPG que mapea pares (estado, acción) a valores-Q.
     
@@ -374,7 +374,7 @@ class critic_network(Model):
         return q_value
 
 
-class ddpg:
+class DDPG:
     """
     Implementación del algoritmo Deep Deterministic Policy Gradient (DDPG).
     
@@ -435,7 +435,7 @@ class ddpg:
         self.critic_hidden_units = critic_hidden_units or DDPG_CONFIG['critic_hidden_units']
         
         # Crear modelos Actor y Crítico
-        self.actor = actor_network(
+        self.actor = ActorNetwork(
             state_dim=state_dim,
             action_dim=action_dim,
             action_high=action_high,
@@ -443,14 +443,14 @@ class ddpg:
             hidden_units=self.actor_hidden_units
         )
         
-        self.critic = critic_network(
+        self.critic = CriticNetwork(
             state_dim=state_dim,
             action_dim=action_dim,
             hidden_units=self.critic_hidden_units
         )
         
         # Crear copias target
-        self.target_actor = actor_network(
+        self.target_actor = ActorNetwork(
             state_dim=state_dim,
             action_dim=action_dim,
             action_high=action_high,
@@ -458,7 +458,7 @@ class ddpg:
             hidden_units=self.actor_hidden_units
         )
         
-        self.target_critic = critic_network(
+        self.target_critic = CriticNetwork(
             state_dim=state_dim,
             action_dim=action_dim,
             hidden_units=self.critic_hidden_units
@@ -482,10 +482,10 @@ class ddpg:
         self.critic_optimizer = Adam(learning_rate=critic_lr)
         
         # Buffer de experiencias
-        self.replay_buffer = replay_buffer(buffer_capacity)
+        self.replay_buffer = ReplayBuffer(buffer_capacity)
         
         # Ruido para exploración
-        self.noise = ou_action_noise(
+        self.noise = OUActionNoise(
             mean=np.zeros(action_dim),
             std_deviation=noise_std * np.ones(action_dim),
             seed=seed

@@ -9,6 +9,7 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanSquaredError
+from typing import Dict, List, Tuple, Any, Optional, Union, Callable, TypeVar
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -22,8 +23,25 @@ class ActorCriticModel:
     para política (actor) y valor (crítico).
     
     TRPO requiere modelos separados para actor y crítico en lugar de un único modelo.
+    
+    Parámetros:
+    -----------
+    state_dim : int
+        Dimensión del espacio de estados
+    action_dim : int
+        Dimensión del espacio de acciones
+    continuous : bool, opcional
+        Si el espacio de acciones es continuo o discreto (default: True)
+    hidden_units : Optional[List[int]], opcional
+        Unidades en capas ocultas (default: None)
     """
-    def __init__(self, state_dim, action_dim, continuous=True, hidden_units=None):
+    def __init__(
+        self, 
+        state_dim: int, 
+        action_dim: int, 
+        continuous: bool = True, 
+        hidden_units: Optional[List[int]] = None
+    ) -> None:
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.continuous = continuous
@@ -43,9 +61,14 @@ class ActorCriticModel:
         # Optimizer solo para el crítico (el actor se actualiza con TRPO)
         self.critic_optimizer = Adam(learning_rate=TRPO_CONFIG['critic_learning_rate'])
     
-    def _create_actor(self):
+    def _create_actor(self) -> Model:
         """
         Crea la red del actor.
+        
+        Retorna:
+        --------
+        Model
+            Modelo de Keras para el actor
         """
         inputs = Input(shape=(self.state_dim,))
         x = inputs
@@ -72,9 +95,14 @@ class ActorCriticModel:
             logits = Dense(self.action_dim, activation=None, name='actor_logits')(x)
             return tf.keras.Model(inputs=inputs, outputs=logits)
     
-    def _create_critic(self):
+    def _create_critic(self) -> Model:
         """
         Crea la red del crítico.
+        
+        Retorna:
+        --------
+        Model
+            Modelo de Keras para el crítico
         """
         inputs = Input(shape=(self.state_dim,))
         x = inputs
@@ -90,15 +118,20 @@ class ActorCriticModel:
         
         return tf.keras.Model(inputs=inputs, outputs=value)
     
-    def get_action(self, state, deterministic=False):
+    def get_action(self, state: np.ndarray, deterministic: bool = False) -> np.ndarray:
         """
         Obtiene una acción basada en el estado actual.
         
-        Args:
-            state: El estado actual
-            deterministic: Si es True, devuelve la acción con máxima probabilidad
+        Parámetros:
+        -----------
+        state : np.ndarray
+            El estado actual
+        deterministic : bool, opcional
+            Si es True, devuelve la acción con máxima probabilidad (default: False)
         
-        Returns:
+        Retorna:
+        --------
+        np.ndarray
             Una acción muestreada de la distribución de política
         """
         state = tf.convert_to_tensor([state], dtype=tf.float32)
@@ -123,43 +156,53 @@ class ActorCriticModel:
             action = tf.random.categorical(logits, 1)
             return action[0, 0].numpy()
     
-    def get_action_distribution_params(self, states):
+    def get_action_distribution_params(self, states: tf.Tensor) -> Union[Tuple[tf.Tensor, tf.Tensor], tf.Tensor]:
         """
         Obtiene los parámetros de la distribución de política para estados dados.
         
-        Args:
-            states: Estados para evaluar
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados para evaluar
             
-        Returns:
+        Retorna:
+        --------
+        Union[Tuple[tf.Tensor, tf.Tensor], tf.Tensor]
             Parámetros de la distribución (mu, log_std para continuo, logits para discreto)
         """
-        if self.continuous:
-            return self.actor(states)
-        else:
-            return self.actor(states)
+        return self.actor(states)
     
-    def get_value(self, state):
+    def get_value(self, state: np.ndarray) -> float:
         """
         Obtiene el valor estimado para un estado.
         
-        Args:
-            state: El estado para evaluar
+        Parámetros:
+        -----------
+        state : np.ndarray
+            El estado para evaluar
             
-        Returns:
+        Retorna:
+        --------
+        float
             El valor estimado del estado
         """
         state = tf.convert_to_tensor([state], dtype=tf.float32)
         return self.critic(state)[0, 0].numpy()
     
-    def get_log_prob(self, states, actions):
+    def get_log_prob(self, states: tf.Tensor, actions: tf.Tensor) -> tf.Tensor:
         """
         Calcula el logaritmo de probabilidad de acciones bajo la política actual.
         
-        Args:
-            states: Estados observados
-            actions: Acciones tomadas
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados observados
+        actions : tf.Tensor
+            Acciones tomadas
             
-        Returns:
+        Retorna:
+        --------
+        tf.Tensor
             Logaritmo de probabilidad de las acciones
         """
         if self.continuous:
@@ -186,17 +229,30 @@ class ActorCriticModel:
             )
             return log_probs
     
-    def get_kl_divergence(self, states, old_mu=None, old_log_std=None, old_logits=None):
+    def get_kl_divergence(
+        self, 
+        states: tf.Tensor, 
+        old_mu: Optional[tf.Tensor] = None, 
+        old_log_std: Optional[tf.Tensor] = None, 
+        old_logits: Optional[tf.Tensor] = None
+    ) -> tf.Tensor:
         """
         Calcula la divergencia KL entre la política antigua y la actual.
         
-        Args:
-            states: Estados para evaluar
-            old_mu: Medias de la política antigua (para continuo)
-            old_log_std: Log std de la política antigua (para continuo)
-            old_logits: Logits de la política antigua (para discreto)
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados para evaluar
+        old_mu : Optional[tf.Tensor], opcional
+            Medias de la política antigua (para continuo) (default: None)
+        old_log_std : Optional[tf.Tensor], opcional
+            Log std de la política antigua (para continuo) (default: None)
+        old_logits : Optional[tf.Tensor], opcional
+            Logits de la política antigua (para discreto) (default: None)
             
-        Returns:
+        Retorna:
+        --------
+        tf.Tensor
             Divergencia KL media
         """
         if self.continuous:
@@ -223,14 +279,18 @@ class ActorCriticModel:
             )
             return tf.reduce_mean(kl, axis=0)
     
-    def get_entropy(self, states):
+    def get_entropy(self, states: tf.Tensor) -> tf.Tensor:
         """
         Calcula la entropía de la política para estados dados.
         
-        Args:
-            states: Estados para evaluar
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados para evaluar
             
-        Returns:
+        Retorna:
+        --------
+        tf.Tensor
             Entropía media de la política
         """
         if self.continuous:
@@ -249,11 +309,13 @@ class ActorCriticModel:
         
         return tf.reduce_mean(entropy, axis=0)
     
-    def get_flat_params(self):
+    def get_flat_params(self) -> tf.Tensor:
         """
         Obtiene los parámetros de la red del actor en un vector plano.
         
-        Returns:
+        Retorna:
+        --------
+        tf.Tensor
             Vector con los parámetros
         """
         params = []
@@ -261,12 +323,14 @@ class ActorCriticModel:
             params.append(tf.reshape(var, [-1]))
         return tf.concat(params, axis=0)
     
-    def set_flat_params(self, flat_params):
+    def set_flat_params(self, flat_params: tf.Tensor) -> None:
         """
         Establece los parámetros de la red del actor desde un vector plano.
         
-        Args:
-            flat_params: Vector con los nuevos parámetros
+        Parámetros:
+        -----------
+        flat_params : tf.Tensor
+            Vector con los nuevos parámetros
         """
         start_idx = 0
         for var in self.actor.trainable_variables:
@@ -283,20 +347,48 @@ class TRPO:
     TRPO es un algoritmo de optimización de política que actualiza la política
     de forma conservadora, manteniendo las actualizaciones dentro de una región
     de confianza definida por una restricción de divergencia KL.
+    
+    Parámetros:
+    -----------
+    state_dim : int
+        Dimensión del espacio de estados
+    action_dim : int
+        Dimensión del espacio de acciones
+    continuous : bool, opcional
+        Si el espacio de acciones es continuo o discreto (default: True)
+    gamma : float, opcional
+        Factor de descuento (default: TRPO_CONFIG['gamma'])
+    delta : float, opcional
+        Límite de divergencia KL (default: TRPO_CONFIG['delta'])
+    hidden_units : Optional[List[int]], opcional
+        Unidades en capas ocultas (default: None)
+    backtrack_iters : int, opcional
+        Iteraciones para búsqueda de línea (default: TRPO_CONFIG['backtrack_iters'])
+    backtrack_coeff : float, opcional
+        Coeficiente de reducción para búsqueda de línea (default: TRPO_CONFIG['backtrack_coeff'])
+    cg_iters : int, opcional
+        Iteraciones para gradiente conjugado (default: TRPO_CONFIG['cg_iters'])
+    damping : float, opcional
+        Término de regularización para estabilidad numérica (default: TRPO_CONFIG['damping'])
     """
     def __init__(
         self, 
-        state_dim, 
-        action_dim,
-        continuous=True,
-        gamma=TRPO_CONFIG['gamma'],
-        delta=TRPO_CONFIG['delta'],
-        hidden_units=None,
-        backtrack_iters=TRPO_CONFIG['backtrack_iters'],
-        backtrack_coeff=TRPO_CONFIG['backtrack_coeff'],
-        cg_iters=TRPO_CONFIG['cg_iters'],
-        damping=TRPO_CONFIG['damping']
-    ):
+        state_dim: int, 
+        action_dim: int,
+        continuous: bool = True,
+        gamma: float = TRPO_CONFIG['gamma'],
+        delta: float = TRPO_CONFIG['delta'],
+        hidden_units: Optional[List[int]] = None,
+        backtrack_iters: int = TRPO_CONFIG['backtrack_iters'],
+        backtrack_coeff: float = TRPO_CONFIG['backtrack_coeff'],
+        cg_iters: int = TRPO_CONFIG['cg_iters'],
+        damping: float = TRPO_CONFIG['damping']
+    ) -> None:
+        # Configurar semilla para reproducibilidad
+        seed = TRPO_CONFIG.get('seed', 42)
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+        
         # Parámetros del modelo
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -328,19 +420,34 @@ class TRPO:
         self.kl_metric = tf.keras.metrics.Mean('kl_divergence')
         self.entropy_metric = tf.keras.metrics.Mean('entropy')
     
-    def compute_gae(self, rewards, values, next_values, dones, lam=TRPO_CONFIG['lambda']):
+    def compute_gae(
+        self, 
+        rewards: np.ndarray, 
+        values: np.ndarray, 
+        next_values: np.ndarray, 
+        dones: np.ndarray, 
+        lam: float = TRPO_CONFIG['lambda']
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Calcula el Estimador de Ventaja Generalizada (GAE).
         
-        Args:
-            rewards: Recompensas recibidas
-            values: Valores estimados para los estados actuales
-            next_values: Valores estimados para los estados siguientes
-            dones: Indicadores de fin de episodio
-            lam: Factor lambda para GAE
+        Parámetros:
+        -----------
+        rewards : np.ndarray
+            Recompensas recibidas
+        values : np.ndarray
+            Valores estimados para los estados actuales
+        next_values : np.ndarray
+            Valores estimados para los estados siguientes
+        dones : np.ndarray
+            Indicadores de fin de episodio
+        lam : float, opcional
+            Factor lambda para GAE (default: TRPO_CONFIG['lambda'])
             
-        Returns:
-            Ventajas y retornos calculados
+        Retorna:
+        --------
+        Tuple[np.ndarray, np.ndarray]
+            (ventajas, retornos)
         """
         # Añadir el valor del último estado
         values = np.append(values, next_values[-1])
@@ -367,15 +474,20 @@ class TRPO:
         
         return advantages, returns
     
-    def fisher_vector_product(self, states, p):
+    def fisher_vector_product(self, states: tf.Tensor, p: tf.Tensor) -> tf.Tensor:
         """
         Calcula el producto Fisher-vector para el método de gradiente conjugado.
         
-        Args:
-            states: Estados
-            p: Vector para multiplicar con la matriz Fisher
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados
+        p : tf.Tensor
+            Vector para multiplicar con la matriz Fisher
             
-        Returns:
+        Retorna:
+        --------
+        tf.Tensor
             Producto Fisher-vector
         """
         # Guardar parámetros originales
@@ -406,15 +518,20 @@ class TRPO:
         # Añadir término de amortiguación para estabilidad numérica
         return flat_hessian_p + self.damping * p
     
-    def conjugate_gradient(self, states, b):
+    def conjugate_gradient(self, states: tf.Tensor, b: np.ndarray) -> np.ndarray:
         """
         Resuelve el sistema lineal Ax = b usando el método de gradiente conjugado.
         
-        Args:
-            states: Estados
-            b: Vector lado derecho de la ecuación
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados
+        b : np.ndarray
+            Vector lado derecho de la ecuación
             
-        Returns:
+        Retorna:
+        --------
+        np.ndarray
             Solución aproximada x
         """
         x = np.zeros_like(b)
@@ -439,19 +556,35 @@ class TRPO:
         
         return x
     
-    def update_policy(self, states, actions, advantages):
+    def update_policy(
+        self, 
+        states: np.ndarray, 
+        actions: np.ndarray, 
+        advantages: np.ndarray
+    ) -> Dict[str, float]:
         """
         Actualiza la política utilizando el método TRPO.
         
-        Args:
-            states: Estados
-            actions: Acciones
-            advantages: Ventajas
+        Parámetros:
+        -----------
+        states : np.ndarray
+            Estados
+        actions : np.ndarray
+            Acciones
+        advantages : np.ndarray
+            Ventajas
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, float]
             Métricas de actualización
         """
         start_time = time.time()
+        
+        # Convertir a tensores
+        states = tf.convert_to_tensor(states, dtype=tf.float32)
+        actions = tf.convert_to_tensor(actions, dtype=tf.float32 if self.continuous else tf.int32)
+        advantages = tf.convert_to_tensor(advantages, dtype=tf.float32)
         
         # Guardar parámetros de distribución antiguos para KL
         if self.continuous:
@@ -486,9 +619,6 @@ class TRPO:
         shs = 0.5 * np.dot(step_direction, fvp.numpy())
         lm = np.sqrt(shs / self.delta)
         full_step = step_direction / lm
-        
-        # Línea de búsqueda para asegurar mejora y restricción KL
-        _ = -np.dot(flat_policy_grad.numpy(), full_step)
         
         # Guardar parámetros actuales
         current_params = old_params.numpy()
@@ -538,43 +668,60 @@ class TRPO:
             'elapsed_time': elapsed_time
         }
     
-    def update_value(self, states, returns, epochs=TRPO_CONFIG['value_epochs'], batch_size=TRPO_CONFIG['batch_size']):
+    def update_value(
+        self, 
+        states: np.ndarray, 
+        returns: np.ndarray, 
+        epochs: int = TRPO_CONFIG['value_epochs'], 
+        batch_size: int = TRPO_CONFIG['batch_size']
+    ) -> Dict[str, float]:
         """
         Actualiza la red de valor (crítico) usando descenso de gradiente.
         
-        Args:
-            states: Estados
-            returns: Retornos objetivo
-            epochs: Número de épocas para entrenar
-            batch_size: Tamaño de lote
+        Parámetros:
+        -----------
+        states : np.ndarray
+            Estados
+        returns : np.ndarray
+            Retornos objetivo
+        epochs : int, opcional
+            Número de épocas para entrenar (default: TRPO_CONFIG['value_epochs'])
+        batch_size : int, opcional
+            Tamaño de lote (default: TRPO_CONFIG['batch_size'])
             
-        Returns:
-            Pérdida de valor
+        Retorna:
+        --------
+        Dict[str, float]
+            Estadísticas de actualización
         """
         start_time = time.time()
-        dataset_size = len(states)
         
+        # Convertir a tensores
+        states = tf.convert_to_tensor(states, dtype=tf.float32)
+        returns = tf.convert_to_tensor(returns, dtype=tf.float32)
+        
+        dataset_size = len(states)
         indices = np.arange(dataset_size)
         losses = []
         
-        # Create a Generator instance with a fixed seed for reproducibility
-        seed = TRPO_CONFIG.get('seed', 42)  # Use config seed or default to 42
+        # Crear generador con semilla fija para reproducibilidad
+        seed = TRPO_CONFIG.get('seed', 42)
         rng = np.random.default_rng(seed)
         
         for _ in range(epochs):
-            # Mezclar datos en cada época usando the Generator
+            # Mezclar datos en cada época
             rng.shuffle(indices)
             
             for start_idx in range(0, dataset_size, batch_size):
                 # Obtener lote
-                idx = indices[start_idx:start_idx + batch_size]
+                idx = indices[start_idx:min(start_idx + batch_size, dataset_size)]
                 batch_states = tf.gather(states, idx)
                 batch_returns = tf.gather(returns, idx)
                 
                 # Actualizar red de valor
                 with tf.GradientTape() as tape:
                     values = self.model.critic(batch_states)
-                    # Assegurar que values y batch_returns tengan la misma forma
+                    # Asegurar que values y batch_returns tengan la misma forma
                     values = tf.squeeze(values)
                     loss = tf.reduce_mean(tf.square(values - batch_returns), axis=0)
                 
@@ -595,16 +742,27 @@ class TRPO:
             'elapsed_time': elapsed_time
         }
     
-    def collect_trajectories(self, env, min_steps=TRPO_CONFIG['min_steps_per_update'], render=False):
+    def collect_trajectories(
+        self, 
+        env: Any, 
+        min_steps: int = TRPO_CONFIG['min_steps_per_update'], 
+        render: bool = False
+    ) -> Dict[str, np.ndarray]:
         """
         Recolecta trayectorias ejecutando la política actual en el entorno.
         
-        Args:
-            env: Entorno
-            min_steps: Mínimo número de pasos antes de actualizar
-            render: Si renderizar el entorno o no
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o compatible
+        min_steps : int, opcional
+            Mínimo número de pasos antes de actualizar (default: TRPO_CONFIG['min_steps_per_update'])
+        render : bool, opcional
+            Si renderizar el entorno o no (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, np.ndarray]
             Datos recolectados
         """
         states, actions, rewards, dones, next_states, values = [], [], [], [], [], []
@@ -681,20 +839,33 @@ class TRPO:
             'total_steps': total_steps
         }
     
-    def train(self, env, iterations=TRPO_CONFIG['iterations'], 
-             min_steps_per_update=TRPO_CONFIG['min_steps_per_update'],
-             render=False, evaluate_interval=TRPO_CONFIG['evaluate_interval']):
+    def train(
+        self, 
+        env: Any, 
+        iterations: int = TRPO_CONFIG['iterations'], 
+        min_steps_per_update: int = TRPO_CONFIG['min_steps_per_update'],
+        render: bool = False, 
+        evaluate_interval: int = TRPO_CONFIG['evaluate_interval']
+    ) -> Dict[str, List[float]]:
         """
         Entrena el agente TRPO.
         
-        Args:
-            env: Entorno para entrenar
-            iterations: Número de iteraciones de entrenamiento
-            min_steps_per_update: Mínimo de pasos antes de actualizar la política
-            render: Si renderizar el entorno o no
-            evaluate_interval: Intervalos para evaluación
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para entrenar
+        iterations : int, opcional
+            Número de iteraciones de entrenamiento (default: TRPO_CONFIG['iterations'])
+        min_steps_per_update : int, opcional
+            Mínimo de pasos antes de actualizar la política (default: TRPO_CONFIG['min_steps_per_update'])
+        render : bool, opcional
+            Si renderizar el entorno o no (default: False)
+        evaluate_interval : int, opcional
+            Intervalos para evaluación (default: TRPO_CONFIG['evaluate_interval'])
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia de entrenamiento
         """
         history = {
@@ -758,16 +929,27 @@ class TRPO:
         
         return history
     
-    def evaluate(self, env, episodes=10, render=False):
+    def evaluate(
+        self, 
+        env: Any, 
+        episodes: int = 10, 
+        render: bool = False
+    ) -> float:
         """
         Evalúa el agente TRPO en el entorno.
         
-        Args:
-            env: Entorno para evaluar
-            episodes: Número de episodios
-            render: Si renderizar el entorno o no
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para evaluar
+        episodes : int, opcional
+            Número de episodios (default: 10)
+        render : bool, opcional
+            Si renderizar el entorno o no (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        float
             Recompensa media
         """
         rewards = []
@@ -797,55 +979,80 @@ class TRPO:
         
         return np.mean(rewards)
     
-    def save_model(self, actor_path, critic_path):
+    def save_model(self, actor_path: str, critic_path: str) -> None:
         """
         Guarda los modelos del actor y crítico.
         
-        Args:
-            actor_path: Ruta para guardar el actor
-            critic_path: Ruta para guardar el crítico
+        Parámetros:
+        -----------
+        actor_path : str
+            Ruta para guardar el actor
+        critic_path : str
+            Ruta para guardar el crítico
         """
         self.model.actor.save_weights(actor_path)
         self.model.critic.save_weights(critic_path)
         print(f"Modelo guardado en {actor_path} y {critic_path}")
     
-    def load_model(self, actor_path, critic_path):
+    def load_model(self, actor_path: str, critic_path: str) -> None:
         """
         Carga los modelos del actor y crítico.
         
-        Args:
-            actor_path: Ruta para cargar el actor
-            critic_path: Ruta para cargar el crítico
+        Parámetros:
+        -----------
+        actor_path : str
+            Ruta para cargar el actor
+        critic_path : str
+            Ruta para cargar el crítico
         """
         # Asegurarse que los modelos están construidos
         dummy_state = np.zeros((1, self.state_dim))
         if self.continuous:
+            dummy_state = np.zeros((1, self.state_dim))
             _ = self.model.actor(dummy_state)
-        else:
-            _ = self.model.actor(dummy_state)
-        _ = self.model.critic(dummy_state)
-        
-        # Cargar pesos
-        self.model.actor.load_weights(actor_path)
-        self.model.critic.load_weights(critic_path)
-        print(f"Modelo cargado desde {actor_path} y {critic_path}")
+            _ = self.model.critic(dummy_state)
+            self.model.critic.load_weights(critic_path)
+            print(f"Modelo cargado desde {actor_path} y {critic_path}")
     
-    def visualize_training(self, history, smoothing_window=10):
+    def visualize_training(self, history: Dict[str, List[float]], smoothing_window: int = 10) -> None:
         """
         Visualiza la historia de entrenamiento.
         
-        Args:
-            history: Historia de entrenamiento
-            smoothing_window: Tamaño de ventana para suavizado
+        Parámetros:
+        -----------
+        history : Dict[str, List[float]]
+            Historia de entrenamiento
+        smoothing_window : int, opcional
+            Tamaño de ventana para suavizado (default: 10)
         """
         import matplotlib.pyplot as plt
         
+        # Constantes para etiquetas
+        LABEL_ITERATION = 'Iteración'
+        LABEL_ENTROPY = 'Entropía'
+        LABEL_LOSS = 'Pérdida'
+        
         # Función para suavizar datos
-        def smooth(data, window_size):
+        def smooth(data: List[float], window_size: int) -> np.ndarray:
+            """
+            Aplica suavizado con media móvil a los datos.
+            
+            Parámetros:
+            -----------
+            data : List[float]
+                Datos a suavizar
+            window_size : int
+                Tamaño de la ventana de suavizado
+                
+            Retorna:
+            --------
+            np.ndarray
+                Datos suavizados
+            """
             if len(data) < window_size:
-                return data
+                return np.array(data)
             kernel = np.ones(window_size) / window_size
-            return np.convolve(data, kernel, mode='valid')
+            return np.convolve(np.array(data), kernel, mode='valid')
         
         # Crear figura con múltiples subplots
         _, axs = plt.subplots(3, 2, figsize=(15, 12))
@@ -860,7 +1067,10 @@ class TRPO:
                 label='Suavizado'
             )
         axs[0, 0].set_title('Recompensa Media por Episodio')
-        axs[0, 0].set_xlabel('Iteración')
+        axs[0, 0].set_xlabel(LABEL_ITERATION)
+        axs[0, 0].set_ylabel('Recompensa')
+        axs[0, 0].grid(alpha=0.3)
+        axs[0, 0].legend()
         axs[0, 0].set_ylabel('Recompensa')
         axs[0, 0].grid(alpha=0.3)
         axs[0, 0].legend()
@@ -870,7 +1080,11 @@ class TRPO:
             eval_interval = len(history['iterations']) // len(history['evaluation_rewards'])
             x_eval = [i * eval_interval for i in range(len(history['evaluation_rewards']))]
             axs[0, 1].plot(x_eval, history['evaluation_rewards'], color='green', marker='o')
+            axs[0, 1].plot(x_eval, history['evaluation_rewards'], color='green', marker='o')
             axs[0, 1].set_title('Recompensa de Evaluación')
+            axs[0, 1].set_xlabel(LABEL_ITERATION)
+            axs[0, 1].set_ylabel('Recompensa Media')
+            axs[0, 1].grid(alpha=0.3)
             axs[0, 1].set_xlabel('Iteración')
             axs[0, 1].set_ylabel('Recompensa Media')
             axs[0, 1].grid(alpha=0.3)
@@ -885,8 +1099,11 @@ class TRPO:
                 label='Suavizado'
             )
         axs[1, 0].set_title('Pérdida de Política')
-        axs[1, 0].set_xlabel('Iteración')
-        axs[1, 0].set_ylabel('Pérdida')
+        axs[1, 0].set_xlabel(LABEL_ITERATION)
+        axs[1, 0].set_ylabel(LABEL_LOSS)
+        axs[1, 0].grid(alpha=0.3)
+        axs[1, 0].legend()
+        axs[1, 0].set_ylabel(LABEL_LOSS)
         axs[1, 0].grid(alpha=0.3)
         axs[1, 0].legend()
         
@@ -900,8 +1117,11 @@ class TRPO:
                 label='Suavizado'
             )
         axs[1, 1].set_title('Pérdida de Valor')
-        axs[1, 1].set_xlabel('Iteración')
-        axs[1, 1].set_ylabel('Pérdida')
+        axs[1, 1].set_xlabel(LABEL_ITERATION)
+        axs[1, 1].set_ylabel(LABEL_LOSS)
+        axs[1, 1].grid(alpha=0.3)
+        axs[1, 1].legend()
+        axs[1, 1].set_ylabel(LABEL_LOSS)
         axs[1, 1].grid(alpha=0.3)
         axs[1, 1].legend()
         
@@ -915,7 +1135,10 @@ class TRPO:
                 label='Suavizado'
             )
         axs[2, 0].set_title('KL Divergence')
-        axs[2, 0].set_xlabel('Iteración')
+        axs[2, 0].set_xlabel(LABEL_ITERATION)
+        axs[2, 0].set_ylabel('KL')
+        axs[2, 0].grid(alpha=0.3)
+        axs[2, 0].legend()
         axs[2, 0].set_ylabel('KL')
         axs[2, 0].grid(alpha=0.3)
         axs[2, 0].legend()
@@ -929,9 +1152,12 @@ class TRPO:
                 color='brown',
                 label='Suavizado'
             )
-        axs[2, 1].set_title('Entropía')
-        axs[2, 1].set_xlabel('Iteración')
-        axs[2, 1].set_ylabel('Entropía')
+        axs[2, 1].set_title(LABEL_ENTROPY)
+        axs[2, 1].set_xlabel(LABEL_ITERATION)
+        axs[2, 1].set_ylabel(LABEL_ENTROPY)
+        axs[2, 1].grid(alpha=0.3)
+        axs[2, 1].legend()
+        axs[2, 1].set_ylabel(LABEL_ENTROPY)
         axs[2, 1].grid(alpha=0.3)
         axs[2, 1].legend()
         

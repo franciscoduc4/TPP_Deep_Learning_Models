@@ -19,7 +19,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import DQN_CONFIG
 
 
-class replay_buffer:
+class ReplayBuffer:
     """
     Buffer de experiencias para el algoritmo DQN.
     
@@ -96,7 +96,7 @@ class replay_buffer:
         return len(self.buffer)
 
 
-class prioritized_replay_buffer(replay_buffer):
+class PrioritizedReplayBuffer(ReplayBuffer):
     """
     Buffer de experiencias con muestreo prioritario.
     
@@ -213,7 +213,7 @@ class prioritized_replay_buffer(replay_buffer):
             self.priorities[idx] = priority
 
 
-class q_network(Model):
+class QNetwork(Model):
     """
     Red Q para DQN que mapea estados a valores Q.
     
@@ -239,7 +239,7 @@ class q_network(Model):
                 dueling: bool = False,
                 activation: str = 'relu',
                 dropout_rate: float = 0.0) -> None:
-        super(q_network, self).__init__()
+        super(QNetwork, self).__init__()
         
         # Valores predeterminados para capas ocultas
         if hidden_units is None:
@@ -423,7 +423,7 @@ class q_network(Model):
             return int(tf.argmax(q_values[0]).numpy())
 
 
-class dqn:
+class DQN:
     """
     Implementación del algoritmo Deep Q-Network (DQN).
     
@@ -489,7 +489,7 @@ class dqn:
             self.hidden_units = hidden_units
         
         # Crear modelo Q y modelo Q Target
-        self.q_network = q_network(
+        self.q_network = QNetwork(
             state_dim, 
             action_dim, 
             self.hidden_units, 
@@ -497,7 +497,7 @@ class dqn:
             activation,
             dropout_rate
         )
-        self.target_q_network = q_network(
+        self.target_q_network = QNetwork(
             state_dim, 
             action_dim, 
             self.hidden_units, 
@@ -521,13 +521,13 @@ class dqn:
         # Buffer de experiencias
         if self.prioritized:
             # Con prioridad de muestreo basada en TD-error
-            self.replay_buffer = prioritized_replay_buffer(buffer_capacity)
+            self.replay_buffer = PrioritizedReplayBuffer(buffer_capacity)
             self.alpha = DQN_CONFIG['priority_alpha']
             self.beta = DQN_CONFIG['priority_beta']
             self.beta_increment = DQN_CONFIG['priority_beta_increment']
         else:
             # Buffer uniforme clásico
-            self.replay_buffer = replay_buffer(buffer_capacity)
+            self.replay_buffer = ReplayBuffer(buffer_capacity)
         
         # Métricas acumuladas
         self.loss_sum = 0.0

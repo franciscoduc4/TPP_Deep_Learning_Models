@@ -14,7 +14,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import TRANSFORMER_CONFIG
 
 @register_keras_serializable()
-class position_encoding(tf.keras.layers.Layer):
+class PositionEncoding(tf.keras.layers.Layer):
     """
     Codificación posicional para el Transformer.
     
@@ -202,7 +202,7 @@ def create_transformer_model(cgm_shape: tuple, other_features_shape: tuple) -> M
     # Proyección inicial y codificación posicional
     x = Dense(TRANSFORMER_CONFIG['key_dim'] * TRANSFORMER_CONFIG['num_heads'])(cgm_input)
     if TRANSFORMER_CONFIG['use_relative_pos']:
-        x = position_encoding(
+        x = PositionEncoding(
             TRANSFORMER_CONFIG['max_position'],
             TRANSFORMER_CONFIG['key_dim'] * TRANSFORMER_CONFIG['num_heads']
         )(x)

@@ -18,7 +18,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import PPO_CONFIG
 
 
-class actor_critic_model(Model):
+class ActorCriticModel(Model):
     """
     Modelo Actor-Crítico para PPO que divide la arquitectura en redes para
     política (actor) y valor (crítico).
@@ -36,7 +36,7 @@ class actor_critic_model(Model):
                 state_dim: int, 
                 action_dim: int, 
                 hidden_units: Optional[List[int]] = None) -> None:
-        super(actor_critic_model, self).__init__()
+        super(ActorCriticModel, self).__init__()
         
         # Valores predeterminados para capas ocultas
         if hidden_units is None:
@@ -217,7 +217,7 @@ class PPO:
             self.hidden_units = hidden_units
         
         # Crear modelo y optimizador
-        self.model = actor_critic_model(state_dim, action_dim, self.hidden_units)
+        self.model = ActorCriticModel(state_dim, action_dim, self.hidden_units)
         self.optimizer = Adam(learning_rate=learning_rate)
         
         # Métricas

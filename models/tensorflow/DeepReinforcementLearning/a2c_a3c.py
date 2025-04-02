@@ -16,7 +16,7 @@ sys.path.append(PROJECT_ROOT)
 from models.config import A2C_A3C_CONFIG
 
 
-class actor_critic_model(Model):
+class ActorCriticModel(Model):
     """
     Modelo Actor-Crítico para A2C que divide la arquitectura en redes para
     política (actor) y valor (crítico).
@@ -234,7 +234,7 @@ class actor_critic_model(Model):
         return log_probs, values, entropy
 
 
-class a2c:
+class A2C:
     """
     Implementación del algoritmo Advantage Actor-Critic (A2C).
     
@@ -290,7 +290,7 @@ class a2c:
             self.hidden_units = hidden_units
         
         # Crear modelo y optimizador
-        self.model = actor_critic_model(state_dim, action_dim, continuous, self.hidden_units)
+        self.model = ActorCriticModel(state_dim, action_dim, continuous, self.hidden_units)
         self.optimizer = Adam(learning_rate=learning_rate)
         
         # Métricas
@@ -657,7 +657,7 @@ class a2c:
         self.model.load_weights(filepath)
 
 
-class a3c(a2c):
+class A3C(A2C):
     """
     Implementación de Asynchronous Advantage Actor-Critic (A3C).
     
@@ -692,7 +692,7 @@ class a3c(a2c):
         self.n_workers = n_workers
         self.workers = []
     
-    def create_worker(self, env_fn: Callable, worker_id: int) -> 'a3c_worker':
+    def create_worker(self, env_fn: Callable, worker_id: int) -> 'A3CWorker':
         """
         Crea un trabajador para entrenamiento asíncrono.
         
@@ -708,7 +708,7 @@ class a3c(a2c):
         a3c_worker
             Un trabajador A3C
         """
-        return a3c_worker(
+        return A3CWorker(
             self.model,
             self.optimizer,
             env_fn,
@@ -775,7 +775,7 @@ class a3c(a2c):
         return history
 
 
-class a3c_worker:
+class A3CWorker:
     """
     Trabajador para el algoritmo A3C que entrena de forma asíncrona.
     
@@ -806,7 +806,7 @@ class a3c_worker:
     """
     def __init__(
         self,
-        global_model: actor_critic_model,
+        global_model: ActorCriticModel,
         optimizer: tf.keras.optimizers.Optimizer,
         env_fn: Callable,
         worker_id: int,
@@ -834,7 +834,7 @@ class a3c_worker:
         self.optimizer = optimizer
         
         # Modelo local para este trabajador
-        self.local_model = actor_critic_model(
+        self.local_model = ActorCriticModel(
             state_dim, action_dim, continuous, 
             hidden_units=A2C_A3C_CONFIG['hidden_units']
         )
