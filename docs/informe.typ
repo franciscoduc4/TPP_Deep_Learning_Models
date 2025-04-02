@@ -258,6 +258,152 @@ Un R#super[2] de 1 indica que el modelo explica toda la variabilidad de los dato
 
 4. *Estabilidad por Sujeto*: se busca lograr que las métricas sean consistentes entre sujetos con especial atención en la reducción del MAE y mejorar el R#super[2] en casos problemáticos.
 
+= Feature Engineering
+
+== Extracción de la Ventana CGM
+
+=== Propósito:
+Capturar los niveles históricos de glucosa en sangre (lecturas CGM) que preceden a cada evento de bolo de insulina para proporcionar contexto temporal al modelo.
+
+=== Implementación:
+En la función `get_cgm_window`, se extrae una ventana de 2 horas de datos CGM (definida por `CONFIG["window_hours"]`) antes de cada evento de bolo.
+La función selecciona las 24 lecturas CGM más recientes (asumiendo intervalos de 5 minutos, 24 lecturas cubren 2 horas) para asegurar un tamaño de entrada consistente.
+Si hay menos de 24 lecturas disponibles, la muestra se descarta (devuelve `None`).
+
+=== Resultado:
+Resulta en una característica `cgm_window` para cada muestra, que es una lista de 24 valores CGM.
+Posteriormente se expande en 24 columnas separadas (`cgm_0` a `cgm_23`) en la función `preprocess_data` utilizando `pd.DataFrame(df_processed['cgm_window'].tolist())`.
+
+=== Impacto:
+- Proporciona al modelo tendencias temporales de glucosa en sangre, que son críticas para predecir dosis de insulina, especialmente para sujetos con dosis altas donde las fluctuaciones de glucosa pueden ser más pronunciadas.
+
+== Transformación Logarítmica de Características Numéricas
+
+=== Propósito:
+Reducir la asimetría de las características numéricas y estabilizar la varianza, haciendo que los datos sean más adecuados para el modelado.
+
+=== Implementación:
+En la función `preprocess_data`, las siguientes características se transforman logarítmicamente utilizando `np.log1p` (`log(1 + x)` para manejar valores cero):
+- `normal` (dosis de insulina objetivo)
+- `carbInput` (ingesta de carbohidratos)
+- `insulinOnBoard` (insulina activa, IOB)
+- `bgInput` (entrada de glucosa en sangre)
+- `cgm_window` (las 24 lecturas CGM)
+- `cgm_slope` (una característica derivada, ver más abajo)
+
+Para `cgm_slope`, que puede ser negativa, la transformación se aplica como `np.log1p(abs(x)) * np.sign(x)` para preservar el signo.
+
+=== Resultado:
+Reduce el impacto de los valores extremos y hace que las distribuciones de estas características sean más gaussianas, lo cual es beneficioso para el entrenamiento de redes neuronales.
+
+=== Impacto:
+- Mejora la capacidad del modelo para aprender patrones al reducir la influencia de los valores atípicos (por ejemplo, dosis de insulina o ingestas de carbohidratos muy altas).
+- Ayuda al modelo a generalizar mejor a través de diferentes rangos de dosis, particularmente para sujetos con dosis altas.
+
+== Cálculo Personalizado del Factor de Sensibilidad a la Insulina (ISF)
+
+=== Propósito:
+Derivar un factor de sensibilidad a la insulina (ISF) personalizado para cada muestra, que representa cuánto disminuye la glucosa en sangre 1 unidad de insulina.
+
+=== Implementación:
+En la función `process_subject`, el ISF se calcula como:
+- Si la dosis de insulina (`normal`) es 0, se utiliza un ISF predeterminado de 50.0.
+- De lo contrario, el ISF se calcula como `(bg_input - 100) / normal`, donde `bg_input` es el nivel de glucosa en sangre en el momento del bolo, y 100 es el objetivo de glucosa en sangre.
+El resultado se limita entre 10 y 100 para evitar valores extremos.
+
+=== Resultado:
+Agrega una nueva característica `insulinSensitivityFactor` que captura la sensibilidad del sujeto a la insulina, que varía entre individuos y contextos.
+
+=== Impacto:
+- Proporciona al modelo una métrica personalizada que relaciona directamente la glucosa en sangre con los requerimientos de insulina, mejorando la precisión de la predicción para sujetos con sensibilidades variables (por ejemplo, sujetos con dosis altas como el Sujeto 49).
+
+== Característica de Pendiente CGM
+
+=== Propósito:
+Capturar la tendencia de los niveles de glucosa en sangre durante los últimos 30 minutos para ayudar al modelo a identificar patrones de glucosa en aumento o disminución, que son críticos para las decisiones de dosificación de insulina.
+
+=== Implementación:
+En la función `process_subject`, se calcula la pendiente de las últimas 6 lecturas CGM (que cubren ~30 minutos, asumiendo intervalos de 5 minutos):
+- Si al menos 6 lecturas están disponibles en la `cgm_window`, se extraen las últimas 6 lecturas (`last_6`).
+- Se aplica un ajuste lineal (`np.polyfit`) a estas lecturas para calcular la pendiente.
+- Si hay menos de 6 lecturas disponibles, la pendiente se establece en 0.0.
+La característica `cgm_slope` luego se transforma logarítmicamente en la función `preprocess_data` utilizando `np.log1p(abs(x)) * np.sign(x)` para manejar pendientes negativas y reducir la asimetría.
+
+=== Resultado:
+Agrega una nueva característica `cgm_slope` que cuantifica la tasa de cambio en los niveles de glucosa en sangre durante los últimos 30 minutos.
+
+=== Impacto:
+- Ayuda al modelo a predecir mejor las dosis de insulina para sujetos con dosis altas al capturar cambios rápidos de glucosa (por ejemplo, un aumento pronunciado puede indicar la necesidad de más insulina).
+- Contribuye a la mejora del rendimiento en sujetos con dosis altas como el Sujeto 49 (MAE reducido a 0.16 en la ejecución actual).
+
+== Manejo de Valores Faltantes o Cero con Imputación por la Mediana
+
+=== Propósito:
+Asegurar la robustez al manejar valores faltantes o cero en características clave, que de otro modo podrían generar errores o predicciones sesgadas.
+
+=== Implementación:
+En la función `process_subject`:
+- *Entrada de Carbohidratos (`carbInput`)*: Si falta `carbInput` (`pd.notna(row['carbInput'])` es `False`) o es cero, se reemplaza con la mediana de los valores no cero de `carbInput` para el sujeto (`carb_median`). La mediana se calcula como `non_zero_carbs.median()` con un valor predeterminado de 10.0 si no existen valores no cero. El resultado se limita a un máximo de `CONFIG["cap_carb"]` (150).
+- *Insulina Activa (`insulinOnBoard`)*: El IOB se calcula utilizando la función `calculate_iob`, pero si el resultado es 0, se reemplaza con la mediana de los valores no cero de IOB para el sujeto (`iob_median`). La mediana se calcula como `np.median(non_zero_iob)` con un valor predeterminado de 0.5 si no existen valores no cero. El resultado se limita a un máximo de `CONFIG["cap_iob"]` (5).
+- *Entrada de Glucosa en Sangre (`bgInput`)*: Si falta `bgInput` (`pd.notna(row['bgInput'])` es `False`), se reemplaza con el valor CGM más reciente (`cgm_window[-1]`). El valor se limita a un mínimo de 50.0 y un máximo de `CONFIG["cap_bg"]` (300).
+- *Dosis de Insulina (`normal`)*: Si falta `normal` (`pd.notna(row['normal'])` es `False`), se establece en 0.0. El valor se limita a un máximo de `CONFIG["cap_normal"]` (30).
+- *Relación Insulina-Carbohidratos (`insulinCarbRatio`)*: Si falta `insulinCarbRatio` (`pd.notna(row['insulinCarbRatio'])` es `False`), se establece en un valor predeterminado de 10.0. El valor se limita entre 5 y 20.
+
+=== Resultado:
+Asegura que todas las muestras tengan valores válidos para las características clave, evitando que el modelo encuentre valores NaN o poco realistas.
+
+=== Impacto:
+- Mejora la robustez del conjunto de datos al completar los datos faltantes con estimaciones razonables, lo cual es particularmente importante para sujetos con datos dispersos.
+- Ayuda a mantener la consistencia entre las muestras, permitiendo que el modelo aprenda de manera más efectiva.
+
+== Normalización de Características
+
+=== Propósito:
+Estandarizar las características para que tengan una media de cero y una varianza unitaria, lo cual es esencial para el entrenamiento de redes neuronales y asegura que las características con diferentes escalas (por ejemplo, valores CGM versus hora del día) contribuyan por igual al modelo.
+
+=== Implementación:
+En la función `split_data`:
+- *Características CGM*: Las 24 columnas CGM (`cgm_0` a `cgm_23`) se normalizan utilizando un `StandardScaler` (`scaler_cgm`). El escalador se ajusta a los datos de entrenamiento y se aplica a los conjuntos de validación y prueba. Los datos CGM se remodelan en una matriz 3D `((n_muestras, 24, 1))` para su posible uso con arquitecturas como CNN o RNN, aunque el modelo PPO actual lo aplana.
+- *Otras Características*: Las características `['carbInput', 'bgInput', 'insulinOnBoard', 'insulinCarbRatio', 'insulinSensitivityFactor', 'hour_of_day', 'cgm_slope']` se normalizan utilizando un `StandardScaler` separado (`scaler_other`). El escalador se ajusta a los datos de entrenamiento y se aplica a los conjuntos de validación y prueba.
+- *Objetivo (`normal`)*: La dosis de insulina objetivo (`normal`) se normaliza utilizando un `StandardScaler` (`scaler_y`). El escalador se ajusta a los datos de entrenamiento y se aplica a los conjuntos de validación y prueba.
+
+=== Resultado:
+Todas las características y el objetivo se estandarizan para tener una media de cero y una varianza unitaria, asegurando que el modelo pueda aprender de manera efectiva.
+
+=== Impacto:
+- Evita que las características con escalas más grandes (por ejemplo, `bgInput`) dominen el proceso de aprendizaje.
+- Asegura que las predicciones del modelo estén en un espacio normalizado, que luego se desnormalizan utilizando `scaler_y.inverse_transform` para la evaluación.
+
+== Característica de Hora del Día
+
+=== Propósito:
+Capturar patrones circadianos en los requerimientos de insulina, ya que la sensibilidad a la insulina y los niveles de glucosa a menudo varían a lo largo del día.
+
+=== Implementación:
+En la función `process_subject`, la característica `hour_of_day` se extrae de la marca de tiempo del bolo (`bolus_time.hour`) y se normaliza al rango [0, 1] dividiendo por 23 (ya que las horas varían de 0 a 23).
+
+=== Resultado:
+Agrega una característica `hour_of_day` que representa la hora del día como un valor continuo entre 0 y 1.
+
+=== Impacto:
+- Permite al modelo aprender patrones dependientes del tiempo en la dosificación de insulina, como dosis más altas a la hora de las comidas o dosis más bajas por la noche.
+- Particularmente útil para sujetos con rutinas diarias consistentes, mejorando la capacidad del modelo para predecir dosis con precisión.
+
+== Resumen de las Características Ingenierizadas
+El conjunto de datos final incluye las siguientes características ingenierizadas para cada muestra:
+
+- *Características CGM (`cgm_0` a `cgm_23`)*: 24 columnas que representan las últimas 2 horas de lecturas CGM, transformadas logarítmicamente y normalizadas.
+- *Entrada de Carbohidratos (`carbInput`)*: Ingesta de carbohidratos, con valores faltantes/cero imputados utilizando la mediana del sujeto, transformada logarítmicamente y normalizada.
+- *Entrada de Glucosa en Sangre (`bgInput`)*: Nivel de glucosa en sangre en el momento del bolo, con valores faltantes imputados utilizando la lectura CGM más reciente, transformada logarítmicamente y normalizada.
+- *Insulina Activa (`insulinOnBoard`)*: IOB calculado, con valores cero imputados utilizando la mediana del sujeto, transformada logarítmicamente y normalizada.
+- *Relación Insulina-Carbohidratos (`insulinCarbRatio`)*: Relación insulina-carbohidratos, con valores faltantes establecidos en un valor predeterminado de 10.0, limitada y normalizada.
+- *Factor de Sensibilidad a la Insulina (`insulinSensitivityFactor`)*: ISF calculado a medida basado en la glucosa en sangre y la dosis de insulina, limitado y normalizado.
+- *Hora del Día (`hour_of_day`)*: Hora del día normalizada (0 a 1), que representa patrones circadianos.
+- *Pendiente CGM (`cgm_slope`)*: Pendiente de las últimas 6 lecturas CGM (~30 minutos), transformada logarítmicamente para manejar valores negativos y normalizada.
+- *Objetivo (`normal`)*: Dosis de insulina, transformada logarítmicamente y normalizada (utilizada como variable objetivo).
+
+
+
 = Modelos <modelos>
 
 == Modelo Basado en Reglas <rule-based>
