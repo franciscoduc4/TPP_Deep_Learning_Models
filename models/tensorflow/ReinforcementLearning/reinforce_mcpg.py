@@ -3,6 +3,7 @@ import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
 import time
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, LayerNormalization, Dropout, Activation
@@ -21,7 +22,27 @@ class PolicyNetwork(Model):
     
     Esta red mapea estados a distribuciones de probabilidad sobre acciones.
     """
-    def __init__(self, state_dim, action_dim, hidden_units=None, continuous=False):
+    def __init__(
+        self, 
+        state_dim: int, 
+        action_dim: int, 
+        hidden_units: Optional[List[int]] = None, 
+        continuous: bool = False
+    ) -> None:
+        """
+        Inicializa la red de política.
+        
+        Parámetros:
+        -----------
+        state_dim : int
+            Dimensión del espacio de estados
+        action_dim : int
+            Dimensión del espacio de acciones
+        hidden_units : Optional[List[int]], opcional
+            Lista con unidades en capas ocultas (default: None)
+        continuous : bool, opcional
+            Si el espacio de acciones es continuo (default: False)
+        """
         super(PolicyNetwork, self).__init__()
         
         # Configuración de la red
@@ -49,7 +70,23 @@ class PolicyNetwork(Model):
             # Para espacios discretos: política categórica
             self.logits = Dense(action_dim, activation='linear', name='logits')
     
-    def call(self, inputs, training=False):
+    def call(self, inputs: tf.Tensor, training: bool = False) -> Union[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]:
+        """
+        Ejecuta la red para obtener los parámetros de la distribución de política.
+        
+        Parámetros:
+        -----------
+        inputs : tf.Tensor
+            Tensor de estados de entrada
+        training : bool, opcional
+            Si está en modo entrenamiento (default: False)
+        
+        Retorna:
+        --------
+        Union[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]
+            Para espacios discretos: logits
+            Para espacios continuos: (mu, log_sigma)
+        """
         x = inputs
         
         # Pasar por capas ocultas
@@ -70,15 +107,20 @@ class PolicyNetwork(Model):
             logits = self.logits(x)
             return logits
     
-    def get_action(self, state, deterministic=False):
+    def get_action(self, state: np.ndarray, deterministic: bool = False) -> Union[np.ndarray, int]:
         """
         Obtiene una acción según la política actual.
         
-        Args:
-            state: Estado actual
-            deterministic: Si se usa la acción determinística (mean) o se muestrea
+        Parámetros:
+        -----------
+        state : np.ndarray
+            Estado actual
+        deterministic : bool, opcional
+            Si se usa la acción determinística o se muestrea (default: False)
 
-        Returns:
+        Retorna:
+        --------
+        Union[np.ndarray, int]
             La acción seleccionada
         """
         # Convertir a tensor y obtener distribución
@@ -106,15 +148,20 @@ class PolicyNetwork(Model):
             action = tf.random.categorical(tf.math.log(probs), 1)
             return action[0, 0].numpy()
     
-    def get_log_prob(self, states, actions):
+    def get_log_prob(self, states: tf.Tensor, actions: tf.Tensor) -> tf.Tensor:
         """
         Calcula el logaritmo de la probabilidad de acciones dadas.
         
-        Args:
-            states: Estados observados
-            actions: Acciones tomadas
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados observados
+        actions : tf.Tensor
+            Acciones tomadas
             
-        Returns:
+        Retorna:
+        --------
+        tf.Tensor
             Log-probabilidades de las acciones
         """
         if self.continuous:
@@ -142,14 +189,18 @@ class PolicyNetwork(Model):
             )
             return log_probs
     
-    def get_entropy(self, states):
+    def get_entropy(self, states: tf.Tensor) -> tf.Tensor:
         """
         Calcula la entropía de la política para los estados dados.
         
-        Args:
-            states: Estados para evaluar
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados para evaluar
             
-        Returns:
+        Retorna:
+        --------
+        tf.Tensor
             Entropía de la política
         """
         if self.continuous:
@@ -180,28 +231,45 @@ class REINFORCE:
     
     def __init__(
         self, 
-        state_dim, 
-        action_dim,
-        continuous=False,
-        learning_rate=REINFORCE_CONFIG['learning_rate'],
-        gamma=REINFORCE_CONFIG['gamma'],
-        hidden_units=None,
-        baseline=REINFORCE_CONFIG['use_baseline'],
-        entropy_coef=REINFORCE_CONFIG['entropy_coef']
-    ):
+        state_dim: int, 
+        action_dim: int,
+        continuous: bool = False,
+        learning_rate: float = REINFORCE_CONFIG['learning_rate'],
+        gamma: float = REINFORCE_CONFIG['gamma'],
+        hidden_units: Optional[List[int]] = None,
+        baseline: bool = REINFORCE_CONFIG['use_baseline'],
+        entropy_coef: float = REINFORCE_CONFIG['entropy_coef'],
+        seed: int = 42
+    ) -> None:
         """
         Inicializa el agente REINFORCE.
         
-        Args:
-            state_dim: Dimensión del espacio de estados
-            action_dim: Dimensión del espacio de acciones
-            continuous: Si el espacio de acciones es continuo
-            learning_rate: Tasa de aprendizaje
-            gamma: Factor de descuento
-            hidden_units: Lista con unidades en capas ocultas
-            baseline: Si usar baseline para reducir varianza
-            entropy_coef: Coeficiente para regularización por entropía
+        Parámetros:
+        -----------
+        state_dim : int
+            Dimensión del espacio de estados
+        action_dim : int
+            Dimensión del espacio de acciones
+        continuous : bool, opcional
+            Si el espacio de acciones es continuo (default: False)
+        learning_rate : float, opcional
+            Tasa de aprendizaje (default: REINFORCE_CONFIG['learning_rate'])
+        gamma : float, opcional
+            Factor de descuento (default: REINFORCE_CONFIG['gamma'])
+        hidden_units : Optional[List[int]], opcional
+            Lista con unidades en capas ocultas (default: None)
+        baseline : bool, opcional
+            Si usar baseline para reducir varianza (default: REINFORCE_CONFIG['use_baseline'])
+        entropy_coef : float, opcional
+            Coeficiente para regularización por entropía (default: REINFORCE_CONFIG['entropy_coef'])
+        seed : int, opcional
+            Semilla para reproducibilidad (default: 42)
         """
+        # Configurar semillas para reproducibilidad
+        tf.random.set_seed(seed)
+        self.rng = np.random.Generator(np.random.PCG64(seed))
+        
+        # Parámetros básicos
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.continuous = continuous
@@ -230,11 +298,13 @@ class REINFORCE:
         self.baseline_loss_metric = tf.keras.metrics.Mean('baseline_loss')
         self.returns_metric = tf.keras.metrics.Mean('returns')
     
-    def _create_value_network(self):
+    def _create_value_network(self) -> Model:
         """
         Crea una red neuronal para estimar el valor de estado (baseline).
         
-        Returns:
+        Retorna:
+        --------
+        Model
             Modelo de red de valor
         """
         inputs = Input(shape=(self.state_dim,))
@@ -254,17 +324,28 @@ class REINFORCE:
         return model
     
     @tf.function
-    def train_policy_step(self, states, actions, returns):
+    def train_policy_step(
+        self, 
+        states: tf.Tensor, 
+        actions: tf.Tensor, 
+        returns: tf.Tensor
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
         """
         Realiza un paso de entrenamiento para la red de política.
         
-        Args:
-            states: Estados visitados
-            actions: Acciones tomadas
-            returns: Retornos calculados
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados visitados
+        actions : tf.Tensor
+            Acciones tomadas
+        returns : tf.Tensor
+            Retornos calculados
             
-        Returns:
-            Pérdida de política, entropía media
+        Retorna:
+        --------
+        Tuple[tf.Tensor, tf.Tensor]
+            Tupla con (pérdida_política, entropía)
         """
         with tf.GradientTape() as tape:
             # Calcular log-probabilidades de acciones tomadas
@@ -296,15 +377,20 @@ class REINFORCE:
         return policy_loss, entropy
     
     @tf.function
-    def train_baseline_step(self, states, returns):
+    def train_baseline_step(self, states: tf.Tensor, returns: tf.Tensor) -> tf.Tensor:
         """
         Realiza un paso de entrenamiento para la red de valor (baseline).
         
-        Args:
-            states: Estados visitados
-            returns: Retornos calculados
+        Parámetros:
+        -----------
+        states : tf.Tensor
+            Estados visitados
+        returns : tf.Tensor
+            Retornos calculados
             
-        Returns:
+        Retorna:
+        --------
+        tf.Tensor
             Pérdida de la red de valor
         """
         with tf.GradientTape() as tape:
@@ -320,14 +406,18 @@ class REINFORCE:
         
         return value_loss
     
-    def compute_returns(self, rewards):
+    def compute_returns(self, rewards: List[float]) -> np.ndarray:
         """
         Calcula los retornos descontados para cada paso de tiempo.
         
-        Args:
-            rewards: Lista de recompensas recibidas
+        Parámetros:
+        -----------
+        rewards : List[float]
+            Lista de recompensas recibidas
             
-        Returns:
+        Retorna:
+        --------
+        np.ndarray
             Array de retornos descontados
         """
         returns = np.zeros_like(rewards, dtype=np.float32)
@@ -344,15 +434,24 @@ class REINFORCE:
         
         return returns
     
-    def _run_episode(self, env, render=False):
+    def _run_episode(
+        self, 
+        env: Any, 
+        render: bool = False
+    ) -> Tuple[List[np.ndarray], List[Union[int, np.ndarray]], List[float], float, int]:
         """
         Ejecuta un episodio completo y recolecta la experiencia.
         
-        Args:
-            env: Entorno de OpenAI Gym o compatible
-            render: Si renderizar el entorno durante entrenamiento
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o compatible
+        render : bool, opcional
+            Si renderizar el entorno durante entrenamiento (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Tuple[List[np.ndarray], List[Union[int, np.ndarray]], List[float], float, int]
             Tupla con (estados, acciones, recompensas, recompensa_total, longitud_episodio)
         """
         state, _ = env.reset()
@@ -385,16 +484,27 @@ class REINFORCE:
         
         return states, actions, rewards, sum(rewards), len(rewards)
     
-    def _update_networks(self, states, actions, rewards):
+    def _update_networks(
+        self, 
+        states: List[np.ndarray], 
+        actions: List[Union[int, np.ndarray]], 
+        rewards: List[float]
+    ) -> Tuple[float, float]:
         """
         Actualiza las redes de política y valor.
         
-        Args:
-            states: Lista de estados
-            actions: Lista de acciones
-            rewards: Lista de recompensas
+        Parámetros:
+        -----------
+        states : List[np.ndarray]
+            Lista de estados
+        actions : List[Union[int, np.ndarray]]
+            Lista de acciones
+        rewards : List[float]
+            Lista de recompensas
             
-        Returns:
+        Retorna:
+        --------
+        Tuple[float, float]
             Tupla con (pérdida_política, entropía)
         """
         # Calcular retornos
@@ -422,18 +532,25 @@ class REINFORCE:
                 tf.convert_to_tensor(returns)
             )
         
-        return policy_loss, entropy
+        return policy_loss.numpy(), entropy.numpy()
     
-    def _update_history(self, history, episode_reward, episode_length):
+    def _update_history(
+        self, 
+        history: Dict[str, List[float]], 
+        episode_reward: float, 
+        episode_length: int
+    ) -> None:
         """
         Actualiza la historia de entrenamiento con las métricas actuales.
         
-        Args:
-            history: Diccionario de historia
-            episode_reward: Recompensa total del episodio
-            episode_length: Longitud del episodio
-            policy_loss: Pérdida de política
-            entropy: Entropía
+        Parámetros:
+        -----------
+        history : Dict[str, List[float]]
+            Diccionario de historia
+        episode_reward : float
+            Recompensa total del episodio
+        episode_length : int
+            Longitud del episodio
         """
         history['episode_rewards'].append(episode_reward)
         history['episode_lengths'].append(episode_length)
@@ -450,16 +567,27 @@ class REINFORCE:
         if self.use_baseline:
             self.baseline_loss_metric.reset_states()
     
-    def train(self, env, episodes=None, render=False):
+    def train(
+        self, 
+        env: Any, 
+        episodes: Optional[int] = None, 
+        render: bool = False
+    ) -> Dict[str, List[float]]:
         """
         Entrena el agente REINFORCE en el entorno dado.
         
-        Args:
-            env: Entorno de OpenAI Gym o compatible
-            episodes: Número de episodios de entrenamiento
-            render: Si renderizar el entorno durante entrenamiento
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o compatible
+        episodes : Optional[int], opcional
+            Número de episodios de entrenamiento (default: None)
+        render : bool, opcional
+            Si renderizar el entorno durante entrenamiento (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia de entrenamiento
         """
         if episodes is None:
@@ -495,19 +623,31 @@ class REINFORCE:
                       f"Pérdida Política: {policy_loss:.4f}, "
                       f"Entropía: {entropy:.4f}, "
                       f"Tiempo: {elapsed_time:.2f}s")
+                start_time = time.time()
         
         return history
     
-    def evaluate(self, env, episodes=10, render=False):
+    def evaluate(
+        self, 
+        env: Any, 
+        episodes: int = 10, 
+        render: bool = False
+    ) -> float:
         """
         Evalúa el agente REINFORCE con su política actual.
         
-        Args:
-            env: Entorno de OpenAI Gym o compatible
-            episodes: Número de episodios para evaluación
-            render: Si renderizar el entorno durante evaluación
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o compatible
+        episodes : int, opcional
+            Número de episodios para evaluación (default: 10)
+        render : bool, opcional
+            Si renderizar el entorno durante evaluación (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        float
             Recompensa media obtenida
         """
         rewards = []
@@ -547,13 +687,16 @@ class REINFORCE:
         
         return avg_reward
     
-    def save(self, policy_path, baseline_path=None):
+    def save(self, policy_path: str, baseline_path: Optional[str] = None) -> None:
         """
         Guarda los modelos del agente.
         
-        Args:
-            policy_path: Ruta para guardar la política
-            baseline_path: Ruta para guardar el baseline (opcional)
+        Parámetros:
+        -----------
+        policy_path : str
+            Ruta para guardar la política
+        baseline_path : Optional[str], opcional
+            Ruta para guardar el baseline (default: None)
         """
         # Guardar política
         self.policy.save_weights(policy_path)
@@ -564,13 +707,16 @@ class REINFORCE:
         
         print(f"Modelo guardado en {policy_path}")
     
-    def load(self, policy_path, baseline_path=None):
+    def load(self, policy_path: str, baseline_path: Optional[str] = None) -> None:
         """
         Carga los modelos del agente.
         
-        Args:
-            policy_path: Ruta para cargar la política
-            baseline_path: Ruta para cargar el baseline (opcional)
+        Parámetros:
+        -----------
+        policy_path : str
+            Ruta para cargar la política
+        baseline_path : Optional[str], opcional
+            Ruta para cargar el baseline (default: None)
         """
         # Asegurarse que el modelo está construido antes de cargar
         dummy_state = np.zeros((1, self.state_dim))
@@ -586,13 +732,20 @@ class REINFORCE:
         
         print(f"Modelo cargado desde {policy_path}")
     
-    def visualize_training(self, history=None, smoothing_window=None):
+    def visualize_training(
+        self, 
+        history: Optional[Dict[str, List[float]]] = None, 
+        smoothing_window: Optional[int] = None
+    ) -> None:
         """
         Visualiza las métricas de entrenamiento.
         
-        Args:
-            history: Historia de entrenamiento (opcional)
-            smoothing_window: Tamaño de ventana para suavizado
+        Parámetros:
+        -----------
+        history : Optional[Dict[str, List[float]]], opcional
+            Historia de entrenamiento (default: None)
+        smoothing_window : Optional[int], opcional
+            Tamaño de ventana para suavizado (default: None)
         """
         if history is None:
             return
@@ -601,7 +754,8 @@ class REINFORCE:
             smoothing_window = REINFORCE_CONFIG['smoothing_window']
         
         # Función para suavizar datos
-        def smooth(data, window_size):
+        def smooth(data: List[float], window_size: int) -> np.ndarray:
+            """Aplica suavizado con media móvil"""
             if len(data) < window_size:
                 return data
             kernel = np.ones(window_size) / window_size
@@ -612,12 +766,12 @@ class REINFORCE:
         _, axs = plt.subplots(n_plots, 1, figsize=(10, 3*n_plots))
         
         # 1. Gráfico de recompensas
-        axs[0].plot(history['episode_rewards'], alpha=0.3, color='blue', label='Raw')
+        axs[0].plot(history['episode_rewards'], alpha=0.3, color='blue', label='Original')
         if len(history['episode_rewards']) > smoothing_window:
             smoothed_rewards = smooth(history['episode_rewards'], smoothing_window)
             axs[0].plot(range(smoothing_window-1, len(history['episode_rewards'])), 
                       smoothed_rewards, color='blue', 
-                      label=f'Smoothed (window={smoothing_window})')
+                      label=f'Suavizado (ventana={smoothing_window})')
         axs[0].set_title('Recompensa por Episodio')
         axs[0].set_xlabel('Episodio')
         axs[0].set_ylabel('Recompensa')
@@ -625,12 +779,12 @@ class REINFORCE:
         axs[0].legend()
         
         # 2. Gráfico de longitud de episodios
-        axs[1].plot(history['episode_lengths'], alpha=0.3, color='green', label='Raw')
+        axs[1].plot(history['episode_lengths'], alpha=0.3, color='green', label='Original')
         if len(history['episode_lengths']) > smoothing_window:
             smoothed_lengths = smooth(history['episode_lengths'], smoothing_window)
             axs[1].plot(range(smoothing_window-1, len(history['episode_lengths'])), 
                       smoothed_lengths, color='green', 
-                      label=f'Smoothed (window={smoothing_window})')
+                      label=f'Suavizado (ventana={smoothing_window})')
         axs[1].set_title('Longitud de Episodios')
         axs[1].set_xlabel('Episodio')
         axs[1].set_ylabel('Pasos')
@@ -638,12 +792,12 @@ class REINFORCE:
         axs[1].legend()
         
         # 3. Gráfico de pérdida de política
-        axs[2].plot(history['policy_losses'], alpha=0.3, color='red', label='Raw')
+        axs[2].plot(history['policy_losses'], alpha=0.3, color='red', label='Original')
         if len(history['policy_losses']) > smoothing_window:
             smoothed_losses = smooth(history['policy_losses'], smoothing_window)
             axs[2].plot(range(smoothing_window-1, len(history['policy_losses'])), 
                       smoothed_losses, color='red', 
-                      label=f'Smoothed (window={smoothing_window})')
+                      label=f'Suavizado (ventana={smoothing_window})')
         axs[2].set_title('Pérdida de Política')
         axs[2].set_xlabel('Episodio')
         axs[2].set_ylabel('Pérdida')
@@ -652,12 +806,12 @@ class REINFORCE:
         
         # 4. Gráfico de pérdida de baseline (si se usa)
         if self.use_baseline:
-            axs[3].plot(history['baseline_losses'], alpha=0.3, color='purple', label='Raw')
+            axs[3].plot(history['baseline_losses'], alpha=0.3, color='purple', label='Original')
             if len(history['baseline_losses']) > smoothing_window:
                 smoothed_baseline = smooth(history['baseline_losses'], smoothing_window)
                 axs[3].plot(range(smoothing_window-1, len(history['baseline_losses'])), 
                           smoothed_baseline, color='purple', 
-                          label=f'Smoothed (window={smoothing_window})')
+                          label=f'Suavizado (ventana={smoothing_window})')
             axs[3].set_title('Pérdida de Baseline')
             axs[3].set_xlabel('Episodio')
             axs[3].set_ylabel('Pérdida')

@@ -1,14 +1,15 @@
 import os, sys
 import numpy as np
-import matplotlib.pyplot as plt
 import time
-from typing import Dict, List, Tuple, Optional, Union
 import pickle
+import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple, Optional, Union, Any
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import MONTE_CARLO_CONFIG
+
 
 class MonteCarlo:
     """
@@ -36,19 +37,28 @@ class MonteCarlo:
         epsilon_decay: float = MONTE_CARLO_CONFIG['epsilon_decay'],
         first_visit: bool = MONTE_CARLO_CONFIG['first_visit'],
         evaluation_mode: bool = False
-    ):
+    ) -> None:
         """
         Inicializa el agente de Monte Carlo.
         
-        Args:
-            n_states: Número de estados en el entorno
-            n_actions: Número de acciones en el entorno
-            gamma: Factor de descuento para recompensas futuras
-            epsilon_start: Valor inicial de epsilon para políticas epsilon-greedy
-            epsilon_end: Valor mínimo de epsilon
-            epsilon_decay: Factor de decaimiento de epsilon
-            first_visit: Si True, usa first-visit MC, sino every-visit MC
-            evaluation_mode: Si True, inicializa en modo evaluación de política (sin control)
+        Parámetros:
+        -----------
+        n_states : int
+            Número de estados en el entorno
+        n_actions : int
+            Número de acciones en el entorno
+        gamma : float, opcional
+            Factor de descuento para recompensas futuras (default: MONTE_CARLO_CONFIG['gamma'])
+        epsilon_start : float, opcional
+            Valor inicial de epsilon para políticas epsilon-greedy (default: MONTE_CARLO_CONFIG['epsilon_start'])
+        epsilon_end : float, opcional
+            Valor mínimo de epsilon (default: MONTE_CARLO_CONFIG['epsilon_end'])
+        epsilon_decay : float, opcional
+            Factor de decaimiento de epsilon (default: MONTE_CARLO_CONFIG['epsilon_decay'])
+        first_visit : bool, opcional
+            Si True, usa first-visit MC, sino every-visit MC (default: MONTE_CARLO_CONFIG['first_visit'])
+        evaluation_mode : bool, opcional
+            Si True, inicializa en modo evaluación de política (sin control) (default: False)
         """
         self.n_states = n_states
         self.n_actions = n_actions
@@ -86,7 +96,7 @@ class MonteCarlo:
         self.value_changes = []
         self.epsilon_history = []
     
-    def reset_counters(self):
+    def reset_counters(self) -> None:
         """
         Reinicia los contadores de retornos para un nuevo entrenamiento.
         """
@@ -100,34 +110,45 @@ class MonteCarlo:
         """
         Selecciona una acción según la política actual, con exploración opcional.
         
-        Args:
-            state: Estado actual
-            explore: Si es True, usa política epsilon-greedy; si es False, usa política greedy
+        Parámetros:
+        -----------
+        state : int
+            Estado actual
+        explore : bool, opcional
+            Si es True, usa política epsilon-greedy; si es False, usa política greedy (default: True)
             
-        Returns:
+        Retorna:
+        --------
+        int
             La acción seleccionada
         """
-        if explore and np.random.random() < self.epsilon:
+        rng = np.random.default_rng(42)  # Create a Generator instance
+        if explore and rng.random() < self.epsilon:
             # Exploración: acción aleatoria
-            return np.random.randint(self.n_actions)
+            return rng.integers(0, self.n_actions)
         else:
             # Explotación: mejor acción según la política actual
             if self.evaluation_mode:
                 # En modo evaluación, usamos la política directamente
                 action_probs = self.policy[state]
-                return np.random.choice(self.n_actions, p=action_probs)
+                rng = np.random.default_rng(42)  # Providing a fixed seed for reproducibility
+                return rng.choice(self.n_actions, p=action_probs)
             else:
                 # En modo control, derivamos la acción greedy de los valores Q
                 return np.argmax(self.q_table[state])
     
-    def update_policy(self, state: int):
+    def update_policy(self, state: int) -> bool:
         """
         Actualiza la política para el estado dado basándose en los valores Q actuales.
         
-        Args:
-            state: Estado para el cual actualizar la política
+        Parámetros:
+        -----------
+        state : int
+            Estado para el cual actualizar la política
             
-        Returns:
+        Retorna:
+        --------
+        bool
             Boolean indicando si la política cambió
         """
         if self.evaluation_mode:
@@ -148,24 +169,30 @@ class MonteCarlo:
         
         return old_action != best_action
     
-    def decay_epsilon(self, episode: int = None):
+    def decay_epsilon(self, episode: Optional[int] = None) -> None:
         """
         Reduce el valor de epsilon según la estrategia de decaimiento.
         
-        Args:
-            episode: Número del episodio actual (para decaimientos basados en episodios)
+        Parámetros:
+        -----------
+        episode : Optional[int], opcional
+            Número del episodio actual (para decaimientos basados en episodios) (default: None)
         """
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
         self.epsilon_history.append(self.epsilon)
     
-    def calculate_returns(self, rewards: list) -> list:
+    def calculate_returns(self, rewards: List[float]) -> np.ndarray:
         """
         Calcula los retornos descontados para cada paso de tiempo en un episodio.
         
-        Args:
-            rewards: Lista de recompensas recibidas durante el episodio
+        Parámetros:
+        -----------
+        rewards : List[float]
+            Lista de recompensas recibidas durante el episodio
             
-        Returns:
+        Retorna:
+        --------
+        np.ndarray
             Lista de retornos (G_t) para cada paso de tiempo
         """
         returns = np.zeros(len(rewards))
@@ -178,15 +205,19 @@ class MonteCarlo:
             
         return returns
     
-    def monte_carlo_prediction(self, episodes: List[Tuple[List[int], List[int], List[float]]]):
+    def monte_carlo_prediction(self, episodes: List[Tuple[List[int], List[int], List[float]]]) -> np.ndarray:
         """
         Realiza predicción Monte Carlo (evaluación de política) usando episodios proporcionados.
         
-        Args:
-            episodes: Lista de episodios, cada uno como una tupla de 
-                     (estados, acciones, recompensas)
+        Parámetros:
+        -----------
+        episodes : List[Tuple[List[int], List[int], List[float]]]
+            Lista de episodios, cada uno como una tupla de 
+            (estados, acciones, recompensas)
         
-        Returns:
+        Retorna:
+        --------
+        np.ndarray
             v_table actualizada (función de valor de estado)
         """
         old_v = self.v_table.copy()
@@ -220,82 +251,156 @@ class MonteCarlo:
         
         return self.v_table
     
-    def monte_carlo_control_on_policy(self, env, episodes: int = MONTE_CARLO_CONFIG['episodes'], 
-                                     max_steps: int = MONTE_CARLO_CONFIG['max_steps'],
-                                     render: bool = False):
+    def _run_episode(self, env: Any, max_steps: int, render: bool) -> Tuple[List[int], List[int], List[float]]:
+        """
+        Ejecuta un episodio completo y retorna las transiciones.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno a ejecutar
+        max_steps : int
+            Número máximo de pasos
+        render : bool
+            Si renderizar o no el entorno
+            
+        Retorna:
+        --------
+        Tuple[List[int], List[int], List[float]]
+            estados, acciones y recompensas del episodio
+        """
+        state, _ = env.reset()
+        episode_states = []
+        episode_actions = []
+        episode_rewards = []
+        
+        for _ in range(max_steps):
+            if render:
+                env.render()
+            
+            # Seleccionar acción según política epsilon-greedy
+            action = self.get_action(state, explore=True)
+            
+            # Dar un paso en el entorno
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # Guardar transición
+            episode_states.append(state)
+            episode_actions.append(action)
+            episode_rewards.append(reward)
+            
+            # Actualizar estado
+            state = next_state
+            
+            if done:
+                break
+                
+        return episode_states, episode_actions, episode_rewards
+        
+    def _update_q_values(self, episode_states: List[int], episode_actions: List[int], returns: np.ndarray) -> bool:
+        """
+        Actualiza valores Q y política basado en un episodio completo.
+        
+        Parámetros:
+        -----------
+        episode_states : List[int]
+            Lista de estados visitados
+        episode_actions : List[int]
+            Lista de acciones tomadas
+        returns : np.ndarray
+            Lista de retornos
+            
+        Retorna:
+        --------
+        bool
+            Si la política cambió durante la actualización
+        """
+        policy_changed = False
+        visited_state_action_pairs = set()
+        
+        for t in range(len(episode_states)):
+            state = episode_states[t]
+            action = episode_actions[t]
+            
+            # Para first-visit MC, solo considerar primera visita a cada par estado-acción
+            state_action = (state, action)
+            if self.first_visit and state_action in visited_state_action_pairs:
+                continue
+            
+            visited_state_action_pairs.add(state_action)
+            
+            # Actualizar conteos y sumas para este par estado-acción
+            self.returns_sum[state, action] += returns[t]
+            self.returns_count[state, action] += 1
+            
+            # Actualizar valor Q usando promedio incremental
+            if self.returns_count[state, action] > 0:
+                self.q_table[state, action] = self.returns_sum[state, action] / self.returns_count[state, action]
+                
+                # Actualizar política basada en nuevos valores Q
+                if self.update_policy(state):
+                    policy_changed = True
+                    
+        return policy_changed
+        
+    def _log_progress(self, episode: int, episodes: int, start_time: float) -> None:
+        """
+        Imprime el progreso del entrenamiento.
+        
+        Parámetros:
+        -----------
+        episode : int
+            Episodio actual
+        episodes : int
+            Total de episodios
+        start_time : float
+            Tiempo de inicio
+        """
+        if (episode + 1) % MONTE_CARLO_CONFIG['log_interval'] == 0 or episode == 0:
+            avg_reward = np.mean(self.episode_rewards[-MONTE_CARLO_CONFIG['log_interval']:])
+            elapsed_time = time.time() - start_time
+            
+            print(f"Episodio {episode+1}/{episodes} - Recompensa promedio: {avg_reward:.2f}, "
+                  f"Epsilon: {self.epsilon:.4f}, Tiempo: {elapsed_time:.2f}s")
+            
+    def monte_carlo_control_on_policy(
+        self, 
+        env: Any, 
+        episodes: int = MONTE_CARLO_CONFIG['episodes'], 
+        max_steps: int = MONTE_CARLO_CONFIG['max_steps'],
+        render: bool = False
+    ) -> Dict[str, List[float]]:
         """
         Implementa control Monte Carlo on-policy con epsilon-greedy.
         
-        Args:
-            env: Entorno de OpenAI Gym o similar
-            episodes: Número de episodios a ejecutar
-            max_steps: Número máximo de pasos por episodio
-            render: Si renderizar o no el entorno
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o similar
+        episodes : int, opcional
+            Número de episodios a ejecutar (default: MONTE_CARLO_CONFIG['episodes'])
+        max_steps : int, opcional
+            Número máximo de pasos por episodio (default: MONTE_CARLO_CONFIG['max_steps'])
+        render : bool, opcional
+            Si renderizar o no el entorno (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia del entrenamiento
         """
         start_time = time.time()
         
         for episode in range(episodes):
-            # Inicializar episodio
-            state, _ = env.reset()
-            episode_states = []
-            episode_actions = []
-            episode_rewards = []
-            
             # Ejecutar un episodio completo
-            for t in range(max_steps):
-                if render:
-                    env.render()
-                
-                # Seleccionar acción según política epsilon-greedy
-                action = self.get_action(state, explore=True)
-                
-                # Dar un paso en el entorno
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                
-                # Guardar transición
-                episode_states.append(state)
-                episode_actions.append(action)
-                episode_rewards.append(reward)
-                
-                # Actualizar estado
-                state = next_state
-                
-                if done:
-                    break
+            episode_states, episode_actions, episode_rewards = self._run_episode(env, max_steps, render)
             
             # Calcular retornos para el episodio
             returns = self.calculate_returns(episode_rewards)
             
-            # Actualizar función de valor de acción (Q)
-            policy_changed = False
-            visited_state_action_pairs = set()
-            
-            for t in range(len(episode_states)):
-                state = episode_states[t]
-                action = episode_actions[t]
-                
-                # Para first-visit MC, solo considerar primera visita a cada par estado-acción
-                state_action = (state, action)
-                if self.first_visit and state_action in visited_state_action_pairs:
-                    continue
-                
-                visited_state_action_pairs.add(state_action)
-                
-                # Actualizar conteos y sumas para este par estado-acción
-                self.returns_sum[state, action] += returns[t]
-                self.returns_count[state, action] += 1
-                
-                # Actualizar valor Q usando promedio incremental
-                if self.returns_count[state, action] > 0:
-                    self.q_table[state, action] = self.returns_sum[state, action] / self.returns_count[state, action]
-                    
-                    # Actualizar política basada en nuevo valor Q
-                    if self.update_policy(state):
-                        policy_changed = True
+            # Actualizar función de valor de acción (Q) y política
+            policy_changed = self._update_q_values(episode_states, episode_actions, returns)
             
             # Registrar métricas del episodio
             self.episode_rewards.append(sum(episode_rewards))
@@ -306,12 +411,7 @@ class MonteCarlo:
             self.decay_epsilon(episode)
             
             # Mostrar progreso periódicamente
-            if (episode + 1) % MONTE_CARLO_CONFIG['log_interval'] == 0 or episode == 0:
-                avg_reward = np.mean(self.episode_rewards[-MONTE_CARLO_CONFIG['log_interval']:])
-                elapsed_time = time.time() - start_time
-                
-                print(f"Episodio {episode+1}/{episodes} - Recompensa promedio: {avg_reward:.2f}, "
-                      f"Epsilon: {self.epsilon:.4f}, Tiempo: {elapsed_time:.2f}s")
+            self._log_progress(episode, episodes, start_time)
         
         # Crear historial de entrenamiento
         history = {
@@ -325,19 +425,145 @@ class MonteCarlo:
         
         return history
     
-    def monte_carlo_control_off_policy(self, env, episodes: int = MONTE_CARLO_CONFIG['episodes'], 
-                                      max_steps: int = MONTE_CARLO_CONFIG['max_steps'],
-                                      render: bool = False):
+    def _collect_off_policy_episode(
+        self, 
+        env: Any, 
+        behavior_epsilon: float, 
+        max_steps: int,
+        render: bool
+    ) -> Tuple[List[int], List[int], List[float], List[float]]:
+        """
+        Recopila un episodio completo usando la política de comportamiento.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno a ejecutar
+        behavior_epsilon : float
+            Epsilon para la política de comportamiento
+        max_steps : int
+            Pasos máximos por episodio
+        render : bool
+            Si renderizar o no el entorno
+            
+        Retorna:
+        --------
+        Tuple[List[int], List[int], List[float], List[float]]
+            Estados, acciones, recompensas y probabilidades de comportamiento
+        """
+        state, _ = env.reset()
+        episode_states = []
+        episode_actions = []
+        episode_rewards = []
+        episode_behavior_probs = []
+        
+        for _ in range(max_steps):
+            if render:
+                env.render()
+            
+            # Seleccionar acción usando política de comportamiento
+            rng = np.random.default_rng(42)  # Generator with seed for reproducibility
+            if rng.random() < behavior_epsilon:
+                action = rng.integers(0, self.n_actions)
+                behavior_prob = behavior_epsilon / self.n_actions
+            else:
+                action = np.argmax(self.q_table[state])
+                behavior_prob = 1 - behavior_epsilon + (behavior_epsilon / self.n_actions)
+            
+            # Dar un paso en el entorno
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # Guardar transición
+            episode_states.append(state)
+            episode_actions.append(action)
+            episode_rewards.append(reward)
+            episode_behavior_probs.append(behavior_prob)
+            
+            # Actualizar estado
+            state = next_state
+            
+            if done:
+                break
+                
+        return episode_states, episode_actions, episode_rewards, episode_behavior_probs
+    
+    def _update_off_policy_q_values(
+        self, 
+        episode_states: List[int], 
+        episode_actions: List[int], 
+        episode_rewards: List[float],
+        episode_behavior_probs: List[float]
+    ) -> None:
+        """
+        Actualiza los valores Q usando importance sampling basado en un episodio.
+        
+        Parámetros:
+        -----------
+        episode_states : List[int]
+            Estados visitados
+        episode_actions : List[int]
+            Acciones tomadas
+        episode_rewards : List[float]
+            Recompensas recibidas
+        episode_behavior_probs : List[float]
+            Probabilidades bajo la política de comportamiento
+        """
+        # Inicializar el retorno y el peso de importancia
+        G = 0.0
+        W = 1.0
+        
+        # Recorremos el episodio en orden inverso
+        for t in range(len(episode_states) - 1, -1, -1):
+            state = episode_states[t]
+            action = episode_actions[t]
+            reward = episode_rewards[t]
+            
+            # Actualizar retorno acumulado
+            G = reward + self.gamma * G
+            
+            # Actualizar contador de visitas para este par estado-acción
+            self.c_table[state, action] += W
+            
+            # Actualizar función Q usando importance sampling
+            self.q_table[state, action] += (W / self.c_table[state, action]) * (G - self.q_table[state, action])
+            
+            # Actualizar política target (greedy respecto a Q)
+            self.update_policy(state)
+            
+            # Obtener probabilidad bajo policy target (greedy)
+            target_policy_prob = 1.0 if action == np.argmax(self.q_table[state]) else 0.0
+            
+            # Actualizar ratio de importancia
+            if target_policy_prob < 1e-10:  # Umbral pequeño en lugar de comparación exacta
+                break  # Si la acción no sería elegida por la política target, terminar
+            
+            W *= target_policy_prob / episode_behavior_probs[t]
+            
+    def monte_carlo_control_off_policy(
+        self, 
+        env: Any, 
+        episodes: int = MONTE_CARLO_CONFIG['episodes'], 
+        max_steps: int = MONTE_CARLO_CONFIG['max_steps'],
+        render: bool = False
+    ) -> Dict[str, List[float]]:
         """
         Implementa control Monte Carlo off-policy con importance sampling.
         
-        Args:
-            env: Entorno de OpenAI Gym o similar
-            episodes: Número de episodios a ejecutar
-            max_steps: Número máximo de pasos por episodio
-            render: Si renderizar o no el entorno
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o similar
+        episodes : int, opcional
+            Número de episodios a ejecutar (default: MONTE_CARLO_CONFIG['episodes'])
+        max_steps : int, opcional
+            Número máximo de pasos por episodio (default: MONTE_CARLO_CONFIG['max_steps'])
+        render : bool, opcional
+            Si renderizar o no el entorno (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia del entrenamiento
         """
         start_time = time.time()
@@ -346,77 +572,15 @@ class MonteCarlo:
         behavior_epsilon = max(0.1, self.epsilon)
         
         for episode in range(episodes):
-            # Inicializar episodio
-            state, _ = env.reset()
-            episode_states = []
-            episode_actions = []
-            episode_rewards = []
-            episode_behavior_probs = []  # Probabilidades bajo política de comportamiento
+            # Recopilar un episodio completo usando la política de comportamiento
+            episode_states, episode_actions, episode_rewards, episode_behavior_probs = self._collect_off_policy_episode(
+                env, behavior_epsilon, max_steps, render
+            )
             
-            # Ejecutar un episodio completo usando política de comportamiento
-            for t in range(max_steps):
-                if render:
-                    env.render()
-                
-                # Seleccionar acción usando política de comportamiento (más exploratoria)
-                if np.random.random() < behavior_epsilon:
-                    action = np.random.randint(self.n_actions)
-                    behavior_prob = behavior_epsilon / self.n_actions
-                else:
-                    action = np.argmax(self.q_table[state])
-                    behavior_prob = 1 - behavior_epsilon + (behavior_epsilon / self.n_actions)
-                
-                # Dar un paso en el entorno
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                
-                # Guardar transición
-                episode_states.append(state)
-                episode_actions.append(action)
-                episode_rewards.append(reward)
-                episode_behavior_probs.append(behavior_prob)
-                
-                # Actualizar estado
-                state = next_state
-                
-                if done:
-                    break
-            
-            # Calcular retornos para el episodio
-            returns = self.calculate_returns(episode_rewards)
-            
-            # Calcular ratios de importancia y actualizar Q
-            G = 0.0
-            W = 1.0  # Peso de importancia inicial
-            
-            # Recorremos el episodio en orden inverso (importante para OFF-policy MC)
-            for t in range(len(episode_states) - 1, -1, -1):
-                state = episode_states[t]
-                action = episode_actions[t]
-                reward = episode_rewards[t]
-                
-                # Actualizar retorno acumulado
-                G = reward + self.gamma * G
-                
-                # Actualizar contador de visitas para este par estado-acción
-                self.c_table[state, action] += W
-                
-                # Actualizar función Q usando importance sampling
-                self.q_table[state, action] += (W / self.c_table[state, action]) * (G - self.q_table[state, action])
-                
-                # Actualizar política target (greedy respecto a Q)
-                self.update_policy(state)
-                
-                # Obtener probabilidad bajo policy target (greedy)
-                target_policy_prob = 1.0 if action == np.argmax(self.q_table[state]) else 0.0
-                
-                # Actualizar ratio de importancia
-                if target_policy_prob == 0.0:
-                    # Si la acción no sería elegida por la política target,
-                    # terminamos el procesamiento de este episodio
-                    break
-                
-                W *= target_policy_prob / episode_behavior_probs[t]
+            # Actualizar valores Q usando importance sampling
+            self._update_off_policy_q_values(
+                episode_states, episode_actions, episode_rewards, episode_behavior_probs
+            )
             
             # Registrar métricas del episodio
             self.episode_rewards.append(sum(episode_rewards))
@@ -426,12 +590,7 @@ class MonteCarlo:
             self.decay_epsilon(episode)
             
             # Mostrar progreso periódicamente
-            if (episode + 1) % MONTE_CARLO_CONFIG['log_interval'] == 0 or episode == 0:
-                avg_reward = np.mean(self.episode_rewards[-MONTE_CARLO_CONFIG['log_interval']:])
-                elapsed_time = time.time() - start_time
-                
-                print(f"Episodio {episode+1}/{episodes} - Recompensa promedio: {avg_reward:.2f}, "
-                      f"Tiempo: {elapsed_time:.2f}s")
+            self._log_progress(episode, episodes, start_time)
         
         # Crear historial de entrenamiento
         history = {
@@ -443,19 +602,95 @@ class MonteCarlo:
         
         return history
     
-    def monte_carlo_exploring_starts(self, env, episodes: int = MONTE_CARLO_CONFIG['episodes'], max_steps: int = MONTE_CARLO_CONFIG['max_steps'], render: bool = False):
+    def _initialize_exploring_start(self, env: Any) -> Tuple[int, List[int], List[int], List[float]]:
+        """
+        Inicializa un episodio con exploring starts.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno a inicializar
+            
+        Retorna:
+        --------
+        Tuple[int, List[int], List[int], List[float]]
+            Estado actual, estados, acciones y recompensas iniciales
+        """
+        # Iniciar con un estado aleatorio (exploring start)
+        if hasattr(env, 'set_state'):
+            rng = np.random.default_rng(42)
+            random_state = rng.integers(0, self.n_states)
+            env.set_state(random_state)
+            state = random_state
+        else:
+            # Si no podemos establecer el estado, iniciamos normalmente
+            state, _ = env.reset()
+            
+        # Seleccionar una primera acción aleatoria para garantizar exploring starts
+        rng = np.random.default_rng(42)
+        action = rng.integers(0, self.n_actions)
+        
+        # Ejecutar la primera acción
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+        
+        # Inicializar listas para guardar la trayectoria
+        episode_states = [state]
+        episode_actions = [action]
+        episode_rewards = [reward]
+        
+        return next_state, done, episode_states, episode_actions, episode_rewards
+    
+    def _update_mces_policy(self, state: int) -> bool:
+        """
+        Actualiza la política determinística para MCES para un estado.
+        
+        Parámetros:
+        -----------
+        state : int
+            Estado para actualizar la política
+            
+        Retorna:
+        --------
+        bool
+            Si la política cambió
+        """
+        old_action = np.argmax(self.policy[state])
+        best_action = np.argmax(self.q_table[state])
+        
+        if old_action != best_action:
+            # Política determinística para MCES
+            self.policy[state] = np.zeros(self.n_actions)
+            self.policy[state][best_action] = 1.0
+            return True
+        return False
+    
+    def monte_carlo_exploring_starts(
+        self, 
+        env: Any, 
+        episodes: int = MONTE_CARLO_CONFIG['episodes'], 
+        max_steps: int = MONTE_CARLO_CONFIG['max_steps'], 
+        render: bool = False
+    ) -> Dict[str, List[float]]:
         """
         Implementa control Monte Carlo con exploring starts (MCES).
         
         Nota: Este método solo funciona para entornos que permiten establecer el estado inicial.
         
-        Args:
-            env: Entorno de OpenAI Gym o similar con soporte para establecer estado
-            episodes: Número de episodios a ejecutar
-            max_steps: Número máximo de pasos por episodio
-            render: Si renderizar o no el entorno
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o similar con soporte para establecer estado
+        episodes : int, opcional
+            Número de episodios a ejecutar (default: MONTE_CARLO_CONFIG['episodes'])
+        max_steps : int, opcional
+            Número máximo de pasos por episodio (default: MONTE_CARLO_CONFIG['max_steps'])
+        render : bool, opcional
+            Si renderizar o no el entorno (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia del entrenamiento
         """
         start_time = time.time()
@@ -465,31 +700,11 @@ class MonteCarlo:
             print("Advertencia: Este entorno no parece soportar 'set_state'. El método MCES puede no funcionar correctamente.")
         
         for episode in range(episodes):
-            # Iniciar con un estado aleatorio (exploring start)
-            if hasattr(env, 'set_state'):
-                random_state = np.random.randint(0, self.n_states)
-                env.set_state(random_state)
-                state = random_state
-            else:
-                # Si no podemos establecer el estado, iniciamos normalmente
-                state, _ = env.reset()
-                
-            # Seleccionar una primera acción aleatoria para garantizar exploring starts
-            action = np.random.randint(0, self.n_actions)
-            
-            # Ejecutar la primera acción
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            
-            # Inicializar listas para guardar la trayectoria
-            episode_states = [state]
-            episode_actions = [action]
-            episode_rewards = [reward]
-            
-            # Continuar el episodio usando la política actual
-            state = next_state
+            # Inicializar con exploring starts
+            state, done, episode_states, episode_actions, episode_rewards = self._initialize_exploring_start(env)
             steps = 1
             
+            # Continuar el episodio usando la política actual
             while not done and steps < max_steps:
                 if render:
                     env.render()
@@ -509,45 +724,12 @@ class MonteCarlo:
                 # Actualizar estado
                 state = next_state
                 steps += 1
-                
-                if done:
-                    break
             
             # Calcular retornos para el episodio
             returns = self.calculate_returns(episode_rewards)
             
-            # Actualizar función Q y política
-            policy_changed = False
-            visited_state_action_pairs = set()
-            
-            for t in range(len(episode_states)):
-                state = episode_states[t]
-                action = episode_actions[t]
-                
-                # Para first-visit MC, solo considerar primera visita a cada par estado-acción
-                state_action = (state, action)
-                if self.first_visit and state_action in visited_state_action_pairs:
-                    continue
-                
-                visited_state_action_pairs.add(state_action)
-                
-                # Actualizar conteos y sumas para este par estado-acción
-                self.returns_sum[state, action] += returns[t]
-                self.returns_count[state, action] += 1
-                
-                # Actualizar valor Q usando promedio incremental
-                if self.returns_count[state, action] > 0:
-                    self.q_table[state, action] = self.returns_sum[state, action] / self.returns_count[state, action]
-                    
-                    # Actualizar política (determinística para MCES)
-                    old_action = np.argmax(self.policy[state])
-                    best_action = np.argmax(self.q_table[state])
-                    
-                    if old_action != best_action:
-                        policy_changed = True
-                        # En MCES, la política es totalmente greedy (determinística)
-                        self.policy[state] = np.zeros(self.n_actions)
-                        self.policy[state][best_action] = 1.0
+            # Actualizar Q y política
+            policy_changed = self._update_values_mces(episode_states, episode_actions, returns)
             
             # Registrar métricas del episodio
             self.episode_rewards.append(sum(episode_rewards))
@@ -555,12 +737,7 @@ class MonteCarlo:
             self.policy_changes.append(1 if policy_changed else 0)
             
             # Mostrar progreso periódicamente
-            if (episode + 1) % MONTE_CARLO_CONFIG['log_interval'] == 0 or episode == 0:
-                avg_reward = np.mean(self.episode_rewards[-MONTE_CARLO_CONFIG['log_interval']:])
-                elapsed_time = time.time() - start_time
-                
-                print(f"Episodio {episode+1}/{episodes} - Recompensa promedio: {avg_reward:.2f}, "
-                      f"Tiempo: {elapsed_time:.2f}s")
+            self._log_progress(episode, episodes, start_time)
         
         # Crear historial de entrenamiento
         history = {
@@ -572,17 +749,76 @@ class MonteCarlo:
         
         return history
     
-    def evaluate(self, env, episodes: int = 10, max_steps: int = 1000, render: bool = False) -> float:
+    def _update_values_mces(self, episode_states: List[int], episode_actions: List[int], returns: np.ndarray) -> bool:
+        """
+        Actualiza valores Q y política para MCES.
+        
+        Parámetros:
+        -----------
+        episode_states : List[int]
+            Lista de estados visitados
+        episode_actions : List[int]
+            Lista de acciones tomadas
+        returns : np.ndarray
+            Lista de retornos
+            
+        Retorna:
+        --------
+        bool
+            Si la política cambió durante la actualización
+        """
+        policy_changed = False
+        visited_state_action_pairs = set()
+        
+        for t in range(len(episode_states)):
+            state = episode_states[t]
+            action = episode_actions[t]
+            
+            # Para first-visit MC, solo considerar primera visita a cada par estado-acción
+            state_action = (state, action)
+            if self.first_visit and state_action in visited_state_action_pairs:
+                continue
+            
+            visited_state_action_pairs.add(state_action)
+            
+            # Actualizar conteos y sumas para este par estado-acción
+            self.returns_sum[state, action] += returns[t]
+            self.returns_count[state, action] += 1
+            
+            # Actualizar valor Q usando promedio incremental
+            if self.returns_count[state, action] > 0:
+                self.q_table[state, action] = self.returns_sum[state, action] / self.returns_count[state, action]
+                
+                # Actualizar política (determinística para MCES)
+                if self._update_mces_policy(state):
+                    policy_changed = True
+        
+        return policy_changed
+    
+    def evaluate(
+        self, 
+        env: Any, 
+        episodes: int = 10, 
+        max_steps: int = 1000, 
+        render: bool = False
+    ) -> float:
         """
         Evalúa la política actual en el entorno.
         
-        Args:
-            env: Entorno para evaluar
-            episodes: Número de episodios para la evaluación
-            max_steps: Máximo número de pasos por episodio
-            render: Si mostrar o no la visualización del entorno
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para evaluar
+        episodes : int, opcional
+            Número de episodios para la evaluación (default: 10)
+        max_steps : int, opcional
+            Máximo número de pasos por episodio (default: 1000)
+        render : bool, opcional
+            Si mostrar o no la visualización del entorno (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        float
             Recompensa promedio por episodio
         """
         total_rewards = []
@@ -621,8 +857,10 @@ class MonteCarlo:
         """
         Guarda el modelo (tablas Q, política, etc.) en un archivo.
         
-        Args:
-            filepath: Ruta donde guardar el modelo
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
         """
         data = {
             'q_table': self.q_table,
@@ -645,8 +883,10 @@ class MonteCarlo:
         """
         Carga el modelo desde un archivo.
         
-        Args:
-            filepath: Ruta desde donde cargar el modelo
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
         """
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
@@ -663,22 +903,17 @@ class MonteCarlo:
         
         print(f"Modelo cargado desde {filepath}")
     
-    def visualize_policy(self, env, title: str = "Política") -> None:
+    def _setup_grid(self, ax, grid_shape):
         """
-        Visualiza la política actual para entornos tipo cuadrícula.
+        Configura la cuadrícula base para la visualización.
         
-        Args:
-            env: Entorno con estructura de cuadrícula
-            title: Título para la visualización
+        Parámetros:
+        -----------
+        ax : matplotlib.axes.Axes
+            Ejes para dibujar
+        grid_shape : tuple
+            Forma de la cuadrícula (filas, columnas)
         """
-        if not hasattr(env, 'shape'):
-            print("El entorno no tiene estructura de cuadrícula para visualización")
-            return
-        
-        grid_shape = env.shape
-        fig, ax = plt.subplots(figsize=(8, 8))
-        
-        # Crear cuadrícula
         ax.set_xlim([0, grid_shape[1]])
         ax.set_ylim([0, grid_shape[0]])
         
@@ -687,66 +922,134 @@ class MonteCarlo:
             ax.axvline(i, color='black', linestyle='-')
         for j in range(grid_shape[0] + 1):
             ax.axhline(j, color='black', linestyle='-')
-        
-        # Dibujar flechas para las acciones
-        for s in range(self.n_states):
-            if hasattr(env, 'state_mapping'):
-                # Convertir índice de estado a posición en cuadrícula
-                i, j = env.state_mapping(s)
-            else:
-                # Asumir orden row-major
-                i, j = s // grid_shape[1], s % grid_shape[1]
             
+    def _get_grid_position(self, env, state, grid_shape):
+        """
+        Obtiene la posición (i,j) en la cuadrícula para un estado.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno
+        state : int
+            Índice del estado
+        grid_shape : tuple
+            Forma de la cuadrícula
+            
+        Retorna:
+        --------
+        tuple
+            Posición (i,j) en la cuadrícula
+        """
+        if hasattr(env, 'state_mapping'):
+            return env.state_mapping(state)
+        else:
+            # Asumir orden row-major
+            return state // grid_shape[1], state % grid_shape[1]
+            
+    def _draw_arrows(self, ax, env, grid_shape):
+        """
+        Dibuja flechas para representar las acciones según la política.
+        
+        Parámetros:
+        -----------
+        ax : matplotlib.axes.Axes
+            Ejes para dibujar
+        env : Any
+            Entorno
+        grid_shape : tuple
+            Forma de la cuadrícula
+        """
+        # Definir direcciones de flechas
+        directions = {
+            0: (0, -0.4),  # Izquierda
+            1: (0, 0.4),   # Derecha
+            2: (-0.4, 0),  # Abajo
+            3: (0.4, 0)    # Arriba
+        }
+        
+        for s in range(self.n_states):
             # Evitar estados terminales
             if hasattr(env, 'is_terminal') and env.is_terminal(s):
                 continue
                 
-            if self.evaluation_mode:
-                # En modo evaluación, mostramos la acción con mayor probabilidad
-                action = np.argmax(self.policy[s])
-            else:
-                # En modo control, mostramos la acción con mayor valor Q
-                action = np.argmax(self.q_table[s])
+            # Obtener posición en la cuadrícula
+            i, j = self._get_grid_position(env, s, grid_shape)
             
-            # Definir direcciones de flechas (estas pueden variar según el entorno)
-            directions = {
-                0: (0, -0.4),  # Izquierda
-                1: (0, 0.4),   # Derecha
-                2: (-0.4, 0),  # Abajo
-                3: (0.4, 0)    # Arriba
-            }
+            # Determinar la acción a mostrar
+            action = np.argmax(self.policy[s]) if self.evaluation_mode else np.argmax(self.q_table[s])
             
+            # Dibujar flecha para la acción
             if action in directions:
                 dx, dy = directions[action]
                 ax.arrow(j + 0.5, grid_shape[0] - i - 0.5, dx, dy, 
-                         head_width=0.1, head_length=0.1, fc='blue', ec='blue')
+                        head_width=0.1, head_length=0.1, fc='blue', ec='blue')
+                    
+    def _draw_values(self, ax, env, grid_shape):
+        """
+        Dibuja los valores para cada estado en la cuadrícula.
+        
+        Parámetros:
+        -----------
+        ax : matplotlib.axes.Axes
+            Ejes para dibujar
+        env : Any
+            Entorno
+        grid_shape : tuple
+            Forma de la cuadrícula
+        """
+        for s in range(self.n_states):
+            # Obtener posición en la cuadrícula
+            i, j = self._get_grid_position(env, s, grid_shape)
+            
+            # Determinar el valor a mostrar
+            value = self.v_table[s] if self.evaluation_mode else np.max(self.q_table[s])
+            
+            # Mostrar valor
+            ax.text(j + 0.5, grid_shape[0] - i - 0.5, f"{value:.2f}", 
+                  ha='center', va='center', color='red', fontsize=9)
+
+    def visualize_policy(self, env: Any, title: str = "Política") -> None:
+        """
+        Visualiza la política actual para entornos tipo cuadrícula.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con estructura de cuadrícula
+        title : str, opcional
+            Título para la visualización (default: "Política")
+        """
+        if not hasattr(env, 'shape'):
+            print("El entorno no tiene estructura de cuadrícula para visualización")
+            return
+        
+        grid_shape = env.shape
+        _, ax = plt.subplots(figsize=(8, 8))
+        
+        # Configurar y dibujar la cuadrícula
+        self._setup_grid(ax, grid_shape)
+        
+        # Dibujar flechas para las acciones
+        self._draw_arrows(ax, env, grid_shape)
         
         # Mostrar valores Q o V
-        for s in range(self.n_states):
-            if hasattr(env, 'state_mapping'):
-                i, j = env.state_mapping(s)
-            else:
-                i, j = s // grid_shape[1], s % grid_shape[1]
-            
-            if self.evaluation_mode:
-                value = self.v_table[s]
-            else:
-                value = np.max(self.q_table[s])
-            
-            ax.text(j + 0.5, grid_shape[0] - i - 0.5, f"{value:.2f}", 
-                   ha='center', va='center', color='red', fontsize=9)
+        self._draw_values(ax, env, grid_shape)
         
         ax.set_title(title)
         plt.tight_layout()
         plt.show()
     
-    def visualize_value_function(self, env, title: str = "Función de Valor"):
+    def visualize_value_function(self, env: Any, title: str = "Función de Valor") -> None:
         """
         Visualiza la función de valor para entornos tipo cuadrícula.
         
-        Args:
-            env: Entorno con estructura de cuadrícula
-            title: Título para la visualización
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con estructura de cuadrícula
+        title : str, opcional
+            Título para la visualización (default: "Función de Valor")
         """
         if not hasattr(env, 'shape'):
             print("El entorno no tiene estructura de cuadrícula para visualización")
@@ -755,11 +1058,7 @@ class MonteCarlo:
         grid_shape = env.shape
         
         # Crear matriz para visualización
-        if self.evaluation_mode:
-            value_grid = np.zeros(grid_shape)
-        else:
-            # Para control, usamos el máximo valor Q en cada estado
-            value_grid = np.zeros(grid_shape)
+        value_grid = np.zeros(grid_shape)
         
         # Llenar matriz con valores
         for s in range(self.n_states):
@@ -773,7 +1072,7 @@ class MonteCarlo:
             else:
                 value_grid[i, j] = np.max(self.q_table[s])
         
-        fig, ax = plt.subplots(figsize=(10, 8))
+        _, ax = plt.subplots(figsize=(10, 8))
         
         # Crear mapa de calor
         im = ax.imshow(value_grid, cmap='viridis')
@@ -791,12 +1090,14 @@ class MonteCarlo:
         plt.tight_layout()
         plt.show()
     
-    def visualize_training(self, history: Dict[str, List] = None):
+    def visualize_training(self, history: Optional[Dict[str, List]] = None) -> None:
         """
         Visualiza métricas de entrenamiento.
         
-        Args:
-            history: Diccionario con historial de entrenamiento (opcional)
+        Parámetros:
+        -----------
+        history : Optional[Dict[str, List]], opcional
+            Diccionario con historial de entrenamiento (default: None)
         """
         if history is None:
             # Si no se proporciona historia, usar datos internos
@@ -815,7 +1116,7 @@ class MonteCarlo:
         if 'policy_changes' in history and history['policy_changes']:
             n_plots += 1
             
-        fig, axs = plt.subplots(n_plots, 1, figsize=(12, 3*n_plots))
+        _, axs = plt.subplots(n_plots, 1, figsize=(12, 3*n_plots))
         
         plot_idx = 0
         
@@ -878,19 +1179,33 @@ class MonteCarlo:
         plt.tight_layout()
         plt.show()
     
-    def train(self, env, method: str = 'on_policy', episodes: int = None, max_steps: int = None,
-             render: bool = False):
+    def train(
+        self, 
+        env: Any, 
+        method: str = 'on_policy', 
+        episodes: Optional[int] = None, 
+        max_steps: Optional[int] = None,
+        render: bool = False
+    ) -> Dict[str, List[float]]:
         """
         Método principal para entrenar el agente con el algoritmo Monte Carlo seleccionado.
         
-        Args:
-            env: Entorno para entrenar
-            method: Método de entrenamiento ('on_policy', 'off_policy', 'exploring_starts')
-            episodes: Número de episodios (si None, usa valor de configuración)
-            max_steps: Pasos máximos por episodio (si None, usa valor de configuración)
-            render: Si mostrar o no la visualización del entorno
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para entrenar
+        method : str, opcional
+            Método de entrenamiento ('on_policy', 'off_policy', 'exploring_starts') (default: 'on_policy')
+        episodes : Optional[int], opcional
+            Número de episodios (si None, usa valor de configuración) (default: None)
+        max_steps : Optional[int], opcional
+            Pasos máximos por episodio (si None, usa valor de configuración) (default: None)
+        render : bool, opcional
+            Si mostrar o no la visualización del entorno (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia de entrenamiento
         """
         if episodes is None:
@@ -912,13 +1227,16 @@ class MonteCarlo:
         else:
             raise ValueError(f"Método desconocido: {method}. Use 'on_policy', 'off_policy' o 'exploring_starts'")
     
-    def visualize_action_values(self, state: int, title: str = None):
+    def visualize_action_values(self, state: int, title: Optional[str] = None) -> None:
         """
         Visualiza los valores Q para todas las acciones en un estado específico.
         
-        Args:
-            state: Estado para visualizar valores de acción
-            title: Título opcional para el gráfico
+        Parámetros:
+        -----------
+        state : int
+            Estado para visualizar valores de acción
+        title : Optional[str], opcional
+            Título opcional para el gráfico (default: None)
         """
         if not title:
             title = f"Valores Q para el Estado {state}"
@@ -946,16 +1264,27 @@ class MonteCarlo:
         plt.grid(True, alpha=0.3)
         plt.show()
     
-    def compare_visits(self, env, episodes=100, max_steps=1000):
+    def compare_visits(
+        self, 
+        env: Any, 
+        episodes: int = 100, 
+        max_steps: int = 1000
+    ) -> Dict[str, np.ndarray]:
         """
         Compara first-visit y every-visit Monte Carlo para la evaluación de política.
         
-        Args:
-            env: Entorno para evaluar
-            episodes: Número de episodios para la comparación
-            max_steps: Pasos máximos por episodio
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para evaluar
+        episodes : int, opcional
+            Número de episodios para la comparación (default: 100)
+        max_steps : int, opcional
+            Pasos máximos por episodio (default: 1000)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, np.ndarray]
             Diccionario con resultados de la comparación
         """
         print("Comparando first-visit vs every-visit Monte Carlo...")
@@ -1061,20 +1390,150 @@ class MonteCarlo:
             'max_diff': max_diff
         }
     
-    def weighted_importance_sampling(self, env, episodes=MONTE_CARLO_CONFIG['episodes'], 
-                                   max_steps=MONTE_CARLO_CONFIG['max_steps'], 
-                                   render=False):
+    def _collect_weighted_is_episode(self, env: Any, behavior_epsilon: float, max_steps: int, render: bool) -> Tuple[List[int], List[int], List[float], List[float]]:
+        """
+        Recopila un episodio usando la política de comportamiento para weighted importance sampling.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno a ejecutar
+        behavior_epsilon : float
+            Epsilon para la política de comportamiento
+        max_steps : int
+            Pasos máximos por episodio
+        render : bool
+            Si renderizar o no el entorno
+            
+        Retorna:
+        --------
+        Tuple[List[int], List[int], List[float], List[float]]
+            Estados, acciones, recompensas y probabilidades de comportamiento
+        """
+        state, _ = env.reset()
+        episode_states = []
+        episode_actions = []
+        episode_rewards = []
+        episode_behavior_probs = []
+        
+        for _ in range(max_steps):
+            if render:
+                env.render()
+            
+            # Seleccionar acción usando política de comportamiento
+            rng = np.random.default_rng(42)
+            if rng.random() < behavior_epsilon:
+                action = rng.integers(0, self.n_actions)
+                behavior_prob = behavior_epsilon / self.n_actions
+            else:
+                action = np.argmax(self.q_table[state])
+                behavior_prob = 1 - behavior_epsilon + (behavior_epsilon / self.n_actions)
+            
+            # Dar un paso en el entorno
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # Guardar transición
+            episode_states.append(state)
+            episode_actions.append(action)
+            episode_rewards.append(reward)
+            episode_behavior_probs.append(behavior_prob)
+            
+            # Actualizar estado
+            state = next_state
+            
+            if done:
+                break
+                
+        return episode_states, episode_actions, episode_rewards, episode_behavior_probs
+        
+    def _update_weighted_is_values(self, episode_states: List[int], episode_actions: List[int], 
+                                  episode_rewards: List[float], episode_behavior_probs: List[float]) -> None:
+        """
+        Actualiza los valores Q usando weighted importance sampling.
+        
+        Parámetros:
+        -----------
+        episode_states : List[int]
+            Estados visitados
+        episode_actions : List[int]
+            Acciones tomadas
+        episode_rewards : List[float]
+            Recompensas recibidas
+        episode_behavior_probs : List[float]
+            Probabilidades bajo la política de comportamiento
+        """
+        # Procesar el episodio en orden inverso
+        G = 0.0
+        W = 1.0  # Peso de importancia inicial
+        
+        for t in range(len(episode_states) - 1, -1, -1):
+            state = episode_states[t]
+            action = episode_actions[t]
+            reward = episode_rewards[t]
+            
+            # Actualizar retorno acumulado
+            G = reward + self.gamma * G
+            
+            # Incrementar el contador de visitas con el peso de importancia
+            self.c_table[state, action] += W
+            
+            # Actualizar valor Q usando weighted importance sampling
+            if self.c_table[state, action] > 0:
+                # Fórmula de weighted importance sampling: Q += W/C * (G - Q)
+                self.q_table[state, action] += (W / self.c_table[state, action]) * (G - self.q_table[state, action])
+            
+            # Actualizar política (greedy respecto a Q)
+            self._update_greedy_policy(state)
+            
+            # Si la acción no habría sido tomada por la política target, detenemos la actualización
+            if action != np.argmax(self.q_table[state]):
+                break
+            
+            # Actualizar ratio de importancia
+            target_prob = 1.0  # Política greedy
+            W *= target_prob / episode_behavior_probs[t]
+    
+    def _update_greedy_policy(self, state: int) -> None:
+        """
+        Actualiza la política para ser completamente greedy respecto a los valores Q.
+        
+        Parámetros:
+        -----------
+        state : int
+            Estado para el cual actualizar la política
+        """
+        best_action = np.argmax(self.q_table[state])
+        
+        # Política greedy (determinística)
+        self.policy[state] = np.zeros(self.n_actions)
+        self.policy[state][best_action] = 1.0
+    
+    def weighted_importance_sampling(
+        self, 
+        env: Any, 
+        episodes: int = MONTE_CARLO_CONFIG['episodes'], 
+        max_steps: int = MONTE_CARLO_CONFIG['max_steps'], 
+        render: bool = False
+    ) -> Dict[str, List[float]]:
         """
         Implementa control Monte Carlo off-policy con weighted importance sampling.
         Este método tiende a ser más estable que el importance sampling ordinario.
         
-        Args:
-            env: Entorno de OpenAI Gym o similar
-            episodes: Número de episodios a ejecutar
-            max_steps: Número máximo de pasos por episodio
-            render: Si renderizar o no el entorno
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o similar
+        episodes : int, opcional
+            Número de episodios a ejecutar (default: MONTE_CARLO_CONFIG['episodes'])
+        max_steps : int, opcional
+            Número máximo de pasos por episodio (default: MONTE_CARLO_CONFIG['max_steps'])
+        render : bool, opcional
+            Si renderizar o no el entorno (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia del entrenamiento
         """
         start_time = time.time()
@@ -1087,91 +1546,19 @@ class MonteCarlo:
         behavior_epsilon = max(0.1, self.epsilon)
         
         for episode in range(episodes):
-            # Inicializar episodio
-            state, _ = env.reset()
-            episode_states = []
-            episode_actions = []
-            episode_rewards = []
-            episode_behavior_probs = []  # Probabilidades bajo política de comportamiento
+            # Recopilar un episodio completo
+            episode_states, episode_actions, episode_rewards, episode_behavior_probs = \
+                self._collect_weighted_is_episode(env, behavior_epsilon, max_steps, render)
             
-            # Ejecutar un episodio completo usando política de comportamiento
-            for t in range(max_steps):
-                if render:
-                    env.render()
-                
-                # Seleccionar acción usando política de comportamiento (más exploratoria)
-                if np.random.random() < behavior_epsilon:
-                    action = np.random.randint(self.n_actions)
-                    behavior_prob = behavior_epsilon / self.n_actions
-                else:
-                    action = np.argmax(self.q_table[state])
-                    behavior_prob = 1 - behavior_epsilon + (behavior_epsilon / self.n_actions)
-                
-                # Dar un paso en el entorno
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                
-                # Guardar transición
-                episode_states.append(state)
-                episode_actions.append(action)
-                episode_rewards.append(reward)
-                episode_behavior_probs.append(behavior_prob)
-                
-                # Actualizar estado
-                state = next_state
-                
-                if done:
-                    break
-            
-            # Calcular retornos para el episodio
-            returns = self.calculate_returns(episode_rewards)
-            
-            # Procesar el episodio en orden inverso
-            G = 0.0
-            W = 1.0  # Peso de importancia inicial
-            
-            for t in range(len(episode_states) - 1, -1, -1):
-                state = episode_states[t]
-                action = episode_actions[t]
-                reward = episode_rewards[t]
-                
-                # Actualizar retorno acumulado
-                G = reward + self.gamma * G
-                
-                # Incrementar el contador de visitas con el peso de importancia
-                self.c_table[state, action] += W
-                
-                # Actualizar valor Q usando weighted importance sampling
-                if self.c_table[state, action] > 0:
-                    # Fórmula de weighted importance sampling: Q += W/C * (G - Q)
-                    self.q_table[state, action] += (W / self.c_table[state, action]) * (G - self.q_table[state, action])
-                
-                # Actualizar política (greedy respecto a Q)
-                for a in range(self.n_actions):
-                    if a == np.argmax(self.q_table[state]):
-                        self.policy[state, a] = 1.0
-                    else:
-                        self.policy[state, a] = 0.0
-                
-                # Si la acción no habría sido tomada por la política target, detenemos la actualización
-                if action != np.argmax(self.q_table[state]):
-                    break
-                
-                # Actualizar ratio de importancia
-                target_prob = 1.0  # Política greedy
-                W *= target_prob / episode_behavior_probs[t]
+            # Actualizar valores y política
+            self._update_weighted_is_values(episode_states, episode_actions, episode_rewards, episode_behavior_probs)
             
             # Registrar métricas del episodio
             self.episode_rewards.append(sum(episode_rewards))
             self.episode_lengths.append(len(episode_rewards))
             
             # Mostrar progreso periódicamente
-            if (episode + 1) % MONTE_CARLO_CONFIG['log_interval'] == 0 or episode == 0:
-                avg_reward = np.mean(self.episode_rewards[-MONTE_CARLO_CONFIG['log_interval']:])
-                elapsed_time = time.time() - start_time
-                
-                print(f"Episodio {episode+1}/{episodes} - Recompensa promedio: {avg_reward:.2f}, "
-                      f"Tiempo: {elapsed_time:.2f}s")
+            self._log_progress(episode, episodes, start_time)
         
         # Crear historial de entrenamiento
         history = {
@@ -1182,82 +1569,139 @@ class MonteCarlo:
         
         return history
     
-    def incremental_monte_carlo(self, env, episodes=MONTE_CARLO_CONFIG['episodes'], 
-                               max_steps=MONTE_CARLO_CONFIG['max_steps'],
-                               render=False):
+    def _collect_episode_buffer(self, env: Any, max_steps: int, render: bool) -> List[Tuple[int, int, float]]:
+        """
+        Recopila un episodio completo y retorna el buffer de experiencias.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno a ejecutar
+        max_steps : int
+            Número máximo de pasos
+        render : bool
+            Si renderizar o no el entorno
+            
+        Retorna:
+        --------
+        List[Tuple[int, int, float]]
+            Buffer de experiencias (estado, acción, recompensa)
+        """
+        state, _ = env.reset()
+        done = False
+        step = 0
+        episode_buffer = []
+        
+        while not done and step < max_steps:
+            if render:
+                env.render()
+            
+            # Seleccionar acción según política epsilon-greedy
+            action = self.get_action(state, explore=True)
+            
+            # Dar un paso en el entorno
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # Guardar transición en buffer
+            episode_buffer.append((state, action, reward))
+            
+            # Actualizar estado
+            state = next_state
+            step += 1
+        
+        return episode_buffer
+    
+    def _is_first_occurrence(self, buffer: List[Tuple[int, int, float]], t: int, state: int, action: int) -> bool:
+        """
+        Verifica si es la primera ocurrencia de un par estado-acción en el buffer.
+        
+        Parámetros:
+        -----------
+        buffer : List[Tuple[int, int, float]]
+            Buffer de experiencias
+        t : int
+            Índice actual
+        state : int
+            Estado a verificar
+        action : int
+            Acción a verificar
+            
+        Retorna:
+        --------
+        bool
+            True si es la primera ocurrencia, False en caso contrario
+        """
+        for i in range(t):
+            if buffer[i][0] == state and buffer[i][1] == action:
+                return False
+        return True
+    
+    def _update_from_episode_buffer(self, episode_buffer: List[Tuple[int, int, float]]) -> None:
+        """
+        Actualiza valores Q y política basándose en el buffer de episodio.
+        
+        Parámetros:
+        -----------
+        episode_buffer : List[Tuple[int, int, float]]
+            Buffer de experiencias (estado, acción, recompensa)
+        """
+        G = 0
+        for t in range(len(episode_buffer) - 1, -1, -1):
+            state, action, reward = episode_buffer[t]
+            
+            # Actualizar retorno acumulado
+            G = reward + self.gamma * G
+            
+            # Verificar si es primera visita (si es necesario)
+            if self.first_visit and not self._is_first_occurrence(episode_buffer, t, state, action):
+                continue
+            
+            # Actualizar contadores y valores Q
+            self.returns_count[state, action] += 1
+            
+            # Actualización incremental
+            alpha = 1.0 / self.returns_count[state, action]
+            self.q_table[state, action] += alpha * (G - self.q_table[state, action])
+            
+            # Actualizar política basada en nuevos valores Q
+            self.update_policy(state)
+    
+    def incremental_monte_carlo(
+        self, 
+        env: Any, 
+        episodes: int = MONTE_CARLO_CONFIG['episodes'], 
+        max_steps: int = MONTE_CARLO_CONFIG['max_steps'],
+        render: bool = False
+    ) -> Dict[str, List[float]]:
         """
         Implementa una versión incremental de Monte Carlo control que actualiza
         los valores Q después de cada paso en lugar de al final del episodio.
         
-        Args:
-            env: Entorno de OpenAI Gym o similar
-            episodes: Número de episodios a ejecutar
-            max_steps: Número máximo de pasos por episodio
-            render: Si renderizar o no el entorno
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o similar
+        episodes : int, opcional
+            Número de episodios a ejecutar (default: MONTE_CARLO_CONFIG['episodes'])
+        max_steps : int, opcional
+            Número máximo de pasos por episodio (default: MONTE_CARLO_CONFIG['max_steps'])
+        render : bool, opcional
+            Si renderizar o no el entorno (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia del entrenamiento
         """
         start_time = time.time()
         
         for episode in range(episodes):
-            # Inicializar episodio
-            state, _ = env.reset()
-            done = False
-            step = 0
-            
-            # Inicializar buffer para el episodio actual
-            episode_buffer = []
-            
-            # Ejecutar un episodio completo
-            while not done and step < max_steps:
-                if render:
-                    env.render()
-                
-                # Seleccionar acción según política epsilon-greedy
-                action = self.get_action(state, explore=True)
-                
-                # Dar un paso en el entorno
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                
-                # Guardar transición en buffer
-                episode_buffer.append((state, action, reward))
-                
-                # Actualizar estado
-                state = next_state
-                step += 1
+            # Recolectar experiencias del episodio
+            episode_buffer = self._collect_episode_buffer(env, max_steps, render)
             
             # Procesar el episodio y actualizar valores Q
-            G = 0
-            for t in range(len(episode_buffer) - 1, -1, -1):
-                state, action, reward = episode_buffer[t]
-                
-                # Actualizar retorno acumulado
-                G = reward + self.gamma * G
-                
-                # Verificar si es primera visita (si es necesario)
-                if self.first_visit:
-                    first_occurrence = True
-                    for i in range(t):
-                        if episode_buffer[i][0] == state and episode_buffer[i][1] == action:
-                            first_occurrence = False
-                            break
-                    
-                    if not first_occurrence:
-                        continue
-                
-                # Actualizar contadores y valores Q
-                self.returns_count[state, action] += 1
-                
-                # Actualización incremental:
-                # Q(s,a) = Q(s,a) + (1/N) * (G - Q(s,a))
-                # donde N es el número de visitas a (s,a)
-                alpha = 1.0 / self.returns_count[state, action]
-                self.q_table[state, action] += alpha * (G - self.q_table[state, action])
-                
-                # Actualizar política basada en nuevos valores Q
-                self.update_policy(state)
+            self._update_from_episode_buffer(episode_buffer)
             
             # Registrar métricas del episodio
             self.episode_rewards.append(sum(r for _, _, r in episode_buffer))
@@ -1267,12 +1711,7 @@ class MonteCarlo:
             self.decay_epsilon(episode)
             
             # Mostrar progreso periódicamente
-            if (episode + 1) % MONTE_CARLO_CONFIG['log_interval'] == 0 or episode == 0:
-                avg_reward = np.mean(self.episode_rewards[-MONTE_CARLO_CONFIG['log_interval']:])
-                elapsed_time = time.time() - start_time
-                
-                print(f"Episodio {episode+1}/{episodes} - Recompensa promedio: {avg_reward:.2f}, "
-                      f"Epsilon: {self.epsilon:.4f}, Tiempo: {elapsed_time:.2f}s")
+            self._log_progress(episode, episodes, start_time)
         
         # Crear historial de entrenamiento
         history = {
@@ -1284,97 +1723,191 @@ class MonteCarlo:
         
         return history
     
-    def batch_monte_carlo(self, env, batch_size=10, iterations=MONTE_CARLO_CONFIG['episodes'] // 10, 
-                         max_steps=MONTE_CARLO_CONFIG['max_steps'], render=False):
+    def _collect_batch_episode(self, env: Any, max_steps: int, render: bool) -> Tuple[List[int], List[int], List[float]]:
+        """
+        Recopila un episodio individual para un lote.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno a ejecutar
+        max_steps : int
+            Número máximo de pasos por episodio
+        render : bool
+            Si renderizar o no el entorno
+            
+        Retorna:
+        --------
+        Tuple[List[int], List[int], List[float]]
+            Estados, acciones y recompensas del episodio
+        """
+        state, _ = env.reset()
+        episode_states = []
+        episode_actions = []
+        episode_rewards = []
+        done = False
+        step = 0
+        
+        while not done and step < max_steps:
+            if render:
+                env.render()
+            
+            # Seleccionar acción según política actual
+            action = self.get_action(state, explore=True)
+            
+            # Dar un paso en el entorno
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # Guardar transición
+            episode_states.append(state)
+            episode_actions.append(action)
+            episode_rewards.append(reward)
+            
+            # Actualizar estado
+            state = next_state
+            step += 1
+        
+        return episode_states, episode_actions, episode_rewards
+    
+    def _collect_batch(self, env: Any, batch_size: int, max_steps: int, render: bool) -> Tuple[List[Tuple[List[int], List[int], List[float]]], float, float]:
+        """
+        Recopila un lote completo de episodios.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno a ejecutar
+        batch_size : int
+            Número de episodios en el lote
+        max_steps : int
+            Número máximo de pasos por episodio
+        render : bool
+            Si renderizar o no el entorno
+            
+        Retorna:
+        --------
+        Tuple[List[Tuple[List[int], List[int], List[float]]], float, float]
+            Lista de episodios, suma de recompensas y suma de pasos
+        """
+        batch_episodes = []
+        batch_rewards_sum = 0
+        batch_steps_sum = 0
+        
+        for _ in range(batch_size):
+            # Recopilar un episodio
+            episode_states, episode_actions, episode_rewards = self._collect_batch_episode(env, max_steps, render)
+            
+            # Guardar episodio completo
+            batch_episodes.append((episode_states, episode_actions, episode_rewards))
+            batch_rewards_sum += sum(episode_rewards)
+            batch_steps_sum += len(episode_rewards)
+        
+        return batch_episodes, batch_rewards_sum, batch_steps_sum
+    
+    def _update_q_values_from_episode(self, states: List[int], actions: List[int], returns: np.ndarray) -> None:
+        """
+        Actualiza los valores Q basados en un episodio.
+        
+        Parámetros:
+        -----------
+        states : List[int]
+            Lista de estados visitados
+        actions : List[int]
+            Lista de acciones tomadas
+        returns : np.ndarray
+            Lista de retornos calculados
+        """
+        visited_state_action_pairs = set()
+        
+        for t in range(len(states)):
+            state = states[t]
+            action = actions[t]
+            
+            # Para first-visit MC, solo considerar primera visita a cada par estado-acción
+            state_action = (state, action)
+            if self.first_visit and state_action in visited_state_action_pairs:
+                continue
+            
+            visited_state_action_pairs.add(state_action)
+            
+            # Actualizar conteos y sumas para este par estado-acción
+            self.returns_sum[state, action] += returns[t]
+            self.returns_count[state, action] += 1
+            
+            # Actualizar valor Q usando promedio incremental
+            if self.returns_count[state, action] > 0:
+                self.q_table[state, action] = self.returns_sum[state, action] / self.returns_count[state, action]
+    
+    def _process_batch(self, batch_episodes: List[Tuple[List[int], List[int], List[float]]]) -> bool:
+        """
+        Procesa un lote completo de episodios actualizando los valores Q y la política.
+        
+        Parámetros:
+        -----------
+        batch_episodes : List[Tuple[List[int], List[int], List[float]]]
+            Lista de episodios con estados, acciones y recompensas
+            
+        Retorna:
+        --------
+        bool
+            Si la política cambió durante el procesamiento
+        """
+        policy_changed = False
+        
+        # Procesar cada episodio del lote
+        for states, actions, rewards in batch_episodes:
+            # Calcular retornos
+            returns = self.calculate_returns(rewards)
+            
+            # Actualizar valores Q
+            self._update_q_values_from_episode(states, actions, returns)
+        
+        # Actualizar política para todos los estados
+        for s in range(self.n_states):
+            if self.update_policy(s):
+                policy_changed = True
+        
+        return policy_changed
+    
+    def batch_monte_carlo(
+        self, 
+        env: Any, 
+        batch_size: int = 10, 
+        iterations: int = MONTE_CARLO_CONFIG['episodes'] // 10, 
+        max_steps: int = MONTE_CARLO_CONFIG['max_steps'], 
+        render: bool = False
+    ) -> Dict[str, List[float]]:
         """
         Implementación de Monte Carlo por lotes, donde los valores Q son actualizados
         después de recopilar múltiples episodios.
         
-        Args:
-            env: Entorno de OpenAI Gym o similar
-            batch_size: Número de episodios por lote
-            iterations: Número de iteraciones (lotes) a ejecutar
-            max_steps: Número máximo de pasos por episodio
-            render: Si renderizar o no el entorno
+        Parámetros:
+        -----------
+        env : Any
+            Entorno de OpenAI Gym o similar
+        batch_size : int, opcional
+            Número de episodios por lote (default: 10)
+        iterations : int, opcional
+            Número de iteraciones (lotes) a ejecutar (default: MONTE_CARLO_CONFIG['episodes'] // 10)
+        max_steps : int, opcional
+            Número máximo de pasos por episodio (default: MONTE_CARLO_CONFIG['max_steps'])
+        render : bool, opcional
+            Si renderizar o no el entorno (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia del entrenamiento
         """
         start_time = time.time()
         
         for iteration in range(iterations):
             # Recopilar un lote de episodios
-            batch_episodes = []
-            batch_rewards_sum = 0
-            batch_steps_sum = 0
+            batch_episodes, batch_rewards_sum, batch_steps_sum = self._collect_batch(env, batch_size, max_steps, render)
             
-            for _ in range(batch_size):
-                # Recopilar un episodio
-                state, _ = env.reset()
-                episode_states = []
-                episode_actions = []
-                episode_rewards = []
-                done = False
-                step = 0
-                
-                while not done and step < max_steps:
-                    if render:
-                        env.render()
-                    
-                    # Seleccionar acción según política epsilon-greedy
-                    action = self.get_action(state, explore=True)
-                    
-                    # Dar un paso en el entorno
-                    next_state, reward, terminated, truncated, _ = env.step(action)
-                    done = terminated or truncated
-                    
-                    # Guardar transición
-                    episode_states.append(state)
-                    episode_actions.append(action)
-                    episode_rewards.append(reward)
-                    
-                    # Actualizar estado
-                    state = next_state
-                    step += 1
-                
-                # Guardar episodio completo
-                batch_episodes.append((episode_states, episode_actions, episode_rewards))
-                batch_rewards_sum += sum(episode_rewards)
-                batch_steps_sum += len(episode_rewards)
-            
-            # Procesar todos los episodios del lote
-            policy_changed = False
-            
-            for states, actions, rewards in batch_episodes:
-                # Calcular retornos
-                returns = self.calculate_returns(rewards)
-                
-                # Actualizar valores Q
-                visited_state_action_pairs = set()
-                
-                for t in range(len(states)):
-                    state = states[t]
-                    action = actions[t]
-                    
-                    # Para first-visit MC, solo considerar primera visita a cada par estado-acción
-                    state_action = (state, action)
-                    if self.first_visit and state_action in visited_state_action_pairs:
-                        continue
-                    
-                    visited_state_action_pairs.add(state_action)
-                    
-                    # Actualizar conteos y sumas para este par estado-acción
-                    self.returns_sum[state, action] += returns[t]
-                    self.returns_count[state, action] += 1
-                    
-                    # Actualizar valor Q usando promedio incremental
-                    if self.returns_count[state, action] > 0:
-                        self.q_table[state, action] = self.returns_sum[state, action] / self.returns_count[state, action]
-            
-            # Actualizar política para todos los estados basada en nuevos valores Q
-            for s in range(self.n_states):
-                if self.update_policy(s):
-                    policy_changed = True
+            # Procesar el lote y actualizar política
+            policy_changed = self._process_batch(batch_episodes)
             
             # Registrar métricas del lote
             self.episode_rewards.append(batch_rewards_sum / batch_size)
@@ -1389,7 +1922,7 @@ class MonteCarlo:
             elapsed_time = time.time() - start_time
             
             print(f"Iteración {iteration+1}/{iterations} - Recompensa promedio: {avg_reward:.2f}, "
-                  f"Epsilon: {self.epsilon:.4f}, Tiempo: {elapsed_time:.2f}s")
+                f"Epsilon: {self.epsilon:.4f}, Tiempo: {elapsed_time:.2f}s")
         
         # Crear historial de entrenamiento
         history = {
@@ -1401,35 +1934,33 @@ class MonteCarlo:
         }
         
         return history
-    
-    def visualize_importance_weights(self, env, episodes=10, max_steps=100):
+
+    def _plot_weight_distribution(self, ax):
         """
-        Visualiza los pesos de importance sampling de Monte Carlo off-policy.
+        Visualiza la distribución de los pesos en el subplot dado.
         
-        Args:
-            env: Entorno para recopilar datos
-            episodes: Número de episodios para visualizar
-            max_steps: Pasos máximos por episodio
+        Parámetros:
+        -----------
+        ax : matplotlib.axes.Axes
+            Subplot para dibujar la distribución
         """
-        # Asegurarse que tenemos pesos de importance sampling acumulados
-        if np.sum(self.c_table) == 0:
-            print("No hay pesos de importance sampling para visualizar. Ejecute monte_carlo_control_off_policy primero.")
-            return
-        
-        plt.figure(figsize=(15, 10))
-        
-        # Visualizar distribución de pesos
-        plt.subplot(2, 2, 1)
         weights = self.c_table.flatten()
         weights = weights[weights > 0]  # Solo pesos positivos
-        plt.hist(weights, bins=50)
-        plt.title('Distribución de Pesos de Importance Sampling')
-        plt.xlabel('Peso')
-        plt.ylabel('Frecuencia')
-        plt.grid(True, alpha=0.3)
+        ax.hist(weights, bins=50)
+        ax.set_title('Distribución de Pesos de Importance Sampling')
+        ax.set_xlabel('Peso')
+        ax.set_ylabel('Frecuencia')
+        ax.grid(True, alpha=0.3)
+    
+    def _plot_weight_vs_q_values(self, ax):
+        """
+        Visualiza la relación entre pesos y valores Q en el subplot dado.
         
-        # Visualizar relación entre pesos y valores Q
-        plt.subplot(2, 2, 2)
+        Parámetros:
+        -----------
+        ax : matplotlib.axes.Axes
+            Subplot para dibujar la relación
+        """
         x = []
         y = []
         for s in range(self.n_states):
@@ -1438,40 +1969,51 @@ class MonteCarlo:
                     x.append(self.c_table[s, a])
                     y.append(self.q_table[s, a])
         
-        plt.scatter(x, y, alpha=0.5)
-        plt.title('Relación entre Pesos y Valores Q')
-        plt.xlabel('Peso (C)')
-        plt.ylabel('Valor Q')
-        plt.xscale('log')  # Escala logarítmica para mejor visualización
-        plt.grid(True, alpha=0.3)
+        ax.scatter(x, y, alpha=0.5)
+        ax.set_title('Relación entre Pesos y Valores Q')
+        ax.set_xlabel('Peso (C)')
+        ax.set_ylabel('Valor Q')
+        ax.set_xscale('log')  # Escala logarítmica para mejor visualización
+        ax.grid(True, alpha=0.3)
+    
+    def _collect_importance_weights(self, env, episodes, max_steps):
+        """
+        Recopila los pesos de importancia para varios episodios.
         
-        # Recopilar algunos episodios y visualizar la evolución de los pesos
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para recopilar datos
+        episodes : int
+            Número de episodios para visualizar
+        max_steps : int
+            Pasos máximos por episodio
+            
+        Retorna:
+        --------
+        list
+            Lista de listas con pesos de importancia por episodio
+        """
         importance_weights = []
         
-        for episode in range(episodes):
+        # Crear política target (greedy)
+        target_policy = np.zeros((self.n_states, self.n_actions))
+        for s in range(self.n_states):
+            target_policy[s, np.argmax(self.q_table[s])] = 1.0
+        
+        behavior_epsilon = 0.1  # Política de comportamiento más exploratoria
+        
+        for _ in range(episodes):
             state, _ = env.reset()
-            behavior_epsilon = 0.1  # Política de comportamiento más exploratoria
-            
-            # Política target (greedy)
-            target_policy = np.zeros((self.n_states, self.n_actions))
-            for s in range(self.n_states):
-                target_policy[s, np.argmax(self.q_table[s])] = 1.0
-                
-            trajectory = []
             weights = []
             W = 1.0
             
-            for t in range(max_steps):
-                # Seleccionar acción usando política de comportamiento
-                if np.random.random() < behavior_epsilon:
-                    action = np.random.randint(self.n_actions)
-                    behavior_prob = behavior_epsilon / self.n_actions
-                else:
-                    action = np.argmax(self.q_table[state])
-                    behavior_prob = 1 - behavior_epsilon + (behavior_epsilon / self.n_actions)
+            for _ in range(max_steps):
+                # Seleccionar acción y obtener probabilidad
+                action, behavior_prob = self._select_action_with_prob(state, behavior_epsilon)
                 
                 # Ejecutar acción
-                next_state, reward, terminated, truncated, _ = env.step(action)
+                next_state, _, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated
                 
                 # Calcular probabilidad bajo política target
@@ -1481,8 +2023,7 @@ class MonteCarlo:
                 if behavior_prob > 0:
                     W *= target_prob / behavior_prob
                 
-                # Guardar datos
-                trajectory.append((state, action))
+                # Guardar peso
                 weights.append(W)
                 
                 # Actualizar estado
@@ -1492,22 +2033,71 @@ class MonteCarlo:
                     break
             
             importance_weights.append(weights)
+            
+        return importance_weights
+    
+    def _select_action_with_prob(self, state, epsilon):
+        """
+        Selecciona una acción según política epsilon-greedy y retorna su probabilidad.
         
-        # Visualizar evolución de pesos a lo largo de episodios
-        plt.subplot(2, 2, 3)
+        Parámetros:
+        -----------
+        state : int
+            Estado actual
+        epsilon : float
+            Parámetro epsilon para exploración
+            
+        Retorna:
+        --------
+        Tuple[int, float]
+            Acción seleccionada y su probabilidad
+        """
+        rng = np.random.default_rng(42)
+        if rng.random() < epsilon:
+            action = rng.integers(0, self.n_actions)
+            prob = epsilon / self.n_actions
+        else:
+            action = np.argmax(self.q_table[state])
+            prob = 1 - epsilon + (epsilon / self.n_actions)
+            
+        return action, prob
+    
+    def _plot_weight_evolution(self, ax, importance_weights, episodes):
+        """
+        Visualiza la evolución de pesos a lo largo de episodios.
+        
+        Parámetros:
+        -----------
+        ax : matplotlib.axes.Axes
+            Subplot para dibujar la evolución
+        importance_weights : list
+            Lista de listas con pesos de importancia
+        episodes : int
+            Número total de episodios
+        """
         for i, weights in enumerate(importance_weights):
-            plt.plot(weights, label=f'Episodio {i+1}' if i < 10 else None)
+            ax.plot(weights, label=f'Episodio {i+1}' if i < 10 else None)
         
-        plt.title('Evolución de Pesos de Importancia')
-        plt.xlabel('Paso')
-        plt.ylabel('Peso')
-        plt.yscale('log')  # Escala logarítmica para mejor visualización
-        plt.grid(True, alpha=0.3)
+        ax.set_title('Evolución de Pesos de Importancia')
+        ax.set_xlabel('Paso')
+        ax.set_ylabel('Peso')
+        ax.set_yscale('log')
+        ax.grid(True, alpha=0.3)
         if episodes <= 10:
-            plt.legend()
+            ax.legend()
+    
+    def _plot_weight_statistics(self, ax, importance_weights):
+        """
+        Visualiza estadísticas de pesos entre episodios.
         
-        # Visualizar varianza de pesos entre episodios
-        plt.subplot(2, 2, 4)
+        Parámetros:
+        -----------
+        ax : matplotlib.axes.Axes
+            Subplot para dibujar las estadísticas
+        importance_weights : list
+            Lista de listas con pesos de importancia
+        """
+        # Preparar datos
         max_len = max(len(w) for w in importance_weights)
         padded_weights = []
         
@@ -1516,35 +2106,85 @@ class MonteCarlo:
             padded = w + [float('nan')] * (max_len - len(w))
             padded_weights.append(padded)
         
+        # Calcular estadísticas
         weights_array = np.array(padded_weights)
         mean_weights = np.nanmean(weights_array, axis=0)
         std_weights = np.nanstd(weights_array, axis=0)
         
+        # Graficar
         steps = np.arange(max_len)
-        plt.plot(steps, mean_weights, 'b-', label='Media')
-        plt.fill_between(steps, mean_weights - std_weights, mean_weights + std_weights, 
-                         color='b', alpha=0.2, label='Desviación Estándar')
+        ax.plot(steps, mean_weights, 'b-', label='Media')
+        ax.fill_between(steps, mean_weights - std_weights, mean_weights + std_weights, 
+                      color='b', alpha=0.2, label='Desviación Estándar')
         
-        plt.title('Estadísticas de Pesos por Paso')
-        plt.xlabel('Paso')
-        plt.ylabel('Peso')
-        plt.yscale('log')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
+        ax.set_title('Estadísticas de Pesos por Paso')
+        ax.set_xlabel('Paso')
+        ax.set_ylabel('Peso')
+        ax.set_yscale('log')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    
+    def visualize_importance_weights(
+        self, 
+        env: Any, 
+        episodes: int = 10, 
+        max_steps: int = 100
+    ) -> None:
+        """
+        Visualiza los pesos de importance sampling de Monte Carlo off-policy.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para recopilar datos
+        episodes : int, opcional
+            Número de episodios para visualizar (default: 10)
+        max_steps : int, opcional
+            Pasos máximos por episodio (default: 100)
+        """
+        # Verificar si hay pesos disponibles
+        if np.sum(self.c_table) == 0:
+            print("No hay pesos de importance sampling para visualizar. Ejecute monte_carlo_control_off_policy primero.")
+            return
+        
+        # Crear figura con subplots
+        _, axs = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Distribuir visualizaciones en subplots
+        self._plot_weight_distribution(axs[0, 0])
+        self._plot_weight_vs_q_values(axs[0, 1])
+        
+        # Recopilar datos de episodios
+        importance_weights = self._collect_importance_weights(env, episodes, max_steps)
+        
+        # Visualizar evolución y estadísticas
+        self._plot_weight_evolution(axs[1, 0], importance_weights, episodes)
+        self._plot_weight_statistics(axs[1, 1], importance_weights)
         
         plt.tight_layout()
         plt.show()
-    
-    def plot_convergence_comparison(self, env, methods=['on_policy', 'weighted', 'batch'], episodes=1000):
+
+    def plot_convergence_comparison(
+        self, 
+        env: Any, 
+        methods: List[str] = ['on_policy', 'weighted', 'batch'], 
+        episodes: int = 1000
+    ) -> Dict[str, Dict[str, List[float]]]:
         """
         Compara la convergencia de diferentes métodos Monte Carlo en un mismo gráfico.
         
-        Args:
-            env: Entorno para la comparación
-            methods: Lista de métodos a comparar
-            episodes: Número de episodios para cada método
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para la comparación
+        methods : List[str], opcional
+            Lista de métodos a comparar (default: ['on_policy', 'weighted', 'batch'])
+        episodes : int, opcional
+            Número de episodios para cada método (default: 1000)
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, Dict[str, List[float]]]
             Diccionario con historiales de entrenamiento
         """
         method_map = {
@@ -1589,11 +2229,8 @@ class MonteCarlo:
             # Aplicar suavizado para mejor visualización
             window_size = min(len(history['episode_rewards']) // 10 + 1, 100)
             if window_size > 1 and len(history['episode_rewards']) > window_size:
-                smoothed_rewards = np.convolve(
-                    history['episode_rewards'], 
-                    np.ones(window_size)/window_size, 
-                    mode='valid'
-                )
+                smoothed_rewards = np.convolve(history['episode_rewards'], 
+                                            np.ones(window_size)/window_size, mode='valid')
                 x = range(window_size-1, len(history['episode_rewards']))
             else:
                 smoothed_rewards = history['episode_rewards']

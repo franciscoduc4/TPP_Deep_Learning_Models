@@ -2,13 +2,14 @@ import os, sys
 import numpy as np
 import matplotlib.pyplot as plt
 import time
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Any
 import pickle
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import VALUE_ITERATION_CONFIG
+
 
 class ValueIteration:
     """
@@ -26,16 +27,22 @@ class ValueIteration:
         gamma: float = VALUE_ITERATION_CONFIG['gamma'],
         theta: float = VALUE_ITERATION_CONFIG['theta'],
         max_iterations: int = VALUE_ITERATION_CONFIG['max_iterations']
-    ):
+    ) -> None:
         """
         Inicializa el agente de Iteración de Valor.
         
-        Args:
-            n_states: Número de estados en el entorno
-            n_actions: Número de acciones en el entorno
-            gamma: Factor de descuento
-            theta: Umbral para convergencia
-            max_iterations: Número máximo de iteraciones
+        Parámetros:
+        -----------
+        n_states : int
+            Número de estados en el entorno
+        n_actions : int
+            Número de acciones en el entorno
+        gamma : float, opcional
+            Factor de descuento (default: VALUE_ITERATION_CONFIG['gamma'])
+        theta : float, opcional
+            Umbral para convergencia (default: VALUE_ITERATION_CONFIG['theta'])
+        max_iterations : int, opcional
+            Número máximo de iteraciones (default: VALUE_ITERATION_CONFIG['max_iterations'])
         """
         self.n_states = n_states
         self.n_actions = n_actions
@@ -53,14 +60,44 @@ class ValueIteration:
         self.value_changes = []
         self.iteration_times = []
     
-    def value_update(self, env) -> float:
+    def _calculate_action_values(self, state: int, transitions: Dict[int, Dict[int, List]]) -> np.ndarray:
+        """
+        Calcula los valores Q para todas las acciones en un estado.
+        
+        Parámetros:
+        -----------
+        state : int
+            Estado para calcular valores de acción
+        transitions : Dict[int, Dict[int, List]]
+            Diccionario con las transiciones del entorno
+            
+        Retorna:
+        --------
+        np.ndarray
+            Valores Q para todas las acciones en el estado dado
+        """
+        action_values = np.zeros(self.n_actions)
+        
+        for a in range(self.n_actions):
+            # Calcular el valor esperado para la acción a desde el estado state
+            for prob, next_s, r, done in transitions[state][a]:
+                # Valor esperado usando la ecuación de Bellman
+                action_values[a] += prob * (r + self.gamma * self.V[next_s] * (not done))
+        
+        return action_values
+    
+    def value_update(self, env: Any) -> float:
         """
         Realiza una iteración de actualización de la función de valor.
         
-        Args:
-            env: Entorno con dinámicas de transición
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
             
-        Returns:
+        Retorna:
+        --------
+        float
             Delta máximo (cambio máximo en la función de valor)
         """
         delta = 0
@@ -69,13 +106,7 @@ class ValueIteration:
             v_old = self.V[s]
             
             # Calcular el valor Q para cada acción y tomar el máximo
-            action_values = np.zeros(self.n_actions)
-            
-            for a in range(self.n_actions):
-                # Calcular el valor esperado para la acción a desde el estado s
-                for prob, next_s, r, done in env.P[s][a]:
-                    # Valor esperado usando la ecuación de Bellman
-                    action_values[a] += prob * (r + self.gamma * self.V[next_s] * (not done))
+            action_values = self._calculate_action_values(s, env.P)
             
             # Actualizar el valor del estado con el máximo valor de acción
             self.V[s] = np.max(action_values)
@@ -85,25 +116,25 @@ class ValueIteration:
         
         return delta
     
-    def extract_policy(self, env):
+    def extract_policy(self, env: Any) -> np.ndarray:
         """
         Extrae la política óptima a partir de la función de valor.
         
-        Args:
-            env: Entorno con dinámicas de transición
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
             
-        Returns:
+        Retorna:
+        --------
+        np.ndarray
             Política óptima (determinística)
         """
         policy = np.zeros((self.n_states, self.n_actions))
         
         for s in range(self.n_states):
             # Calcular el valor Q para cada acción
-            action_values = np.zeros(self.n_actions)
-            
-            for a in range(self.n_actions):
-                for prob, next_s, r, done in env.P[s][a]:
-                    action_values[a] += prob * (r + self.gamma * self.V[next_s] * (not done))
+            action_values = self._calculate_action_values(s, env.P)
             
             # Política determinística: asignar probabilidad 1.0 a la mejor acción
             best_action = np.argmax(action_values)
@@ -111,20 +142,26 @@ class ValueIteration:
         
         return policy
     
-    def train(self, env) -> Dict[str, List]:
+    def train(self, env: Any) -> Dict[str, List]:
         """
         Entrena al agente usando iteración de valor.
         
-        Args:
-            env: Entorno con dinámicas de transición
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List]
             Diccionario con historial de entrenamiento
         """
         print("Iniciando iteración de valor...")
         
         iterations = 0
         start_time = time.time()
+        self.value_changes = []
+        self.iteration_times = []
         
         for i in range(self.max_iterations):
             iteration_start = time.time()
@@ -167,10 +204,14 @@ class ValueIteration:
         """
         Devuelve la mejor acción para un estado dado según la política actual.
         
-        Args:
-            state: Estado actual
+        Parámetros:
+        -----------
+        state : int
+            Estado actual
             
-        Returns:
+        Retorna:
+        --------
+        int
             Mejor acción
         """
         return np.argmax(self.policy[state])
@@ -179,27 +220,38 @@ class ValueIteration:
         """
         Devuelve el valor de un estado según la función de valor actual.
         
-        Args:
-            state: Estado para obtener su valor
+        Parámetros:
+        -----------
+        state : int
+            Estado para obtener su valor
             
-        Returns:
+        Retorna:
+        --------
+        float
             Valor del estado
         """
         return self.V[state]
     
-    def evaluate(self, env, max_steps: int = 100, episodes: int = 10) -> float:
+    def evaluate(self, env: Any, max_steps: int = 100, episodes: int = 10) -> float:
         """
         Evalúa la política actual en el entorno.
         
-        Args:
-            env: Entorno para evaluar
-            max_steps: Pasos máximos por episodio
-            episodes: Número de episodios para evaluar
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para evaluar
+        max_steps : int, opcional
+            Pasos máximos por episodio (default: 100)
+        episodes : int, opcional
+            Número de episodios para evaluar (default: 10)
             
-        Returns:
+        Retorna:
+        --------
+        float
             Recompensa promedio en los episodios
         """
         total_rewards = []
+        episode_lengths = []
         
         for ep in range(episodes):
             state, _ = env.reset()
@@ -217,10 +269,13 @@ class ValueIteration:
                 steps += 1
             
             total_rewards.append(total_reward)
+            episode_lengths.append(steps)
             print(f"Episodio {ep+1}: Recompensa = {total_reward}, Pasos = {steps}")
         
         avg_reward = np.mean(total_rewards)
-        print(f"Evaluación: recompensa media en {episodes} episodios = {avg_reward:.2f}")
+        avg_length = np.mean(episode_lengths)
+        print(f"Evaluación: recompensa media en {episodes} episodios = {avg_reward:.2f}, " +
+              f"longitud media = {avg_length:.2f}")
         
         return avg_reward
     
@@ -228,8 +283,10 @@ class ValueIteration:
         """
         Guarda la política y función de valor en un archivo.
         
-        Args:
-            filepath: Ruta donde guardar el modelo
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
         """
         data = {
             'policy': self.policy,
@@ -248,8 +305,10 @@ class ValueIteration:
         """
         Carga la política y función de valor desde un archivo.
         
-        Args:
-            filepath: Ruta desde donde cargar el modelo
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
         """
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
@@ -262,22 +321,62 @@ class ValueIteration:
         
         print(f"Modelo cargado desde {filepath}")
     
-    def visualize_policy(self, env, title: str = "Política Óptima"):
+    def _get_grid_position(self, env: Any, state: int) -> Tuple[int, int]:
         """
-        Visualiza la política para entornos de tipo cuadrícula.
+        Obtiene la posición en la cuadrícula para un estado.
         
-        Args:
-            env: Entorno con estructura de cuadrícula
-            title: Título para la visualización
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con estructura de cuadrícula
+        state : int
+            Estado a convertir en posición
+            
+        Retorna:
+        --------
+        Tuple[int, int]
+            Posición (i, j) en la cuadrícula
         """
-        if not hasattr(env, 'shape'):
-            print("El entorno no tiene estructura de cuadrícula para visualización")
-            return
+        if hasattr(env, 'state_mapping'):
+            return env.state_mapping(state)
+        else:
+            # Asumir orden row-major
+            return state // env.shape[1], state % env.shape[1]
+    
+    def _is_terminal_state(self, env: Any, state: int) -> bool:
+        """
+        Determina si un estado es terminal.
         
-        grid_shape = env.shape
-        _, ax = plt.subplots(figsize=(8, 8))
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con transiciones
+        state : int
+            Estado a comprobar
+            
+        Retorna:
+        --------
+        bool
+            True si el estado es terminal, False en caso contrario
+        """
+        for a in range(self.n_actions):
+            for _, _, _, done in env.P[state][a]:
+                if done:
+                    return True
+        return False
+    
+    def _setup_grid(self, ax: plt.Axes, grid_shape: Tuple[int, int]) -> None:
+        """
+        Configura la cuadrícula para visualización.
         
-        # Crear cuadrícula
+        Parámetros:
+        -----------
+        ax : plt.Axes
+            Ejes para dibujar
+        grid_shape : Tuple[int, int]
+            Forma de la cuadrícula (filas, columnas)
+        """
+        # Configurar límites
         ax.set_xlim([0, grid_shape[1]])
         ax.set_ylim([0, grid_shape[0]])
         
@@ -286,57 +385,100 @@ class ValueIteration:
             ax.axvline(i, color='black', linestyle='-')
         for j in range(grid_shape[0] + 1):
             ax.axhline(j, color='black', linestyle='-')
-        
-        # Dibujar flechas para las acciones
-        for s in range(self.n_states):
-            if hasattr(env, 'state_mapping'):
-                # Convertir índice de estado a posición en cuadrícula
-                i, j = env.state_mapping(s)
-            else:
-                # Asumir orden row-major
-                i, j = s // grid_shape[1], s % grid_shape[1]
             
-            # Omitir estados terminales
-            if any(info[2] for a in range(self.n_actions) for _, _, info, _ in env.P[s][a]):
+    def _draw_action_arrows(self, ax: plt.Axes, env: Any, grid_shape: Tuple[int, int]) -> None:
+        """
+        Dibuja flechas para las acciones en cada estado no terminal.
+        
+        Parámetros:
+        -----------
+        ax : plt.Axes
+            Ejes para dibujar
+        env : Any
+            Entorno con estructura de cuadrícula
+        grid_shape : Tuple[int, int]
+            Forma de la cuadrícula (filas, columnas)
+        """
+        # Definir direcciones de flechas
+        directions = {
+            0: (0, -0.4),  # Izquierda
+            1: (0, 0.4),   # Derecha
+            2: (-0.4, 0),  # Abajo
+            3: (0.4, 0)    # Arriba
+        }
+        
+        for s in range(self.n_states):
+            if self._is_terminal_state(env, s):
                 continue
                 
+            i, j = self._get_grid_position(env, s)
             action = self.get_action(s)
-            
-            # Definir direcciones de flechas
-            directions = {
-                0: (0, -0.4),  # Izquierda
-                1: (0, 0.4),   # Derecha
-                2: (-0.4, 0),  # Abajo
-                3: (0.4, 0)    # Arriba
-            }
             
             if action in directions:
                 dx, dy = directions[action]
                 ax.arrow(j + 0.5, grid_shape[0] - i - 0.5, dx, dy, 
                          head_width=0.1, head_length=0.1, fc='blue', ec='blue')
+    
+    def _show_state_values(self, ax: plt.Axes, env: Any, grid_shape: Tuple[int, int]) -> None:
+        """
+        Muestra los valores de cada estado en la cuadrícula.
         
-        # Mostrar valores de estados
+        Parámetros:
+        -----------
+        ax : plt.Axes
+            Ejes para dibujar
+        env : Any
+            Entorno con estructura de cuadrícula
+        grid_shape : Tuple[int, int]
+            Forma de la cuadrícula (filas, columnas)
+        """
         for s in range(self.n_states):
-            if hasattr(env, 'state_mapping'):
-                i, j = env.state_mapping(s)
-            else:
-                i, j = s // grid_shape[1], s % grid_shape[1]
-            
+            i, j = self._get_grid_position(env, s)
             value = self.get_value(s)
             ax.text(j + 0.5, grid_shape[0] - i - 0.5, f"{value:.2f}", 
                    ha='center', va='center', color='red', fontsize=9)
+    
+    def visualize_policy(self, env: Any, title: str = "Política Óptima") -> None:
+        """
+        Visualiza la política para entornos de tipo cuadrícula.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con estructura de cuadrícula
+        title : str, opcional
+            Título para la visualización (default: "Política Óptima")
+        """
+        if not hasattr(env, 'shape'):
+            print("El entorno no tiene estructura de cuadrícula para visualización")
+            return
+        
+        grid_shape = env.shape
+        _, ax = plt.subplots(figsize=(8, 8))
+        
+        # Configurar y dibujar cuadrícula
+        self._setup_grid(ax, grid_shape)
+        
+        # Dibujar flechas para las acciones
+        self._draw_action_arrows(ax, env, grid_shape)
+        
+        # Mostrar valores de estados
+        self._show_state_values(ax, env, grid_shape)
         
         ax.set_title(title)
         plt.tight_layout()
         plt.show()
     
-    def visualize_value_function(self, env, title: str = "Función de Valor"):
+    def visualize_value_function(self, env: Any, title: str = "Función de Valor") -> None:
         """
         Visualiza la función de valor para entornos de tipo cuadrícula.
         
-        Args:
-            env: Entorno con estructura de cuadrícula
-            title: Título para la visualización
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con estructura de cuadrícula
+        title : str, opcional
+            Título para la visualización (default: "Función de Valor")
         """
         if not hasattr(env, 'shape'):
             print("El entorno no tiene estructura de cuadrícula para visualización")
@@ -378,8 +520,10 @@ class ValueIteration:
         """
         Visualiza las métricas de entrenamiento.
         
-        Args:
-            history: Diccionario con historial de entrenamiento
+        Parámetros:
+        -----------
+        history : Dict[str, List]
+            Diccionario con historial de entrenamiento
         """
         _, axs = plt.subplots(2, 1, figsize=(12, 8))
         
@@ -402,3 +546,94 @@ class ValueIteration:
         
         plt.tight_layout()
         plt.show()
+        
+    def vectorized_value_iteration(self, env: Any) -> Dict[str, List]:
+        """
+        Implementa una versión vectorizada de iteración de valor usando operaciones de NumPy.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
+            
+        Retorna:
+        --------
+        Dict[str, List]
+            Diccionario con historial de entrenamiento
+        """
+        print("Iniciando iteración de valor vectorizada...")
+        
+        # Preparar estructuras de datos para cálculo vectorizado
+        transitions = np.zeros((self.n_states, self.n_actions, self.n_states))
+        rewards = np.zeros((self.n_states, self.n_actions, self.n_states))
+        terminals = np.zeros((self.n_states, self.n_actions, self.n_states), dtype=bool)
+        
+        # Convertir modelo de transición a matrices
+        for s in range(self.n_states):
+            for a in range(self.n_actions):
+                for prob, next_s, r, done in env.P[s][a]:
+                    transitions[s, a, next_s] += prob
+                    rewards[s, a, next_s] = r
+                    terminals[s, a, next_s] = done
+        
+        iterations = 0
+        start_time = time.time()
+        self.value_changes = []
+        self.iteration_times = []
+        
+        for i in range(self.max_iterations):
+            iteration_start = time.time()
+            
+            # Calcular los valores Q para todos los estados y acciones
+            # Q(s,a) = Σ_s' P(s'|s,a) * [R(s,a,s') + γ*V(s')*(1-terminal(s'))]
+            v_expanded = np.expand_dims(self.V, axis=(0, 1))
+            q_values = np.sum(
+                transitions * (rewards + self.gamma * v_expanded * ~terminals), 
+                axis=2
+            )
+            
+            # Actualizar con los valores máximos
+            v_old = self.V.copy()
+            self.V = np.max(q_values, axis=1)
+            
+            # Calcular delta
+            delta = np.max(np.abs(v_old - self.V))
+            
+            # Registrar métricas
+            self.value_changes.append(delta)
+            iteration_time = time.time() - iteration_start
+            self.iteration_times.append(iteration_time)
+            
+            iterations = i + 1
+            
+            print(f"Iteración {iterations}: Delta = {delta:.6f}, Tiempo = {iteration_time:.2f} segundos")
+            
+            # Verificar convergencia
+            if delta < self.theta:
+                print("¡Convergencia alcanzada!")
+                break
+        
+        # Extraer política óptima
+        q_values = np.zeros((self.n_states, self.n_actions))
+        for s in range(self.n_states):
+            for a in range(self.n_actions):
+                for prob, next_s, r, done in env.P[s][a]:
+                    q_values[s, a] += prob * (r + self.gamma * self.V[next_s] * (not done))
+        
+        # Política determinística
+        best_actions = np.argmax(q_values, axis=1)
+        self.policy = np.zeros((self.n_states, self.n_actions))
+        self.policy[np.arange(self.n_states), best_actions] = 1.0
+        
+        total_time = time.time() - start_time
+        print(f"Iteración de valor vectorizada completada en {iterations} iteraciones, "
+              f"{total_time:.2f} segundos")
+        
+        history = {
+            'iterations': iterations,
+            'value_changes': self.value_changes,
+            'iteration_times': self.iteration_times,
+            'total_time': total_time
+        }
+        
+        return history

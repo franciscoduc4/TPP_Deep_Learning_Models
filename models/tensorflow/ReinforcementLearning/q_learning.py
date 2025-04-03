@@ -2,15 +2,14 @@ import os, sys
 import numpy as np
 import matplotlib.pyplot as plt
 import time
-from typing import Dict, List, Tuple, Optional, Union
-import random
-
-rng = np.random.default_rng(seed=42)
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable
+import tensorflow as tf
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
 
 from models.config import QLEARNING_CONFIG
+
 
 class QLearning:
     """
@@ -30,21 +29,34 @@ class QLearning:
         epsilon_end: float = QLEARNING_CONFIG['epsilon_end'],
         epsilon_decay: float = QLEARNING_CONFIG['epsilon_decay'],
         use_decay_schedule: str = QLEARNING_CONFIG['use_decay_schedule'],
-        decay_steps: int = QLEARNING_CONFIG['decay_steps']
-    ):
+        decay_steps: int = QLEARNING_CONFIG['decay_steps'],
+        seed: int = 42
+    ) -> None:
         """
         Inicializa el agente Q-Learning.
         
-        Args:
-            n_states: Número de estados en el espacio de estados discreto
-            n_actions: Número de acciones en el espacio de acciones discreto
-            learning_rate: Tasa de aprendizaje (alpha)
-            gamma: Factor de descuento
-            epsilon_start: Valor inicial de epsilon para política epsilon-greedy
-            epsilon_end: Valor final de epsilon para política epsilon-greedy
-            epsilon_decay: Factor de decaimiento para epsilon
-            use_decay_schedule: Tipo de decaimiento ('linear', 'exponential', o None)
-            decay_steps: Número de pasos para decaer epsilon (si se usa decay schedule)
+        Parámetros:
+        -----------
+        n_states : int
+            Número de estados en el espacio de estados discreto
+        n_actions : int
+            Número de acciones en el espacio de acciones discreto
+        learning_rate : float, opcional
+            Tasa de aprendizaje (alpha) (default: QLEARNING_CONFIG['learning_rate'])
+        gamma : float, opcional
+            Factor de descuento (default: QLEARNING_CONFIG['gamma'])
+        epsilon_start : float, opcional
+            Valor inicial de epsilon para política epsilon-greedy (default: QLEARNING_CONFIG['epsilon_start'])
+        epsilon_end : float, opcional
+            Valor final de epsilon para política epsilon-greedy (default: QLEARNING_CONFIG['epsilon_end'])
+        epsilon_decay : float, opcional
+            Factor de decaimiento para epsilon (default: QLEARNING_CONFIG['epsilon_decay'])
+        use_decay_schedule : str, opcional
+            Tipo de decaimiento ('linear', 'exponential', o None) (default: QLEARNING_CONFIG['use_decay_schedule'])
+        decay_steps : int, opcional
+            Número de pasos para decaer epsilon (si se usa decay schedule) (default: QLEARNING_CONFIG['decay_steps'])
+        seed : int, opcional
+            Semilla para reproducibilidad (default: 42)
         """
         self.n_states = n_states
         self.n_actions = n_actions
@@ -57,25 +69,38 @@ class QLearning:
         self.use_decay_schedule = use_decay_schedule
         self.decay_steps = decay_steps
         
+        # Configurar generador de números aleatorios con semilla fija
+        self.rng = np.random.Generator(np.random.PCG64(seed))
+        
         # Inicializar la tabla Q con valores optimistas o ceros
-        self.q_table = np.zeros((n_states, n_actions)) if not QLEARNING_CONFIG['optimistic_init'] else \
-                      np.ones((n_states, n_actions)) * QLEARNING_CONFIG['optimistic_value']
+        if QLEARNING_CONFIG['optimistic_init']:
+            self.q_table = np.ones((n_states, n_actions)) * QLEARNING_CONFIG['optimistic_value']
+        else:
+            self.q_table = np.zeros((n_states, n_actions))
+        
+        # Contador total de pasos
+        self.total_steps = 0
         
         # Métricas
         self.rewards_history = []
+    
     def get_action(self, state: int) -> int:
         """
         Selecciona una acción usando la política epsilon-greedy.
         
-        Args:
-            state: Estado actual
+        Parámetros:
+        -----------
+        state : int
+            Estado actual
             
-        Returns:
+        Retorna:
+        --------
+        int
             Acción seleccionada
         """
-        if rng.random() < self.epsilon:
+        if self.rng.random() < self.epsilon:
             # Explorar: acción aleatoria
-            return rng.integers(0, self.n_actions)
+            return self.rng.integers(0, self.n_actions)
         else:
             # Explotar: mejor acción según la tabla Q
             return np.argmax(self.q_table[state])
@@ -84,14 +109,22 @@ class QLearning:
         """
         Actualiza la tabla Q usando la regla de Q-Learning.
         
-        Args:
-            state: Estado actual
-            action: Acción tomada
-            reward: Recompensa recibida
-            next_state: Estado siguiente
-            done: Si el episodio ha terminado
+        Parámetros:
+        -----------
+        state : int
+            Estado actual
+        action : int
+            Acción tomada
+        reward : float
+            Recompensa recibida
+        next_state : int
+            Estado siguiente
+        done : bool
+            Si el episodio ha terminado
             
-        Returns:
+        Retorna:
+        --------
+        float
             TD-error calculado
         """
         # Calcular valor Q objetivo con Q-Learning (off-policy TD control)
@@ -105,18 +138,22 @@ class QLearning:
         # Valor Q actual
         current_q = self.q_table[state, action]
         
-        # Actualizar valor Q
+        # Calcular TD error
         td_error = target_q - current_q
+        
+        # Actualizar valor Q
         self.q_table[state, action] += self.learning_rate * td_error
         
         return td_error
     
-    def update_epsilon(self, step: int = None) -> None:
+    def update_epsilon(self, step: Optional[int] = None) -> None:
         """
         Actualiza el valor de epsilon según la política de decaimiento.
         
-        Args:
-            step: Paso actual para decaimiento programado (opcional)
+        Parámetros:
+        -----------
+        step : Optional[int], opcional
+            Paso actual para decaimiento programado (default: None)
         """
         if self.use_decay_schedule == 'linear':
             # Decaimiento lineal
@@ -128,20 +165,24 @@ class QLearning:
         elif self.use_decay_schedule == 'exponential':
             # Decaimiento exponencial
             self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        else:
-            # Sin decaimiento
-            pass
+        # Si no hay decay schedule, epsilon se mantiene constante
     
-    def _run_episode(self, env, max_steps: int, render: bool) -> Tuple[float, int]:
+    def _run_episode(self, env: Any, max_steps: int, render: bool) -> Tuple[float, int]:
         """
         Ejecuta un episodio de entrenamiento.
         
-        Args:
-            env: Entorno compatible con OpenAI Gym
-            max_steps: Máximo número de pasos por episodio
-            render: Si renderizar el entorno durante el entrenamiento
+        Parámetros:
+        -----------
+        env : Any
+            Entorno compatible con OpenAI Gym
+        max_steps : int
+            Máximo número de pasos por episodio
+        render : bool
+            Si renderizar el entorno durante el entrenamiento
             
-        Returns:
+        Retorna:
+        --------
+        Tuple[float, int]
             Recompensa total y número de pasos del episodio
         """
         state, _ = env.reset()
@@ -175,12 +216,33 @@ class QLearning:
                 
         return episode_reward, steps
     
-    def _update_history(self, history: Dict[str, List[float]], episode_reward: float, 
-                      steps: int, episode_rewards_window: List[float], log_interval: int) -> float:
+    def _update_history(
+        self, 
+        history: Dict[str, List[float]], 
+        episode_reward: float, 
+        steps: int, 
+        episode_rewards_window: List[float], 
+        log_interval: int
+    ) -> float:
         """
         Actualiza el historial de entrenamiento con los resultados del episodio.
         
-        Returns:
+        Parámetros:
+        -----------
+        history : Dict[str, List[float]]
+            Historial de entrenamiento
+        episode_reward : float
+            Recompensa del episodio
+        steps : int
+            Pasos del episodio
+        episode_rewards_window : List[float]
+            Ventana de recompensas recientes
+        log_interval : int
+            Intervalo para el cálculo de promedio móvil
+            
+        Retorna:
+        --------
+        float
             Recompensa promedio actual
         """
         history['episode_rewards'].append(episode_reward)
@@ -199,7 +261,7 @@ class QLearning:
     
     def train(
         self, 
-        env, 
+        env: Any, 
         episodes: int = QLEARNING_CONFIG['episodes'],
         max_steps: int = QLEARNING_CONFIG['max_steps_per_episode'],
         render: bool = False,
@@ -208,20 +270,24 @@ class QLearning:
         """
         Entrena el agente Q-Learning en el entorno.
         
-        Args:
-            env: Entorno compatible con OpenAI Gym
-            episodes: Número de episodios para entrenar
-            max_steps: Máximo número de pasos por episodio
-            render: Si renderizar el entorno durante el entrenamiento
-            log_interval: Cada cuántos episodios mostrar estadísticas
+        Parámetros:
+        -----------
+        env : Any
+            Entorno compatible con OpenAI Gym
+        episodes : int, opcional
+            Número de episodios para entrenar (default: QLEARNING_CONFIG['episodes'])
+        max_steps : int, opcional
+            Máximo número de pasos por episodio (default: QLEARNING_CONFIG['max_steps_per_episode'])
+        render : bool, opcional
+            Si renderizar el entorno durante el entrenamiento (default: False)
+        log_interval : int, opcional
+            Cada cuántos episodios mostrar estadísticas (default: QLEARNING_CONFIG['log_interval'])
             
-        Returns:
+        Retorna:
+        --------
+        Dict[str, List[float]]
             Historia de entrenamiento
         """
-        # Inicializar contador total de pasos si no existe
-        if not hasattr(self, 'total_steps'):
-            self.total_steps = 0
-            
         history = {
             'episode_rewards': [],
             'episode_lengths': [],
@@ -257,23 +323,31 @@ class QLearning:
         
         return history
     
-    def evaluate(self, env, episodes: int = 10, render: bool = False) -> float:
+    def evaluate(self, env: Any, episodes: int = 10, render: bool = False) -> float:
         """
         Evalúa el agente entrenado.
         
-        Args:
-            env: Entorno compatible con OpenAI Gym
-            episodes: Número de episodios para evaluar
-            render: Si renderizar el entorno durante la evaluación
+        Parámetros:
+        -----------
+        env : Any
+            Entorno compatible con OpenAI Gym
+        episodes : int, opcional
+            Número de episodios para evaluar (default: 10)
+        render : bool, opcional
+            Si renderizar el entorno durante la evaluación (default: False)
             
-        Returns:
+        Retorna:
+        --------
+        float
             Recompensa promedio
         """
         rewards = []
+        episode_lengths = []
         
         for episode in range(episodes):
             state, _ = env.reset()
             episode_reward = 0
+            steps = 0
             done = False
             
             while not done:
@@ -290,12 +364,16 @@ class QLearning:
                 # Actualizar estado y recompensa
                 state = next_state
                 episode_reward += reward
+                steps += 1
             
             rewards.append(episode_reward)
+            episode_lengths.append(steps)
             print(f"Episodio de evaluación {episode+1}/{episodes} - Recompensa: {episode_reward:.2f}")
         
         avg_reward = np.mean(rewards)
-        print(f"Recompensa promedio de evaluación: {avg_reward:.2f}")
+        avg_length = np.mean(episode_lengths)
+        print(f"Recompensa promedio de evaluación: {avg_reward:.2f}, "
+              f"Longitud promedio: {avg_length:.2f}")
         
         return avg_reward
     
@@ -303,8 +381,10 @@ class QLearning:
         """
         Guarda la tabla Q en un archivo.
         
-        Args:
-            filepath: Ruta para guardar la tabla Q
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta para guardar la tabla Q
         """
         np.save(filepath, self.q_table)
         print(f"Tabla Q guardada en {filepath}")
@@ -313,8 +393,10 @@ class QLearning:
         """
         Carga la tabla Q desde un archivo.
         
-        Args:
-            filepath: Ruta para cargar la tabla Q
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta para cargar la tabla Q
         """
         self.q_table = np.load(filepath)
         print(f"Tabla Q cargada desde {filepath}")
@@ -323,13 +405,17 @@ class QLearning:
         """
         Visualiza los resultados del entrenamiento.
         
-        Args:
-            history: Historia de entrenamiento
-            window_size: Tamaño de ventana para suavizado
+        Parámetros:
+        -----------
+        history : Dict[str, List[float]]
+            Historia de entrenamiento
+        window_size : int, opcional
+            Tamaño de ventana para suavizado (default: 10)
         """
-        def smooth(data, window_size):
+        def smooth(data: List[float], window_size: int) -> np.ndarray:
+            """Aplica suavizado con media móvil a los datos"""
             kernel = np.ones(window_size) / window_size
-            return np.convolve(data, kernel, mode='valid')
+            return np.convolve(np.array(data), kernel, mode='valid')
         
         _, axs = plt.subplots(2, 2, figsize=(15, 10))
         
@@ -380,8 +466,19 @@ class QLearning:
         plt.tight_layout()
         plt.show()
     
-    def _setup_grid_visualization(self, ax, rows, cols):
-        """Helper method to setup grid visualization"""
+    def _setup_grid_visualization(self, ax: plt.Axes, rows: int, cols: int) -> None:
+        """
+        Configura la visualización básica de la cuadrícula.
+        
+        Parámetros:
+        -----------
+        ax : plt.Axes
+            Eje para la visualización
+        rows : int
+            Número de filas en la grilla
+        cols : int
+            Número de columnas en la grilla
+        """
         ax.set_xlim(0, cols)
         ax.set_ylim(0, rows)
         ax.invert_yaxis()
@@ -392,8 +489,23 @@ class QLearning:
         for j in range(cols+1):
             ax.axvline(j, color='black', alpha=0.3)
     
-    def _draw_policy_arrows(self, ax, row, col, state, arrows):
-        """Helper method to draw policy arrows for a state"""
+    def _draw_policy_arrows(self, ax: plt.Axes, row: int, col: int, state: int, arrows: Dict[int, Tuple[float, float]]) -> None:
+        """
+        Dibuja flechas que representan la política para un estado.
+        
+        Parámetros:
+        -----------
+        ax : plt.Axes
+            Eje para la visualización
+        row : int
+            Fila del estado en la grilla
+        col : int
+            Columna del estado en la grilla
+        state : int
+            Índice del estado
+        arrows : Dict[int, Tuple[float, float]]
+            Diccionario que mapea acciones a vectores de dirección
+        """
         if np.all(self.q_table[state] == 0):
             # Si todas las acciones son iguales, no hay preferencia clara
             for action in range(self.n_actions):
@@ -411,13 +523,16 @@ class QLearning:
             ax.text(col + 0.5, row + 0.7, f"{np.max(self.q_table[state]):.2f}", 
                    ha='center', va='center', fontsize=8)
     
-    def visualize_policy(self, env, grid_size: Tuple[int, int] = None) -> None:
+    def visualize_policy(self, env: Any, grid_size: Optional[Tuple[int, int]] = None) -> None:
         """
         Visualiza la política aprendida para entornos de tipo grilla.
         
-        Args:
-            env: Entorno, preferentemente de tipo grilla
-            grid_size: Tamaño de la grilla (filas, columnas)
+        Parámetros:
+        -----------
+        env : Any
+            Entorno, preferentemente de tipo grilla
+        grid_size : Optional[Tuple[int, int]], opcional
+            Tamaño de la grilla (filas, columnas) (default: None)
         """
         if grid_size is None:
             try:
@@ -450,13 +565,16 @@ class QLearning:
         plt.tight_layout()
         plt.show()
     
-    def visualize_value_function(self, env, grid_size: Tuple[int, int] = None) -> None:
+    def visualize_value_function(self, env: Any, grid_size: Optional[Tuple[int, int]] = None) -> None:
         """
         Visualiza la función de valor aprendida para entornos de tipo grilla.
         
-        Args:
-            env: Entorno, preferentemente de tipo grilla
-            grid_size: Tamaño de la grilla (filas, columnas)
+        Parámetros:
+        -----------
+        env : Any
+            Entorno, preferentemente de tipo grilla
+        grid_size : Optional[Tuple[int, int]], opcional
+            Tamaño de la grilla (filas, columnas) (default: None)
         """
         if grid_size is None:
             try:
@@ -483,8 +601,46 @@ class QLearning:
                 state = i * cols + j
                 value = np.max(self.q_table[state])
                 ax.text(j, i, f"{value:.2f}", ha="center", va="center", 
-                        color="w" if value < (np.max(self.q_table) + np.min(self.q_table))/2 else "black")
+                        color="w" if value < (value_function.max() + value_function.min())/2 else "black")
         
         plt.title('Función de Valor (V)')
         plt.tight_layout()
         plt.show()
+    
+    def compare_with_optimal(self, optimal_policy: np.ndarray) -> float:
+        """
+        Compara la política aprendida con una política óptima conocida.
+        
+        Parámetros:
+        -----------
+        optimal_policy : np.ndarray
+            Política óptima conocida como array de acciones para cada estado
+            
+        Retorna:
+        --------
+        float
+            Porcentaje de acciones que coinciden con la política óptima
+        """
+        # Obtener la política actual
+        current_policy = np.array([np.argmax(self.q_table[s]) for s in range(self.n_states)])
+        
+        # Calcular coincidencias
+        matches = np.sum(current_policy == optimal_policy)
+        
+        # Calcular porcentaje de coincidencia
+        match_percentage = matches / self.n_states * 100
+        
+        print(f"Coincidencia con política óptima: {match_percentage:.2f}%")
+        
+        return match_percentage
+    
+    def get_q_table(self) -> np.ndarray:
+        """
+        Devuelve la tabla Q actual.
+        
+        Retorna:
+        --------
+        np.ndarray
+            Tabla Q actual
+        """
+        return self.q_table
