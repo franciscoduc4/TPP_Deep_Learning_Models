@@ -3,7 +3,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import time
+import gym
 from typing import Dict, List, Tuple, Optional, Union, Any
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, Input, Concatenate, GlobalAveragePooling1D
+from keras.saving import register_keras_serializable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -681,3 +686,463 @@ class SARSA:
         plt.ylabel(f'Dimensión de Estado {dim2}')
         plt.grid(alpha=0.2)
         plt.show()
+
+@register_keras_serializable
+class SARSAModel(Model):
+    """
+    Wrapper para el algoritmo SARSA que implementa la interfaz de Model de Keras.
+    """
+    
+    def __init__(
+        self, 
+        sarsa_agent: SARSA,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...],
+        discretizer: Optional[Any] = None
+    ) -> None:
+        """
+        Inicializa el modelo wrapper para SARSA.
+        
+        Parámetros:
+        -----------
+        sarsa_agent : SARSA
+            Agente SARSA a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        discretizer : Optional[Any], opcional
+            Función de discretización personalizada (default: None)
+        """
+        super(SARSAModel, self).__init__()
+        self.sarsa_agent = sarsa_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        self.discretizer = discretizer
+        
+        # Capas para procesar entrada de CGM
+        self.cgm_encoder = Dense(64, activation='relu', name='cgm_encoder')
+        self.cgm_pooling = GlobalAveragePooling1D(name='cgm_pooling')
+        
+        # Capas para procesar otras características
+        self.other_encoder = Dense(32, activation='relu', name='other_encoder')
+        
+        # Capa de concatenación
+        self.concat = Concatenate(name='concat_layer')
+        
+        # Capa para codificar estado discreto
+        self.state_encoder = Dense(
+            sarsa_agent.state_space_size if hasattr(sarsa_agent, 'state_space_size') else 1000, 
+            activation='softmax', 
+            name='state_encoder'
+        )
+        
+        # Capa para convertir acciones discretas a dosis continuas
+        self.action_decoder = Dense(1, kernel_initializer='glorot_uniform', name='action_decoder')
+        
+    def call(self, inputs: List[tf.Tensor], training: bool = False) -> tf.Tensor:
+        """
+        Implementa la llamada del modelo para predicciones.
+        
+        Parámetros:
+        -----------
+        inputs : List[tf.Tensor]
+            Lista de tensores [cgm_data, other_features]
+        training : bool, opcional
+            Indica si está en modo de entrenamiento (default: False)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones basadas en la política actual
+        """
+        # Obtener y procesar entradas
+        cgm_input, other_input = inputs
+        batch_size = tf.shape(cgm_input)[0]
+        
+        # Codificar estado a partir de las entradas
+        states = self._encode_states(cgm_input, other_input)
+        
+        # Inicializar array para acciones
+        actions = tf.TensorArray(tf.float32, size=batch_size)
+        
+        # Para cada muestra en el batch, obtener acción correspondiente
+        for i in range(batch_size):
+            # Obtener índice del estado más probable
+            state = tf.argmax(states[i]).numpy()
+            # Usar sarsa para obtener acción (sin exploración en modo predicción)
+            action = self.sarsa_agent.get_action(state, explore=False)
+            actions = actions.write(i, tf.cast(action, tf.float32))
+        
+        # Convertir a tensor y ajustar forma
+        actions_tensor = tf.reshape(actions.stack(), [batch_size, 1])
+        
+        # Decodificar acción discreta a valor de dosis
+        dose_predictions = self._decode_actions(actions_tensor)
+        
+        return dose_predictions
+    
+    def _encode_states(self, cgm_data: tf.Tensor, other_features: tf.Tensor) -> tf.Tensor:
+        """
+        Codifica las características en estados discretos.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos de monitoreo continuo de glucosa
+        other_features : tf.Tensor
+            Otras características (carbohidratos, insulina a bordo, etc.)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Distribución suave sobre estados discretos
+        """
+        # Procesar CGM con capas densas
+        cgm_encoded = self.cgm_encoder(cgm_data)
+        cgm_features = self.cgm_pooling(cgm_encoded)
+        
+        # Procesar otras características
+        other_encoded = self.other_encoder(other_features)
+        
+        # Concatenar características
+        combined = self.concat([cgm_features, other_encoded])
+        
+        # Codificar a estados discretos
+        state_distribution = self.state_encoder(combined)
+        
+        return state_distribution
+    
+    def _decode_actions(self, actions: tf.Tensor) -> tf.Tensor:
+        """
+        Decodifica acciones discretas a valores continuos de dosis.
+        
+        Parámetros:
+        -----------
+        actions : tf.Tensor
+            Índices de acciones discretas
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Valores de dosis de insulina
+        """
+        # Convertir índices a one-hot para procesamiento
+        action_one_hot = tf.one_hot(tf.cast(actions, tf.int32), self.sarsa_agent.action_space_size)
+        # Mapear a valores continuos
+        doses = self.action_decoder(action_one_hot)
+        return doses
+    
+    def fit(
+        self, 
+        x: List[tf.Tensor], 
+        y: tf.Tensor, 
+        batch_size: int = 32, 
+        epochs: int = 1, 
+        verbose: int = 0,
+        callbacks: Optional[List[Any]] = None,
+        validation_data: Optional[Tuple] = None,
+        **kwargs
+    ) -> Dict:
+        """
+        Simula la interfaz de entrenamiento de Keras para el agente SARSA.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+        callbacks : Optional[List[Any]], opcional
+            Lista de callbacks (default: None)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        Dict
+            Historia simulada de entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando modelo SARSA...")
+        
+        # Crear entorno personalizado para SARSA
+        _ = self._create_environment(x[0], x[1], y)
+        
+        # Entrenar agente SARSA
+        history = self.sarsa_agent.train(
+            episodes=epochs * batch_size,
+            max_steps=100,
+            render=False
+        )
+        
+        # Calibrar decodificador de acciones
+        self._calibrate_action_decoder(y)
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado en {len(history.get('rewards', []))} episodios")
+        
+        # Crear historia simulada para compatibilidad con Keras
+        keras_history = {
+            'loss': history.get('rewards', [0]),
+            'val_loss': [history.get('rewards', [0])[-1]] if validation_data is not None else None
+        }
+        
+        return {'history': keras_history}
+    
+    def _create_environment(self, cgm_data: tf.Tensor, other_features: tf.Tensor, 
+                           target_doses: tf.Tensor) -> Any:
+        """
+        Crea un entorno personalizado para entrenar el agente SARSA.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos CGM
+        other_features : tf.Tensor
+            Otras características
+        target_doses : tf.Tensor
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno compatible con OpenAI Gym
+        """
+        # Convertir tensores a numpy arrays
+        cgm_np = cgm_data.numpy() if hasattr(cgm_data, 'numpy') else cgm_data
+        other_np = other_features.numpy() if hasattr(other_features, 'numpy') else other_features
+        target_np = target_doses.numpy() if hasattr(target_doses, 'numpy') else target_doses
+        
+        # Crear clase de entorno personalizada
+        class InsulinDosingEnv:
+            """Entorno personalizado para dosificación de insulina con SARSA."""
+            
+            def __init__(self, cgm, features, targets, model):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Espacios para compatibilidad con Gym
+                self.observation_space = gym.spaces.Discrete(
+                    model.sarsa_agent.state_space_size 
+                    if hasattr(model.sarsa_agent, 'state_space_size') 
+                    else 1000
+                )
+                self.action_space = gym.spaces.Discrete(model.sarsa_agent.action_space_size)
+            
+            def reset(self):
+                """Reinicia el entorno a un estado aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso en el entorno con la acción dada."""
+                # Convertir acción a dosis
+                dose = action / (self.model.sarsa_agent.action_space_size - 1) * 15  # Max 15 U
+                
+                # Calcular recompensa (negativo del error absoluto)
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de un paso
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+                
+            def _get_state(self):
+                """Obtiene el estado discreto para el ejemplo actual."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar estado
+                states = self.model._encode_states(
+                    tf.convert_to_tensor(cgm_batch, dtype=tf.float32),
+                    tf.convert_to_tensor(features_batch, dtype=tf.float32)
+                )
+                
+                # Obtener índice del estado más probable
+                state = tf.argmax(states, axis=1)[0].numpy()
+                return int(state)
+                
+        # Actualizar el entorno en el agente SARSA
+        env = InsulinDosingEnv(cgm_np, other_np, target_np, self)
+        self.sarsa_agent.env = env
+        
+        return env
+    
+    def _calibrate_action_decoder(self, target_doses: tf.Tensor) -> None:
+        """
+        Calibra la capa decodificadora para mapear acciones a dosis apropiadas.
+        
+        Parámetros:
+        -----------
+        target_doses : tf.Tensor
+            Dosis objetivo para calibración
+        """
+        doses_np = target_doses.numpy() if hasattr(target_doses, 'numpy') else target_doses
+        max_dose = np.max(doses_np)
+        min_dose = np.min(doses_np)
+        
+        # Configurar pesos para mapear del espacio discreto al rango de dosis
+        self.action_decoder.set_weights([
+            np.ones((self.sarsa_agent.action_space_size, 1)) * 
+            (max_dose - min_dose) / self.sarsa_agent.action_space_size,
+            np.array([min_dose])
+        ])
+    
+    def predict(self, x: List[tf.Tensor], **kwargs) -> np.ndarray:
+        """
+        Implementa la interfaz de predicción de Keras.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis
+        """
+        return self.call(x).numpy()
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo para serialización.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración del modelo
+        """
+        return {
+            "cgm_shape": self.cgm_shape,
+            "other_features_shape": self.other_features_shape
+        }
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo SARSA.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        # Guardar pesos del modelo
+        super().save_weights(filepath + WEIGHTS_FILE_SUFFIX)
+        
+        # Guardar agente SARSA
+        self.sarsa_agent.save(filepath + SARSA_AGENT_SUFFIX)
+        
+    def load_weights(self, filepath: str) -> None:
+        """
+        Carga el modelo SARSA.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
+        # Determinar ruta correcta según formato de filepath
+        if filepath.endswith(WEIGHTS_FILE_SUFFIX):
+            weights_path = filepath
+            sarsa_path = filepath.replace(WEIGHTS_FILE_SUFFIX, SARSA_AGENT_SUFFIX)
+        else:
+            weights_path = filepath + WEIGHTS_FILE_SUFFIX
+            sarsa_path = filepath + SARSA_AGENT_SUFFIX
+        
+        # Cargar pesos del modelo
+        super().load_weights(weights_path)
+        
+        # Cargar agente SARSA
+        self.sarsa_agent.load(sarsa_path)
+
+
+# Constantes para prevenir duplicación
+CGM_ENCODER = 'cgm_encoder'
+OTHER_ENCODER = 'other_encoder'
+STATE_ENCODER = 'state_encoder'
+ACTION_DECODER = 'action_decoder'
+WEIGHTS_FILE_SUFFIX = '_weights.h5'
+SARSA_AGENT_SUFFIX = '_sarsa_agent'
+
+
+def create_sarsa_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> Model:
+    """
+    Crea un modelo basado en SARSA para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    Model
+        Modelo SARSA que implementa la interfaz de Keras
+    """
+    # Configuración del espacio de estados y acciones
+    n_states = 1000  # Número de estados discretos
+    n_actions = 20   # Número de acciones discretas (niveles de dosis)
+    
+    # Crear entorno dummy para inicializar SARSA
+    class DummyEnv:
+        def __init__(self):
+            self.observation_space = gym.spaces.Discrete(n_states)
+            self.action_space = gym.spaces.Discrete(n_actions)
+    
+    dummy_env = DummyEnv()
+    
+    # Crear agente SARSA
+    sarsa_agent = SARSA(
+        env=dummy_env,
+        config={
+            'learning_rate': SARSA_CONFIG['learning_rate'],
+            'gamma': SARSA_CONFIG['gamma'],
+            'epsilon_start': SARSA_CONFIG['epsilon_start'],
+            'epsilon_end': SARSA_CONFIG['epsilon_end'],
+            'epsilon_decay': SARSA_CONFIG['epsilon_decay'],
+            'epsilon_decay_type': SARSA_CONFIG['epsilon_decay_type'],
+            'optimistic_initialization': SARSA_CONFIG['optimistic_initialization'],
+            'optimistic_initial_value': SARSA_CONFIG['optimistic_initial_value'],
+            'log_interval': SARSA_CONFIG['log_interval'],
+            'episodes': SARSA_CONFIG['episodes'],
+            'max_steps': SARSA_CONFIG['max_steps'],
+            'smoothing_window': SARSA_CONFIG['smoothing_window']
+        },
+        seed=42
+    )
+    
+    # Crear y devolver el modelo wrapper
+    return SARSAModel(
+        sarsa_agent=sarsa_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )

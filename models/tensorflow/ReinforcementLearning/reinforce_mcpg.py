@@ -6,9 +6,10 @@ import time
 from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
-    Input, Dense, LayerNormalization, Dropout, Activation
+    Input, Dense, LayerNormalization, Dropout, Activation, GlobalAveragePooling1D
 )
 from tensorflow.keras.optimizers import Adam
+from keras.saving import register_keras_serializable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -820,3 +821,429 @@ class REINFORCE:
         
         plt.tight_layout()
         plt.show()
+
+@register_keras_serializable
+class REINFORCEModel(Model):
+    """
+    Wrapper para el algoritmo REINFORCE que implementa la interfaz de Keras.Model.
+    """
+    
+    def __init__(
+        self, 
+        reinforce_agent: REINFORCE,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...]
+    ) -> None:
+        """
+        Inicializa el modelo wrapper para REINFORCE.
+        
+        Parámetros:
+        -----------
+        reinforce_agent : REINFORCE
+            Agente REINFORCE a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        super(REINFORCEModel, self).__init__()
+        self.reinforce_agent = reinforce_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Capas para procesamiento de entradas
+        self.cgm_encoder = Dense(64, activation='relu', name='cgm_encoder')
+        self.cgm_pooling = GlobalAveragePooling1D(name='cgm_pooling')
+        self.other_encoder = Dense(32, activation='relu', name='other_encoder')
+        self.combined_encoder = Dense(reinforce_agent.state_dim, activation='linear', name='state_encoder')
+        
+        # Capa para convertir acciones de política a dosis de insulina
+        self.action_decoder = Dense(1, kernel_initializer='glorot_uniform', name='action_decoder')
+        
+    def call(self, inputs: List[tf.Tensor], training: bool = False) -> tf.Tensor:
+        """
+        Implementa la llamada del modelo para predicciones.
+        
+        Parámetros:
+        -----------
+        inputs : List[tf.Tensor]
+            Lista de tensores [cgm_data, other_features]
+        training : bool, opcional
+            Indica si está en modo de entrenamiento (default: False)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones basadas en la política actual
+        """
+        cgm_data, other_features = inputs
+        batch_size = tf.shape(cgm_data)[0]
+        
+        # Codificar estado a partir de entradas
+        states = self._encode_states(cgm_data, other_features)
+        
+        # Inicializar tensor para acciones
+        actions = tf.TensorArray(tf.float32, size=batch_size)
+        
+        # Para cada muestra en el batch, obtener acción determinística (sin exploración)
+        for i in range(batch_size):
+            state = states[i]
+            # Usar el agente para seleccionar acción sin exploración
+            action = self.reinforce_agent.policy.get_action(state.numpy(), deterministic=True)
+            actions = actions.write(i, tf.convert_to_tensor(action, dtype=tf.float32))
+        
+        # Obtener tensor de acciones y ajustar forma
+        actions_tensor = actions.stack()
+        
+        # Para espacio continuo, usar directamente las acciones
+        if self.reinforce_agent.continuous:
+            # Escalar a rango de dosis apropiado
+            scaled_actions = self.action_decoder(tf.reshape(actions_tensor, [batch_size, -1]))
+        else:
+            # Para espacio discreto, decodificar valores de acción a dosis
+            action_one_hot = tf.one_hot(tf.cast(actions_tensor, tf.int32), self.reinforce_agent.action_dim)
+            scaled_actions = self.action_decoder(action_one_hot)
+        
+        return scaled_actions
+    
+    def _encode_states(self, cgm_data: tf.Tensor, other_features: tf.Tensor) -> tf.Tensor:
+        """
+        Codifica las entradas CGM y otras características en representaciones de estado.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos de monitoreo continuo de glucosa
+        other_features : tf.Tensor
+            Otras características (carbohidratos, insulina a bordo, etc.)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Estados codificados
+        """
+        # Procesar CGM con capas convolucionales
+        cgm_encoded = self.cgm_encoder(cgm_data)
+        cgm_features = self.cgm_pooling(cgm_encoded)
+        
+        # Procesar otras características
+        other_encoded = self.other_encoder(other_features)
+        
+        # Combinar características
+        combined = tf.concat([cgm_features, other_encoded], axis=1)
+        
+        # Codificar a dimensión de estado esperada por REINFORCE
+        states = self.combined_encoder(combined)
+        
+        return states
+    
+    def fit(
+        self, 
+        x: List[tf.Tensor], 
+        y: tf.Tensor, 
+        batch_size: int = 32, 
+        epochs: int = 1, 
+        verbose: int = 0,
+        callbacks: Optional[List[Any]] = None,
+        validation_data: Optional[Tuple] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Simula la interfaz de entrenamiento de Keras para el agente REINFORCE.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+        callbacks : Optional[List[Any]], opcional
+            Lista de callbacks (default: None)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        Dict[str, Any]
+            Historia simulada de entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando agente REINFORCE...")
+        
+        # Crear entorno para entrenar el agente REINFORCE
+        env = self._create_environment(x, y)
+        
+        # Entrenar agente REINFORCE
+        history = self.reinforce_agent.train(
+            env=env,
+            episodes=batch_size * epochs,
+            render=False
+        )
+        
+        # Calibrar la capa de acción para mapeo apropiado
+        self._calibrate_action_decoder(y)
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado en {len(history['episode_rewards'])} episodios.")
+        
+        # Convertir métricas a formato compatible con Keras
+        keras_history = {
+            'loss': history['policy_losses'],
+            'val_loss': [np.mean(history['policy_losses'][-10:])] if validation_data else None
+        }
+        
+        # Retornar directamente un diccionario
+        return {'history': keras_history}
+    
+    def _create_environment(self, x: List[tf.Tensor], y: tf.Tensor) -> Any:
+        """
+        Crea un entorno personalizado para entrenar el agente REINFORCE.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+            
+        Retorna:
+        --------
+        Any
+            Entorno para entrenamiento de RL
+        """
+        # Convertir a numpy para procesamiento
+        cgm_data = x[0].numpy() if hasattr(x[0], 'numpy') else x[0]
+        other_features = x[1].numpy() if hasattr(x[1], 'numpy') else x[1]
+        targets = y.numpy() if hasattr(y, 'numpy') else y
+        
+        # Clase de entorno personalizado
+        class InsulinDosingEnvironment:
+            def __init__(self, cgm, features, targets, model):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                self.rng = np.random.Generator(np.random.PCG64(REINFORCE_CONFIG.get('seed', 42)))
+                
+            def reset(self):
+                """Reinicia el entorno con un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+                
+            def step(self, action):
+                """Ejecuta un paso en el entorno con la acción dada."""
+                # Convertir acción a dosis según el tipo de espacio de acción
+                if self.model.reinforce_agent.continuous:
+                    # Escalar la acción continua al rango de dosis
+                    dose = action[0]  # Primera dimensión si es vector multidimensional
+                else:
+                    # Mapear el índice discreto a valor de dosis
+                    max_dose = np.max(self.targets)
+                    dose = (action / (self.model.reinforce_agent.action_dim - 1)) * max_dose
+                
+                # Calcular recompensa (negativo del error absoluto)
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente caso
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de un paso
+                done = True
+                
+                return next_state, reward, done, False, {}
+                
+            def _get_state(self):
+                """Obtiene el estado actual codificado."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar estado usando el modelo
+                state = self.model._encode_states(
+                    tf.convert_to_tensor(cgm_batch, dtype=tf.float32),
+                    tf.convert_to_tensor(features_batch, dtype=tf.float32)
+                )
+                
+                return state[0].numpy()  # Extraer y convertir a numpy
+        
+        return InsulinDosingEnvironment(cgm_data, other_features, targets, self)
+    
+    def _calibrate_action_decoder(self, y: tf.Tensor) -> None:
+        """
+        Calibra la capa que mapea acciones a dosis de insulina.
+        
+        Parámetros:
+        -----------
+        y : tf.Tensor
+            Dosis objetivo para calibración
+        """
+        y_numpy = y.numpy() if hasattr(y, 'numpy') else y
+        max_dose = np.max(y_numpy)
+        min_dose = np.min(y_numpy)
+        
+        if self.reinforce_agent.continuous:
+            # Para política continua, escalar a rango adecuado
+            self.action_decoder.set_weights([
+                np.ones((1, 1)) * (max_dose - min_dose),
+                np.array([min_dose])
+            ])
+        else:
+            # Para política discreta, establecer pesos para mapear adecuadamente
+            self.action_decoder.set_weights([
+                np.ones((self.reinforce_agent.action_dim, 1)) * (max_dose - min_dose) / self.reinforce_agent.action_dim,
+                np.array([min_dose])
+            ])
+    
+    def predict(self, x: List[tf.Tensor], **kwargs) -> np.ndarray:
+        """
+        Implementa la interfaz de predicción de Keras.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis
+        """
+        return self.call(x).numpy()
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo para serialización.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración del modelo
+        """
+        return {
+            "cgm_shape": self.cgm_shape,
+            "other_features_shape": self.other_features_shape,
+            "state_dim": self.reinforce_agent.state_dim,
+            "action_dim": self.reinforce_agent.action_dim,
+            "continuous": self.reinforce_agent.continuous,
+            "gamma": self.reinforce_agent.gamma
+        }
+    
+    def save(self, filepath: str, **kwargs) -> None:
+        """
+        Guarda el modelo y los pesos del agente REINFORCE.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Guardar pesos de la política y del modelo wrapper
+        self.save_weights(filepath + MODEL_WEIGHTS_EXT)
+        
+        # Guardar pesos de la política por separado
+        policy_path = filepath + POLICY_WEIGHTS_EXT
+        baseline_path = filepath + BASELINE_WEIGHTS_EXT if self.reinforce_agent.use_baseline else None
+        
+        self.reinforce_agent.save(policy_path, baseline_path)
+        
+    def load_weights(self, filepath: str, **kwargs) -> None:
+        """
+        Carga el modelo y los pesos del agente REINFORCE.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Determinar rutas de archivos según el filepath proporcionado
+        if filepath.endswith(MODEL_WEIGHTS_EXT):
+            base_path = filepath[:-len(MODEL_WEIGHTS_EXT)]
+        else:
+            base_path = filepath
+            filepath = base_path + MODEL_WEIGHTS_EXT
+            
+        # Cargar pesos del wrapper
+        super().load_weights(filepath)
+        
+        # Cargar pesos de la política
+        policy_path = base_path + POLICY_WEIGHTS_EXT
+        baseline_path = base_path + BASELINE_WEIGHTS_EXT if self.reinforce_agent.use_baseline else None
+        
+        self.reinforce_agent.load(policy_path, baseline_path)
+
+
+# Constantes para evitar duplicación de strings
+CGM_ENCODER = 'cgm_encoder'
+OTHER_ENCODER = 'other_encoder'
+STATE_ENCODER = 'state_encoder'
+ACTION_DECODER = 'action_decoder'
+# Constantes para evitar duplicación de archivos
+MODEL_WEIGHTS_EXT = "_model.h5"
+POLICY_WEIGHTS_EXT = "_policy.h5"
+BASELINE_WEIGHTS_EXT = "_baseline.h5"
+
+
+def create_reinforce_mcpg_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> Model:
+    """
+    Crea un modelo basado en REINFORCE (Monte Carlo Policy Gradient) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    Model
+        Modelo REINFORCE que implementa la interfaz de Keras
+    """
+    # Definir dimensiones de entrada
+    _ = cgm_shape[1] * cgm_shape[2] + other_features_shape[1]
+    state_dim = 64  # Dimensión del espacio de estado
+    
+    # Configurar espacio de acciones
+    action_dim = 20  # Acciones discretas (niveles de dosis)
+    continuous = REINFORCE_CONFIG['continuous_action']
+    
+    # Crear agente REINFORCE
+    reinforce_agent = REINFORCE(
+        state_dim=state_dim,
+        action_dim=action_dim if not continuous else 1,
+        continuous=continuous,
+        learning_rate=REINFORCE_CONFIG['learning_rate'],
+        gamma=REINFORCE_CONFIG['gamma'],
+        hidden_units=REINFORCE_CONFIG['hidden_units'],
+        baseline=REINFORCE_CONFIG['use_baseline'],
+        entropy_coef=REINFORCE_CONFIG['entropy_coef'],
+        seed=REINFORCE_CONFIG.get('seed', 42)
+    )
+    
+    # Crear y devolver el modelo wrapper
+    return REINFORCEModel(
+        reinforce_agent=reinforce_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )

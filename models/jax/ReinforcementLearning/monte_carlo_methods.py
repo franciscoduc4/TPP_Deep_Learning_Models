@@ -2486,3 +2486,180 @@ class MonteCarlo:
         plt.show()
         
         return all_histories
+
+class MonteCarloWrapper:
+    """
+    Wrapper para hacer que MonteCarlo sea compatible con la interfaz de modelos de aprendizaje profundo.
+    """
+    def __init__(
+        self,
+        mc_agent: MonteCarlo,
+        input_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para MonteCarlo.
+        
+        Parámetros:
+        -----------
+        mc_agent : MonteCarlo
+            Instancia de agente MonteCarlo
+        input_shape : Tuple[int, ...]
+            Forma de entrada principal (CGM)
+        other_features_shape : Tuple[int, ...]
+            Forma de características adicionales
+        """
+        self.mc_agent = mc_agent
+        self.input_shape = input_shape
+        self.other_features_shape = other_features_shape
+    
+    def __call__(self, inputs: list) -> np.ndarray:
+        """
+        Implementa interfaz de llamada para compatibilidad con pipeline de predicción.
+        
+        Parámetros:
+        -----------
+        inputs : list
+            Lista de tensores de entrada [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones basadas en política actual
+        """
+        # Extraer características
+        cgm_data, other_features = inputs
+        batch_size = cgm_data.shape[0]
+        
+        # Transformar datos a estados (simplificado)
+        states = np.argmax(other_features, axis=1) % self.mc_agent.n_states
+        
+        # Obtener acciones según la política actual
+        actions = np.array([self.mc_agent.get_action(int(state), explore=False) for state in states])
+        
+        # Devolver acciones como predicciones
+        # Esto es una simplificación - en un caso real habría que mapear acciones a valores de dosis
+        return actions.reshape(-1, 1).astype(np.float32)
+    
+    def predict(self, inputs: list) -> np.ndarray:
+        """
+        Método de predicción para compatibilidad con API de Keras.
+        
+        Parámetros:
+        -----------
+        inputs : list
+            Lista de tensores de entrada [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones basadas en política actual
+        """
+        return self(inputs)
+    
+    def fit(
+        self, 
+        x: list, 
+        y: np.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: list = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Simula interfaz de entrenamiento compatible con Keras.
+        
+        Parámetros:
+        -----------
+        x : list
+            Lista de tensores de entrada [cgm_data, other_features]
+        y : np.ndarray
+            Valores objetivo
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        batch_size : int, opcional
+            Tamaño de lote (default: 32)
+        callbacks : list, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia de entrenamiento simulada
+        """
+        # Simular history para compatibilidad
+        history = {
+            'loss': [0.5],
+            'val_loss': [0.5] if validation_data is not None else None
+        }
+        
+        # En un caso real, aquí se implementaría la lógica para adaptar
+        # los datos al formato que necesita MonteCarlo y llamar a sus métodos de entrenamiento
+        
+        return type('History', (), {'history': history})
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el agente Monte Carlo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        self.mc_agent.save(filepath)
+    
+    def get_config(self) -> Dict:
+        """
+        Devuelve la configuración para serialización.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración del modelo
+        """
+        return {
+            "input_shape": self.input_shape,
+            "other_features_shape": self.other_features_shape
+        }
+
+
+def create_monte_carlo_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> MonteCarloWrapper:
+    """
+    Crea un modelo de MonteCarlo compatible con la interfaz de modelos de aprendizaje profundo.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    MonteCarloWrapper
+        Wrapper de MonteCarlo que implementa la interfaz compatible
+    """
+    # Configurar el tamaño del espacio de estados y acciones
+    # Esto es una simplificación - en un caso real habría que definirlo según los datos
+    n_states = 100  # Por ejemplo: discretización del espacio de estados
+    n_actions = 20   # Por ejemplo: niveles discretos de dosis de insulina
+    
+    # Crear agente MonteCarlo
+    mc_agent = MonteCarlo(
+        n_states=n_states,
+        n_actions=n_actions,
+        gamma=MONTE_CARLO_CONFIG['gamma'],
+        epsilon_start=MONTE_CARLO_CONFIG['epsilon_start'],
+        epsilon_end=MONTE_CARLO_CONFIG['epsilon_end'],
+        epsilon_decay=MONTE_CARLO_CONFIG['epsilon_decay'],
+        first_visit=MONTE_CARLO_CONFIG['first_visit']
+    )
+    
+    # Crear y devolver wrapper
+    return MonteCarloWrapper(mc_agent, cgm_shape, other_features_shape)

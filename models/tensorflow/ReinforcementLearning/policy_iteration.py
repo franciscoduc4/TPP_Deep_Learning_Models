@@ -4,6 +4,10 @@ import matplotlib.pyplot as plt
 import time
 from typing import Dict, List, Tuple, Optional, Union, Any
 import pickle
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Concatenate
+from keras.saving import register_keras_serializable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -821,3 +825,295 @@ class PolicyIteration:
         
         plt.tight_layout()
         plt.show()
+
+@register_keras_serializable
+class PolicyIterationModel(Model):
+    """
+    Modelo wrapper para Iteración de Política compatible con la interfaz de Keras.
+    """
+    
+    def __init__(
+        self, 
+        policy_iteration_agent: PolicyIteration,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...],
+        discretizer: Optional[Any] = None
+    ) -> None:
+        """
+        Inicializa el modelo wrapper para Iteración de Política.
+        
+        Parámetros:
+        -----------
+        policy_iteration_agent : PolicyIteration
+            Agente de Iteración de Política a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        discretizer : Optional[Any], opcional
+            Función para discretizar estados continuos (default: None)
+        """
+        super(PolicyIterationModel, self).__init__()
+        self.policy_iteration_agent = policy_iteration_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Red simple para combinar inputs en una representación de estado
+        self.cgm_encoder = Dense(32, activation="relu")
+        self.other_encoder = Dense(16, activation="relu")
+        self.combined_encoder = Dense(policy_iteration_agent.n_states, activation="softmax")
+        self.action_decoder = Dense(1, kernel_initializer="glorot_uniform")
+        
+        # Constantes
+        self.policy_file_ext = ".policy"
+        self.weight_file_ext = ".weights.h5"
+        
+    def call(self, inputs: List[tf.Tensor], training: bool = False) -> tf.Tensor:
+        """
+        Implementa la llamada del modelo para predicciones.
+        
+        Parámetros:
+        -----------
+        inputs : List[tf.Tensor]
+            Lista de tensores [cgm_data, other_features]
+        training : bool, opcional
+            Indica si está en modo de entrenamiento (default: False)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones basadas en la política actual
+        """
+        cgm_data, other_features = inputs
+        
+        # Mapear inputs a estados discretos
+        states = self._encode_states(cgm_data, other_features)
+        _ = tf.shape(states)[0]
+        
+        # Construir seleccionador de acción basado en la política óptima
+        policy_matrix = tf.constant(self.policy_iteration_agent.policy, dtype=tf.float32)
+        
+        # Extraer las acciones para los estados calculados
+        actions = tf.matmul(states, policy_matrix)
+        
+        # Mapear acción discreta a valor continuo de dosis
+        # Usar la representación continua para predecir la dosis
+        action_values = self.action_decoder(actions)
+        
+        return action_values
+        
+    def _encode_states(self, cgm_data: tf.Tensor, other_features: tf.Tensor) -> tf.Tensor:
+        """
+        Convierte CGM y otras características en una representación de estados discretos.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos de monitoreo continuo de glucosa
+        other_features : tf.Tensor
+            Otras características (carbohidratos, insulina a bordo, etc.)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Representación one-hot de estados discretos
+        """
+        # Extraer características relevantes de CGM
+        batch_size = tf.shape(cgm_data)[0]
+        cgm_flat = tf.reshape(cgm_data, [batch_size, -1])
+        
+        # Procesar ambos tipos de características
+        cgm_encoded = self.cgm_encoder(cgm_flat)
+        other_encoded = self.other_encoder(other_features)
+        
+        # Concatenar y obtener distribución sobre estados discretos
+        combined = Concatenate()([cgm_encoded, other_encoded])
+        state_distribution = self.combined_encoder(combined)
+        
+        return state_distribution
+        
+    def fit(
+        self, 
+        x: List[tf.Tensor], 
+        y: tf.Tensor, 
+        batch_size: int = 32, 
+        epochs: int = 1, 
+        verbose: int = 0,
+        callbacks: Optional[List[Any]] = None,
+        validation_data: Optional[Tuple] = None,
+        **kwargs
+    ) -> Dict:
+        """
+        Simula el entrenamiento con interfaz compatible con Keras.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+        callbacks : Optional[List[Any]], opcional
+            Lista de callbacks (default: None)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        Dict
+            Historia simulada de entrenamiento
+        """
+        # Actualizar encoders en base a los datos
+        self._update_encoders(x, y)
+        
+        # Simulación de entrenamiento
+        history = {
+            'loss': [0.0],
+            'val_loss': [0.0] if validation_data is not None else None
+        }
+        
+        # Usado solo para simulación de interfaz compatible
+        return {'history': history}
+        
+    def _update_encoders(self, x: List[tf.Tensor], y: tf.Tensor) -> None:
+        """
+        Actualiza los encoders para mapear mejor los datos a estados.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+        """
+        _, _ = x
+        
+        # Calcular rangos para parámetros de la capa de salida
+        max_dose = tf.reduce_max(y, axis=0)
+        min_dose = tf.reduce_min(y, axis=0)
+        
+        # Actualizar capa para mapear a rango correcto de dosis
+        dose_spread = max_dose - min_dose
+        self.action_decoder.set_weights([
+            tf.ones([self.policy_iteration_agent.n_actions, 1]) * (dose_spread / self.policy_iteration_agent.n_actions),
+            tf.ones([1]) * min_dose
+        ])
+        
+    def predict(self, x: List[tf.Tensor], **kwargs) -> tf.Tensor:
+        """
+        Implementa la interfaz de predicción de Keras.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones de dosis
+        """
+        return self.call(x)
+        
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo para serialización.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración del modelo
+        """
+        return {
+            "cgm_shape": self.cgm_shape,
+            "other_features_shape": self.other_features_shape,
+            "n_states": self.policy_iteration_agent.n_states,
+            "n_actions": self.policy_iteration_agent.n_actions,
+            "gamma": self.policy_iteration_agent.gamma
+        }
+        
+    def save(self, filepath: str, **kwargs) -> None:
+        """
+        Guarda el modelo y el agente de Iteración de Política.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Guardar el agente de iteración de política
+        self.policy_iteration_agent.save(filepath + self.policy_file_ext)
+        
+        # Guardar la parte del modelo de keras (encoders/decoders)
+        super().save_weights(filepath + self.weight_file_ext)
+        
+    def load_weights(self, filepath: str, **kwargs) -> None:
+        """
+        Carga el modelo y el agente de Iteración de Política.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Cargar el agente de iteración de política
+        if filepath.endswith(self.weight_file_ext):
+            policy_file = filepath.replace(self.weight_file_ext, self.policy_file_ext)
+        else:
+            policy_file = filepath + self.policy_file_ext
+            
+        self.policy_iteration_agent.load(policy_file)
+        
+        # Cargar la parte del modelo de keras
+        super().load_weights(filepath + self.weight_file_ext if not filepath.endswith(self.weight_file_ext) else filepath)
+
+
+def create_policy_iteration_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> Model:
+    """
+    Crea un modelo basado en Iteración de Política para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    Model
+        Modelo de Iteración de Política que implementa la interfaz de Keras
+    """
+    # Configuración del espacio de estados y acciones
+    n_states = 1000  # Estados discretos (ajustar según complejidad del problema)
+    n_actions = 20   # Acciones discretas (niveles de dosis de insulina)
+    
+    # Crear agente de Iteración de Política
+    policy_iteration_agent = PolicyIteration(
+        n_states=n_states,
+        n_actions=n_actions,
+        gamma=POLICY_ITERATION_CONFIG['gamma'],
+        theta=POLICY_ITERATION_CONFIG['theta'],
+        max_iterations=POLICY_ITERATION_CONFIG['max_iterations'],
+        max_iterations_eval=POLICY_ITERATION_CONFIG['max_iterations_eval']
+    )
+    
+    # Crear y devolver el modelo wrapper
+    return PolicyIterationModel(
+        policy_iteration_agent=policy_iteration_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )

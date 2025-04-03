@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import time
 from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 import tensorflow as tf
+from keras.saving import register_keras_serializable
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -644,3 +645,415 @@ class QLearning:
             Tabla Q actual
         """
         return self.q_table
+    
+# Constantes para archivos
+QTABLE_SUFFIX = "_qtable.npy"
+WRAPPER_WEIGHTS_SUFFIX = "_wrapper_weights.h5"
+
+@register_keras_serializable
+class QLearningModel(tf.keras.models.Model):
+    """
+    Wrapper para el agente Q-Learning que implementa la interfaz de Keras.Model.
+    """
+    
+    def __init__(
+        self, 
+        q_learning_agent: QLearning,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...]
+    ) -> None:
+        """
+        Inicializa el modelo wrapper para Q-Learning.
+        
+        Parámetros:
+        -----------
+        q_learning_agent : QLearning
+            Agente Q-Learning a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        super(QLearningModel, self).__init__()
+        self.q_learning_agent = q_learning_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Capas para procesar entrada CGM
+        self.cgm_encoder = tf.keras.layers.Dense(64, activation='relu')
+        self.other_encoder = tf.keras.layers.Dense(32, activation='relu')
+        self.state_encoder = tf.keras.layers.Dense(q_learning_agent.n_states, activation='softmax')
+        
+        # Capa para convertir índices de acción a valores continuos
+        self.action_decoder = tf.keras.layers.Dense(1, kernel_initializer='glorot_uniform')
+        
+    def call(self, inputs: List[tf.Tensor], training: bool = False) -> tf.Tensor:
+        """
+        Implementa la llamada del modelo para predicciones.
+        
+        Parámetros:
+        -----------
+        inputs : List[tf.Tensor]
+            Lista de tensores [cgm_data, other_features]
+        training : bool, opcional
+            Indica si está en modo de entrenamiento (default: False)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones basadas en la política actual
+        """
+        cgm_data, other_features = inputs
+        batch_size = tf.shape(cgm_data)[0]
+        
+        # Codificar estados
+        states = self._encode_states(cgm_data, other_features)
+        
+        # Convertir a valores discretos
+        discrete_states = tf.argmax(states, axis=1)
+        
+        # Inicializar tensor de acciones
+        actions = tf.TensorArray(tf.float32, size=batch_size)
+        
+        # Usar la tabla Q para determinar acciones
+        for i in range(batch_size):
+            state = discrete_states[i]
+            # Usar el modelo Q-Learning para obtener la mejor acción (sin exploración)
+            q_values = tf.convert_to_tensor(self.q_learning_agent.q_table[state])
+            best_action = tf.argmax(q_values)
+            actions = actions.write(i, tf.cast(best_action, tf.float32))
+        
+        # Convertir a tensor
+        actions_tensor = tf.reshape(actions.stack(), [batch_size, 1])
+        
+        # Decodificar acción discreta a valores continuos (dosis)
+        action_values = self.action_decoder(tf.one_hot(tf.cast(actions_tensor, tf.int32), 
+                                                       self.q_learning_agent.n_actions))
+        
+        return action_values
+    
+    def _encode_states(self, cgm_data: tf.Tensor, other_features: tf.Tensor) -> tf.Tensor:
+        """
+        Codifica las características de entrada en estados discretos.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos de monitoreo continuo de glucosa
+        other_features : tf.Tensor
+            Otras características (carbohidratos, insulina a bordo, etc.)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Distribución suave sobre estados discretos
+        """
+        # Aplanar datos CGM
+        cgm_flat = tf.reshape(cgm_data, [tf.shape(cgm_data)[0], -1])
+        
+        # Encoders separados para CGM y otras características
+        cgm_encoded = self.cgm_encoder(cgm_flat)
+        other_encoded = self.other_encoder(other_features)
+        
+        # Combinar características
+        combined = tf.concat([cgm_encoded, other_encoded], axis=1)
+        
+        # Distribución sobre estados discretos
+        state_distribution = self.state_encoder(combined)
+        
+        return state_distribution
+    
+    def fit(
+        self, 
+        x: List[tf.Tensor], 
+        y: tf.Tensor, 
+        batch_size: int = 32, 
+        epochs: int = 1, 
+        verbose: int = 0,
+        callbacks: Optional[List[Any]] = None,
+        validation_data: Optional[Tuple] = None,
+        **kwargs
+    ) -> Dict:
+        """
+        Simula la interfaz de entrenamiento de Keras para Q-Learning.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+        callbacks : Optional[List[Any]], opcional
+            Lista de callbacks (default: None)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        Dict
+            Historia simulada de entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando modelo Q-Learning...")
+        
+        # Crear entorno simulado para entrenar el agente
+        env = self._create_environment(x[0], x[1], y)
+        
+        # Entrenar el agente Q-Learning
+        history = self.q_learning_agent.train(
+            env=env,
+            episodes=batch_size * epochs,
+            max_steps=100,
+            render=False,
+            log_interval=max(1, epochs * batch_size // 10)
+        )
+        
+        # Actualizar capa decodificadora con rango de dosis adecuado
+        self._calibrate_action_decoder(y)
+        
+        if verbose > 0:
+            print("Entrenamiento completado.")
+        
+        # Simular historia compatible con Keras
+        keras_history = {
+            'loss': history['avg_rewards'],
+            'val_loss': [history['avg_rewards'][-1] * 1.05] if validation_data is not None else None
+        }
+        
+        return {'history': keras_history}
+    
+    def _create_environment(self, cgm_data: tf.Tensor, other_features: tf.Tensor, 
+                           target_doses: tf.Tensor) -> Any:
+        """
+        Crea un entorno personalizado para entrenar el agente Q-Learning.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos de CGM
+        other_features : tf.Tensor
+            Otras características
+        target_doses : tf.Tensor
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno compatible con OpenAI Gym
+        """
+        # Convertir tensores a numpy arrays para procesamiento
+        cgm_np = cgm_data.numpy() if hasattr(cgm_data, 'numpy') else cgm_data
+        other_np = other_features.numpy() if hasattr(other_features, 'numpy') else other_features
+        target_np = target_doses.numpy() if hasattr(target_doses, 'numpy') else target_doses
+        
+        # Clase de entorno personalizado
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model
+                self.max_dose = np.max(targets)
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                self.rng = np.random.Generator(np.random.PCG64(42))
+            
+            def reset(self):
+                """Reinicia el entorno a un estado aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                
+                # Codificar estado
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                states = self.model._encode_states(
+                    tf.convert_to_tensor(cgm_batch),
+                    tf.convert_to_tensor(features_batch)
+                )
+                state = tf.argmax(states, axis=1)[0].numpy()
+                
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso en el entorno con la acción dada."""
+                # Convertir acción discreta a dosis continua
+                dose = action / (self.model.q_learning_agent.n_actions - 1) * self.max_dose
+                
+                # Calcular recompensa (error negativo)
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                next_idx = (self.current_idx + 1) % self.max_idx
+                self.current_idx = next_idx
+                
+                # Codificar próximo estado
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                states = self.model._encode_states(
+                    tf.convert_to_tensor(cgm_batch),
+                    tf.convert_to_tensor(features_batch)
+                )
+                next_state = tf.argmax(states, axis=1)[0].numpy()
+                
+                # Episodio siempre termina después de un paso
+                done = True
+                
+                return next_state, reward, done, False, {}
+        
+        return InsulinDosingEnv(cgm_np, other_np, target_np, self)
+    
+    def _calibrate_action_decoder(self, y: tf.Tensor) -> None:
+        """
+        Calibra la capa decodificadora para mapear acciones a dosis adecuadas.
+        
+        Parámetros:
+        -----------
+        y : tf.Tensor
+            Dosis objetivo para calibración
+        """
+        y_np = y.numpy() if hasattr(y, 'numpy') else y
+        max_dose = float(np.max(y_np))
+        min_dose = float(np.min(y_np))
+        
+        # Configurar pesos para mapear del rango de acciones al rango de dosis
+        action_range = self.q_learning_agent.n_actions - 1
+        dose_range = max_dose - min_dose
+        scale = dose_range / action_range
+        
+        # Actualizar pesos de la capa decodificadora
+        weights = [
+            np.ones((self.q_learning_agent.n_actions, 1)) * scale,
+            np.array([min_dose])
+        ]
+        self.action_decoder.set_weights(weights)
+    
+    def predict(self, x: List[tf.Tensor], **kwargs) -> np.ndarray:
+        """
+        Implementa la interfaz de predicción de Keras.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis
+        """
+        return self.call(x).numpy()
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo para serialización.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración del modelo
+        """
+        return {
+            "cgm_shape": self.cgm_shape,
+            "other_features_shape": self.other_features_shape,
+            "n_states": self.q_learning_agent.n_states,
+            "n_actions": self.q_learning_agent.n_actions,
+            "gamma": self.q_learning_agent.gamma,
+            "learning_rate": self.q_learning_agent.learning_rate,
+            "epsilon": self.q_learning_agent.epsilon
+        }
+    
+    def save(self, filepath: str, **kwargs) -> None:
+        """
+        Guarda el modelo y el agente Q-Learning.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Guardar tabla Q
+        self.q_learning_agent.save_qtable(filepath + QTABLE_SUFFIX)
+        
+        # Guardar configuración y pesos del modelo wrapper
+        super().save_weights(filepath + WRAPPER_WEIGHTS_SUFFIX)
+    
+    def load_weights(self, filepath: str, **kwargs) -> None:
+        """
+        Carga el modelo y el agente Q-Learning.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Cargar tabla Q
+        if filepath.endswith(WRAPPER_WEIGHTS_SUFFIX):
+            qtable_path = filepath.replace(WRAPPER_WEIGHTS_SUFFIX, QTABLE_SUFFIX)
+        else:
+            qtable_path = filepath + QTABLE_SUFFIX
+            
+        self.q_learning_agent.load_qtable(qtable_path)
+        
+        # Cargar pesos del wrapper
+        weights_path = filepath if filepath.endswith(WRAPPER_WEIGHTS_SUFFIX) else filepath + WRAPPER_WEIGHTS_SUFFIX
+        super().load_weights(weights_path)
+
+
+def create_q_learning_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> tf.keras.models.Model:
+    """
+    Crea un modelo basado en Q-Learning para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    tf.keras.models.Model
+        Modelo de Q-Learning que implementa la interfaz de Keras
+    """
+    # Configuración del espacio de estados y acciones
+    n_states = 1000  # Estados discretos (ajustar según complejidad del problema)
+    n_actions = 20   # Acciones discretas (niveles de dosis de insulina)
+    
+    # Crear agente Q-Learning
+    q_learning_agent = QLearning(
+        n_states=n_states,
+        n_actions=n_actions,
+        learning_rate=QLEARNING_CONFIG['learning_rate'],
+        gamma=QLEARNING_CONFIG['gamma'],
+        epsilon_start=QLEARNING_CONFIG['epsilon_start'],
+        epsilon_end=QLEARNING_CONFIG['epsilon_end'],
+        epsilon_decay=QLEARNING_CONFIG['epsilon_decay'],
+        use_decay_schedule=QLEARNING_CONFIG['use_decay_schedule'],
+        decay_steps=QLEARNING_CONFIG['decay_steps'],
+        seed=QLEARNING_CONFIG.get('seed', 42)
+    )
+    
+    # Crear y devolver el modelo wrapper
+    return QLearningModel(
+        q_learning_agent=q_learning_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )
