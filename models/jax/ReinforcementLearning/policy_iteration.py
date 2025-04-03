@@ -1,0 +1,871 @@
+import os, sys
+import jax
+import jax.numpy as jnp
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable
+import pickle
+from functools import partial
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.append(PROJECT_ROOT) 
+
+from models.config import POLICY_ITERATION_CONFIG
+
+
+class PolicyIteration:
+    """
+    Implementación del algoritmo de Iteración de Política usando JAX.
+    
+    La Iteración de Política alterna entre Evaluación de Política (calcular la función
+    de valor para la política actual) y Mejora de Política (hacer la política codiciosa
+    respecto a la función de valor actual).
+    """
+    # Constantes para etiquetas de gráficos y operaciones
+    ITERATION_LABEL = 'Iteración'
+    EINSUM_PATTERN = 'san,n->sa'  # Patrón para calcular valores esperados
+    
+    def __init__(
+        self,
+        n_states: int,
+        n_actions: int,
+        gamma: float = POLICY_ITERATION_CONFIG['gamma'],
+        theta: float = POLICY_ITERATION_CONFIG['theta'],
+        max_iterations: int = POLICY_ITERATION_CONFIG['max_iterations'],
+        max_iterations_eval: int = POLICY_ITERATION_CONFIG['max_iterations_eval'],
+        seed: int = POLICY_ITERATION_CONFIG.get('seed', 42)
+    ) -> None:
+        """
+        Inicializa el agente de Iteración de Política.
+        
+        Parámetros:
+        -----------
+        n_states : int
+            Número de estados en el entorno
+        n_actions : int
+            Número de acciones en el entorno
+        gamma : float, opcional
+            Factor de descuento (default: POLICY_ITERATION_CONFIG['gamma'])
+        theta : float, opcional
+            Umbral para convergencia (default: POLICY_ITERATION_CONFIG['theta'])
+        max_iterations : int, opcional
+            Número máximo de iteraciones de iteración de política 
+            (default: POLICY_ITERATION_CONFIG['max_iterations'])
+        max_iterations_eval : int, opcional
+            Número máximo de iteraciones para evaluación de política 
+            (default: POLICY_ITERATION_CONFIG['max_iterations_eval'])
+        seed : int, opcional
+            Semilla para reproducibilidad (default: POLICY_ITERATION_CONFIG.get('seed', 42))
+        """
+        self.n_states = n_states
+        self.n_actions = n_actions
+        self.gamma = gamma
+        self.theta = theta
+        self.max_iterations = max_iterations
+        self.max_iterations_eval = max_iterations_eval
+        
+        # Configurar claves para aleatorización
+        self.key = jax.random.key(seed)
+        self.np_rng = np.random.Generator(np.random.PCG64(seed))
+        
+        # Inicializar función de valor
+        self.v = jnp.zeros(n_states)
+        
+        # Inicializar política (aleatoria uniforme)
+        self.policy = jnp.ones((n_states, n_actions)) / n_actions
+        
+        # Para métricas
+        self.policy_changes = []
+        self.value_changes = []
+        self.policy_iteration_times = []
+        self.eval_iteration_counts = []
+        
+        # Compilar funciones clave para mejorar rendimiento
+        self._init_jitted_functions()
+    
+    def _init_jitted_functions(self) -> None:
+        """
+        Inicializa funciones JIT-compiladas para mejorar el rendimiento.
+        """
+        # Definimos las funciones que serán compiladas con JIT
+        self._jit_policy_evaluation_step = jax.jit(self._policy_evaluation_step)
+        self._jit_calculate_state_values = jax.jit(self._calculate_state_values)
+    
+    def _prepare_transition_matrices(self, env: Any) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """
+        Prepara matrices de transición para cálculos JAX eficientes.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
+            
+        Retorna:
+        --------
+        Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+            Matrices de transición: (probabilidades, recompensas, terminales)
+        """
+        # Crear matrices para probabilidades de transición, recompensas y estados terminales
+        transition_probs = np.zeros((self.n_states, self.n_actions, self.n_states))
+        rewards = np.zeros((self.n_states, self.n_actions))
+        terminals = np.zeros((self.n_states, self.n_actions), dtype=bool)
+        
+        # Llenar matrices desde la información del entorno
+        for s in range(self.n_states):
+            for a in range(self.n_actions):
+                for prob, next_s, r, done in env.P[s][a]:
+                    transition_probs[s, a, next_s] += prob
+                    rewards[s, a] += prob * r  # Recompensa esperada
+                    if done:
+                        terminals[s, a] = True
+        
+        return jnp.array(transition_probs), jnp.array(rewards), jnp.array(terminals)
+    
+    def _calculate_state_values(
+        self, 
+        policy: jnp.ndarray, 
+        v: jnp.ndarray,
+        transition_probs: jnp.ndarray, 
+        rewards: jnp.ndarray, 
+        terminals: jnp.ndarray
+    ) -> jnp.ndarray:
+        """
+        Calcula valores de estado para todos los estados en un solo paso.
+        
+        Parámetros:
+        -----------
+        policy : jnp.ndarray
+            Política actual
+        v : jnp.ndarray
+            Función de valor actual
+        transition_probs : jnp.ndarray
+            Matriz de probabilidades de transición
+        rewards : jnp.ndarray
+            Matriz de recompensas
+        terminals : jnp.ndarray
+            Matriz de indicadores de terminal
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Nuevos valores de estado
+        """
+        # Calcular el valor de cada estado siguiendo la política
+        # Para cada estado s, acción a, y estado siguiente s':
+        # v_new[s] = sum_a policy[s,a] * (rewards[s,a] + gamma * sum_s' P[s,a,s'] * v[s'] * (not terminal[s,a]))
+        expected_values = rewards + self.gamma * jnp.einsum(self.EINSUM_PATTERN, transition_probs, v)
+        expected_values = jnp.where(terminals, rewards, expected_values)
+        
+        # Promediar sobre la política
+        v_new = jnp.einsum('sa,sa->s', policy, expected_values)
+        
+        return v_new
+    
+    def _policy_evaluation_step(
+        self, 
+        v: jnp.ndarray, 
+        policy: jnp.ndarray,
+        transition_probs: jnp.ndarray, 
+        rewards: jnp.ndarray, 
+        terminals: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, float]:
+        """
+        Realiza un paso de evaluación de política y calcula el delta.
+        
+        Parámetros:
+        -----------
+        v : jnp.ndarray
+            Función de valor actual
+        policy : jnp.ndarray
+            Política a evaluar
+        transition_probs : jnp.ndarray
+            Matriz de probabilidades de transición
+        rewards : jnp.ndarray
+            Matriz de recompensas
+        terminals : jnp.ndarray
+            Matriz de indicadores de terminal
+            
+        Retorna:
+        --------
+        Tuple[jnp.ndarray, jnp.float64]
+            Nueva función de valor y delta (cambio máximo)
+        """
+        v_new = self._calculate_state_values(policy, v, transition_probs, rewards, terminals)
+        delta = jnp.max(jnp.abs(v_new - v))
+        
+        return v_new, delta
+    
+    def policy_evaluation(
+        self, 
+        env: Any, 
+        policy: jnp.ndarray,
+        use_jit: bool = True
+    ) -> jnp.ndarray:
+        """
+        Evalúa la política actual calculando su función de valor.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
+        policy : jnp.ndarray
+            Política a evaluar (distribución de probabilidad sobre acciones para cada estado)
+        use_jit : bool, opcional
+            Si usar compilación JIT (default: True)
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Función de valor para la política dada
+        """
+        # Preparar matrices de transición
+        transition_probs, rewards, terminals = self._prepare_transition_matrices(env)
+        
+        # Inicializar valor
+        v = jnp.zeros(self.n_states)
+        
+        # Función de evaluación paso a paso
+        eval_step = self._jit_policy_evaluation_step if use_jit else self._policy_evaluation_step
+        
+        # Iteración de valor para la política dada
+        for i in range(self.max_iterations_eval):
+            v, delta = eval_step(v, policy, transition_probs, rewards, terminals)
+            
+            # Verificar convergencia
+            if delta < self.theta:
+                break
+        
+        self.eval_iteration_counts.append(i + 1)
+        return v
+    
+    def policy_improvement(
+        self, 
+        env: Any, 
+        v: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, bool]:
+        """
+        Mejora la política haciéndola codiciosa respecto a la función de valor.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
+        v : jnp.ndarray
+            Función de valor actual
+            
+        Retorna:
+        --------
+        Tuple[jnp.ndarray, bool]
+            Tupla de (nueva política, política_estable)
+        """
+        # Preparar matrices de transición
+        transition_probs, rewards, terminals = self._prepare_transition_matrices(env)
+        
+        # Convertir a arrays numpy para manipulación
+        v_np = np.array(v)
+        old_policy_np = np.array(self.policy)
+        new_policy_np = np.zeros_like(old_policy_np)
+        
+        # Calcular todos los valores de acción
+        action_values = np.zeros((self.n_states, self.n_actions))
+        
+        for s in range(self.n_states):
+            for a in range(self.n_actions):
+                if terminals[s, a]:
+                    action_values[s, a] = rewards[s, a]
+                else:
+                    for next_s in range(self.n_states):
+                        action_values[s, a] += transition_probs[s, a, next_s] * (
+                            rewards[s, a] + self.gamma * v_np[next_s]
+                        )
+        
+        # Determinar la mejor acción para cada estado
+        best_actions = np.argmax(action_values, axis=1)
+        
+        # Crear nueva política
+        for s in range(self.n_states):
+            new_policy_np[s, best_actions[s]] = 1.0
+        
+        # Verificar estabilidad de la política
+        policy_stable = np.all(np.argmax(old_policy_np, axis=1) == best_actions)
+        
+        return jnp.array(new_policy_np), policy_stable
+    
+    def train(self, env: Any) -> Dict[str, List]:
+        """
+        Entrena al agente usando iteración de política.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
+            
+        Retorna:
+        --------
+        Dict[str, List]
+            Diccionario con historial de entrenamiento
+        """
+        print("Iniciando iteración de política...")
+        
+        policy_stable = False
+        iterations = 0
+        
+        start_time = time.time()
+        
+        while not policy_stable and iterations < self.max_iterations:
+            iteration_start = time.time()
+            
+            # Evaluación de Política: Calcular función de valor para la política actual
+            self.v = self.policy_evaluation(env, self.policy)
+            
+            # Calcular cambio de valor para métricas
+            if iterations > 0:
+                value_change = float(jnp.mean(jnp.abs(self.v - old_v)))
+                self.value_changes.append(value_change)
+            old_v = self.v
+            
+            # Mejora de Política: Actualizar política basada en nueva función de valor
+            new_policy, policy_stable = self.policy_improvement(env, self.v)
+            
+            # Calcular cambio de política para métricas
+            if iterations > 0:
+                policy_change = float(jnp.sum(jnp.abs(new_policy - self.policy)) / (2 * self.n_states))
+                self.policy_changes.append(policy_change)
+            
+            self.policy = new_policy
+            iterations += 1
+            
+            # Registrar tiempo transcurrido
+            iteration_time = time.time() - iteration_start
+            self.policy_iteration_times.append(iteration_time)
+            
+            print(f"Iteración {iterations}: {iteration_time:.2f} segundos, " + 
+                  f"Iteraciones de evaluación: {self.eval_iteration_counts[-1]}")
+            
+            if policy_stable:
+                print("¡Política convergida!")
+        
+        total_time = time.time() - start_time
+        print(f"Iteración de política completada en {iterations} iteraciones, {total_time:.2f} segundos")
+        
+        history = {
+            'iterations': iterations,
+            'policy_changes': self.policy_changes,
+            'value_changes': self.value_changes,
+            'iteration_times': self.policy_iteration_times,
+            'eval_iterations': self.eval_iteration_counts,
+            'total_time': total_time
+        }
+        
+        return history
+    
+    def modified_policy_iteration(self, env: Any, k_eval: int = 5) -> Dict[str, List]:
+        """
+        Implementa la Iteración de Política Modificada que utiliza un número fijo
+        de iteraciones para la evaluación de política.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
+        k_eval : int, opcional
+            Número de iteraciones para evaluación de política (default: 5)
+            
+        Retorna:
+        --------
+        Dict[str, List]
+            Diccionario con historial de entrenamiento
+        """
+        print(f"Iniciando iteración de política modificada (k={k_eval})...")
+        
+        # Preparar matrices de transición
+        transition_probs, rewards, terminals = self._prepare_transition_matrices(env)
+        
+        policy_stable = False
+        iterations = 0
+        
+        start_time = time.time()
+        
+        # Inicializar función de valor
+        v = jnp.zeros(self.n_states)
+        
+        while not policy_stable and iterations < self.max_iterations:
+            iteration_start = time.time()
+            
+            # Evaluación de política parcial: k iteraciones
+            for _ in range(k_eval):
+                v = self._calculate_state_values(self.policy, v, transition_probs, rewards, terminals)
+            
+            # Calcular cambio de valor para métricas
+            if iterations > 0:
+                value_change = float(jnp.mean(jnp.abs(v - old_v)))
+                self.value_changes.append(value_change)
+            old_v = v
+            
+            # Mejora de Política: Actualizar política basada en nueva función de valor
+            new_policy, policy_stable = self.policy_improvement(env, v)
+            
+            # Calcular cambio de política para métricas
+            if iterations > 0:
+                policy_change = float(jnp.sum(jnp.abs(new_policy - self.policy)) / (2 * self.n_states))
+                self.policy_changes.append(policy_change)
+            
+            self.policy = new_policy
+            iterations += 1
+            
+            # Registrar tiempo transcurrido
+            iteration_time = time.time() - iteration_start
+            self.policy_iteration_times.append(iteration_time)
+            
+            print(f"Iteración {iterations}: {iteration_time:.2f} segundos")
+            
+            if policy_stable:
+                print("¡Política convergida!")
+        
+        # Evaluación final para obtener valores precisos
+        self.v = self.policy_evaluation(env, self.policy)
+        
+        total_time = time.time() - start_time
+        print(f"Iteración de política modificada completada en {iterations} iteraciones, {total_time:.2f} segundos")
+        
+        history = {
+            'iterations': iterations,
+            'policy_changes': self.policy_changes,
+            'value_changes': self.value_changes,
+            'iteration_times': self.policy_iteration_times,
+            'total_time': total_time
+        }
+        
+        return history
+    
+    def get_action(self, state: int) -> int:
+        """
+        Devuelve la mejor acción para un estado dado según la política actual.
+        
+        Parámetros:
+        -----------
+        state : int
+            Estado actual
+            
+        Retorna:
+        --------
+        int
+            Mejor acción
+        """
+        return int(jnp.argmax(self.policy[state]))
+    
+    def get_value(self, state: int) -> float:
+        """
+        Devuelve el valor de un estado según la función de valor actual.
+        
+        Parámetros:
+        -----------
+        state : int
+            Estado para obtener su valor
+            
+        Retorna:
+        --------
+        float
+            Valor del estado
+        """
+        return float(self.v[state])
+    
+    def evaluate(self, env: Any, max_steps: int = 100, episodes: int = 10) -> float:
+        """
+        Evalúa la política actual en el entorno.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno para evaluar
+        max_steps : int, opcional
+            Pasos máximos por episodio (default: 100)
+        episodes : int, opcional
+            Número de episodios para evaluar (default: 10)
+            
+        Retorna:
+        --------
+        float
+            Recompensa promedio en los episodios
+        """
+        total_rewards = []
+        episode_lengths = []
+        
+        for _ in range(episodes):
+            state, _ = env.reset()
+            done = False
+            total_reward = 0
+            steps = 0
+            
+            while not done and steps < max_steps:
+                action = self.get_action(state)
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                
+                total_reward += reward
+                state = next_state
+                steps += 1
+            
+            total_rewards.append(total_reward)
+            episode_lengths.append(steps)
+        
+        avg_reward = float(np.mean(total_rewards))
+        avg_length = float(np.mean(episode_lengths))
+        print(f"Evaluación: recompensa media en {episodes} episodios = {avg_reward:.2f}, " +
+              f"longitud media = {avg_length:.2f}")
+        
+        return avg_reward
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda la política y función de valor en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        # Convertir arrays JAX a NumPy para serialización
+        data = {
+            'policy': np.array(self.policy),
+            'v': np.array(self.v),
+            'n_states': self.n_states,
+            'n_actions': self.n_actions,
+            'gamma': self.gamma
+        }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(data, f)
+        
+        print(f"Modelo guardado en {filepath}")
+    
+    def load(self, filepath: str) -> None:
+        """
+        Carga la política y función de valor desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
+        with open(filepath, 'rb') as f:
+            data = pickle.load(f)
+        
+        # Convertir arrays NumPy a JAX
+        self.policy = jnp.array(data['policy'])
+        self.v = jnp.array(data['v'] if 'v' in data else data.get('V', np.zeros(data['n_states'])))
+        self.n_states = data['n_states']
+        self.n_actions = data['n_actions']
+        self.gamma = data['gamma']
+        
+        print(f"Modelo cargado desde {filepath}")
+    
+    def compare_with_value_iteration(
+        self, 
+        env: Any, 
+        max_iterations: int = POLICY_ITERATION_CONFIG['max_iterations']
+    ) -> Dict[str, List]:
+        """
+        Compara Iteración de Política con Iteración de Valor.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con dinámicas de transición
+        max_iterations : int, opcional
+            Número máximo de iteraciones (default: POLICY_ITERATION_CONFIG['max_iterations'])
+            
+        Retorna:
+        --------
+        Dict[str, List]
+            Diccionario con resultados de la comparación
+        """
+        # Guardar configuración original
+        original_max_iterations = self.max_iterations
+        self.max_iterations = max_iterations
+        
+        # Preparar matrices de transición
+        transition_probs, rewards, terminals = self._prepare_transition_matrices(env)
+        
+        # Resultados de la comparación
+        comparison = {
+            'policy_iteration': {'time': 0, 'iterations': 0, 'values': []},
+            'value_iteration': {'time': 0, 'iterations': 0, 'values': []}
+        }
+        
+        # Ejecutar Iteración de Política
+        print("\n--- Iteración de Política ---")
+        pi_start = time.time()
+        pi_history = self.train(env)
+        pi_time = time.time() - pi_start
+        pi_values = np.array(self.v)
+        
+        comparison['policy_iteration']['time'] = pi_time
+        comparison['policy_iteration']['iterations'] = pi_history['iterations']
+        comparison['policy_iteration']['values'] = pi_values
+        
+        # Compilar función de valor-iteración para mayor velocidad
+        @jax.jit
+        def value_iteration_step(v: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+            # Calcular valores para todas las acciones en todos los estados
+            expected_values = rewards + self.gamma * jnp.einsum(self.EINSUM_PATTERN, transition_probs, v)
+            expected_values = jnp.where(terminals, rewards, expected_values)
+            expected_values = jnp.where(terminals, rewards, expected_values)
+            
+            # Tomar el máximo valor para cada estado
+            new_v = jnp.max(expected_values, axis=1)
+            delta = jnp.max(jnp.abs(new_v - v))
+            
+            return new_v, delta
+        
+        # Ejecutar Iteración de Valor
+        print("\n--- Iteración de Valor ---")
+        vi_start = time.time()
+        v = jnp.zeros(self.n_states)
+        vi_iterations = 0
+        
+        for i in range(max_iterations):
+            v, delta = value_iteration_step(v)
+            vi_iterations = i + 1
+            
+            # Verificar convergencia
+            if delta < self.theta:
+                break
+        
+        # Calcular valores para todas las acciones
+        expected_values = rewards + self.gamma * jnp.einsum(self.EINSUM_PATTERN, transition_probs, v)
+        expected_values = jnp.where(terminals, rewards, expected_values)
+        expected_values = jnp.where(terminals, rewards, expected_values)
+        
+        # La política es determinista, eligiendo la mejor acción
+        best_actions = jnp.argmax(expected_values, axis=1)
+        value_based_policy = jnp.zeros((self.n_states, self.n_actions))
+        value_based_policy = value_based_policy.at[jnp.arange(self.n_states), best_actions].set(1.0)
+        
+        vi_time = time.time() - vi_start
+        
+        comparison['value_iteration']['time'] = vi_time
+        comparison['value_iteration']['iterations'] = vi_iterations
+        comparison['value_iteration']['values'] = np.array(v)
+        
+        # Calcular diferencia entre políticas
+        pi_actions = np.argmax(np.array(self.policy), axis=1)
+        vi_actions = np.array(best_actions)
+        policy_difference = np.sum(pi_actions != vi_actions) / self.n_states
+        value_difference = np.mean(np.abs(pi_values - np.array(v)))
+        
+        # Mostrar resultados
+        print("\n--- Comparación ---")
+        print(f"Iteración de Política: {pi_history['iterations']} iteraciones, {pi_time:.2f} segundos")
+        print(f"Iteración de Valor: {vi_iterations} iteraciones, {vi_time:.2f} segundos")
+        print(f"Diferencia en política: {policy_difference:.2%}")
+        print(f"Diferencia en valores: {value_difference:.6f}")
+        
+        # Restaurar configuración original
+        self.max_iterations = original_max_iterations
+        
+        return comparison
+    
+    def _get_grid_position(self, env: Any, state: int, grid_shape: Tuple[int, int]) -> Tuple[int, int]:
+        """
+        Obtiene la posición en la cuadrícula para un estado.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con estructura de cuadrícula
+        state : int
+            Estado a convertir
+        grid_shape : Tuple[int, int]
+            Forma de la cuadrícula
+            
+        Retorna:
+        --------
+        Tuple[int, int]
+            Posición (fila, columna) en la cuadrícula
+        """
+        if hasattr(env, 'state_mapping'):
+            return env.state_mapping(state)
+        # Asumir orden row-major
+        return state // grid_shape[1], state % grid_shape[1]
+    
+    def _is_terminal_state(self, env: Any, state: int) -> bool:
+        """
+        Verifica si un estado es terminal.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno
+        state : int
+            Estado a verificar
+            
+        Retorna:
+        --------
+        bool
+            True si el estado es terminal, False en caso contrario
+        """
+        for action in range(self.n_actions):
+            for transitions in env.P[state][action]:
+                if len(transitions) >= 3 and transitions[2]:  # done
+                    return True
+        return False
+    
+    def _setup_grid(self, ax: plt.Axes, grid_shape: Tuple[int, int]) -> None:
+        """
+        Configura la cuadrícula en los ejes.
+        
+        Parámetros:
+        -----------
+        ax : plt.Axes
+            Ejes donde dibujar
+        grid_shape : Tuple[int, int]
+            Forma de la cuadrícula
+        """
+        # Crear cuadrícula
+        ax.set_xlim([0, grid_shape[1]])
+        ax.set_ylim([0, grid_shape[0]])
+        
+        # Dibujar líneas de cuadrícula
+        for i in range(grid_shape[1] + 1):
+            ax.axvline(i, color='black', linestyle='-')
+        for j in range(grid_shape[0] + 1):
+            ax.axhline(j, color='black', linestyle='-')
+    
+    def _draw_policy_arrows(self, ax: plt.Axes, env: Any, policy_np: np.ndarray, grid_shape: Tuple[int, int]) -> None:
+        """
+        Dibuja flechas representando la política.
+        
+        Parámetros:
+        -----------
+        ax : plt.Axes
+            Ejes donde dibujar
+        env : Any
+            Entorno
+        policy_np : np.ndarray
+            Política en formato NumPy
+        grid_shape : Tuple[int, int]
+            Forma de la cuadrícula
+        """
+        # Definir direcciones de flechas
+        directions = {
+            0: (0, -0.4),  # Izquierda
+            1: (0, 0.4),   # Derecha
+            2: (-0.4, 0),  # Abajo
+            3: (0.4, 0)    # Arriba
+        }
+        
+        for s in range(self.n_states):
+            if self._is_terminal_state(env, s):
+                continue
+                
+            i, j = self._get_grid_position(env, s, grid_shape)
+            action = np.argmax(policy_np[s])
+            
+            if action in directions:
+                dx, dy = directions[action]
+                ax.arrow(j + 0.5, grid_shape[0] - i - 0.5, dx, dy, 
+                        head_width=0.1, head_length=0.1, fc='blue', ec='blue')
+    
+    def _draw_state_values(self, ax: plt.Axes, env: Any, v_np: np.ndarray, grid_shape: Tuple[int, int]) -> None:
+        """
+        Dibuja los valores de los estados en la cuadrícula.
+        
+        Parámetros:
+        -----------
+        ax : plt.Axes
+            Ejes donde dibujar
+        env : Any
+            Entorno
+        v_np : np.ndarray
+            Función de valor en formato NumPy
+        grid_shape : Tuple[int, int]
+            Forma de la cuadrícula
+        """
+        for s in range(self.n_states):
+            i, j = self._get_grid_position(env, s, grid_shape)
+            value = v_np[s]
+            ax.text(j + 0.5, grid_shape[0] - i - 0.5, f"{value:.2f}", 
+                  ha='center', va='center', color='red', fontsize=9)
+    
+    def visualize_policy(self, env: Any, title: str = "Política") -> None:
+        """
+        Visualiza la política para entornos de tipo cuadrícula.
+        
+        Parámetros:
+        -----------
+        env : Any
+            Entorno con estructura de cuadrícula
+        title : str, opcional
+            Título para la visualización (default: "Política")
+        """
+        if not hasattr(env, 'shape'):
+            print("El entorno no tiene estructura de cuadrícula para visualización")
+            return
+        
+        # Convertir a NumPy para visualización
+        policy_np = np.array(self.policy)
+        v_np = np.array(self.v)
+        
+        grid_shape = env.shape
+        _, ax = plt.subplots(figsize=(8, 8))
+        
+        # Configurar y dibujar elementos
+        self._setup_grid(ax, grid_shape)
+        self._draw_policy_arrows(ax, env, policy_np, grid_shape)
+        self._draw_state_values(ax, env, v_np, grid_shape)
+        
+        ax.set_title(title)
+        plt.tight_layout()
+        plt.show()
+    
+    def visualize_training(self, history: Dict[str, List]) -> None:
+        """
+        Visualiza las métricas de entrenamiento.
+        
+        Parámetros:
+        -----------
+        history : Dict[str, List]
+            Diccionario con historial de entrenamiento
+        """
+        _, axs = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Gráfico de cambios en la política
+        if 'policy_changes' in history and history['policy_changes']:
+            x = range(1, len(history['policy_changes']) + 1)
+            axs[0, 0].plot(x, history['policy_changes'], marker='o')
+            axs[0, 0].set_title('Cambios en la Política')
+            axs[0, 0].set_xlabel(self.ITERATION_LABEL)
+            axs[0, 0].set_ylabel('Cambio de Política')
+            axs[0, 0].grid(True)
+        
+        # Gráfico de cambios en la función de valor
+        if 'value_changes' in history and history['value_changes']:
+            x = range(1, len(history['value_changes']) + 1)
+            axs[0, 1].plot(x, history['value_changes'], marker='o')
+            axs[0, 1].set_title('Cambios en la Función de Valor')
+            axs[0, 1].set_xlabel(self.ITERATION_LABEL)
+            axs[0, 1].set_ylabel('Cambio Promedio de Valor')
+            axs[0, 1].grid(True)
+        
+        # Gráfico de tiempos de iteración
+        if 'iteration_times' in history and history['iteration_times']:
+            x = range(1, len(history['iteration_times']) + 1)
+            axs[1, 0].plot(x, history['iteration_times'], marker='o')
+            axs[1, 0].set_title('Tiempos de Iteración')
+            axs[1, 0].set_xlabel(self.ITERATION_LABEL)
+            axs[1, 0].set_ylabel('Tiempo (segundos)')
+            axs[1, 0].grid(True)
+        
+        # Gráfico de iteraciones de evaluación
+        if 'eval_iterations' in history and history['eval_iterations']:
+            x = range(1, len(history['eval_iterations']) + 1)
+            axs[1, 1].plot(x, history['eval_iterations'], marker='o')
+            axs[1, 1].set_title('Iteraciones de Evaluación de Política')
+            axs[1, 1].set_xlabel('Iteración de Política')
+            axs[1, 1].set_ylabel('Número de Iteraciones')
+            axs[1, 1].grid(True)
+        
+        plt.tight_layout()
+        plt.show()
