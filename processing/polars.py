@@ -27,13 +27,6 @@ CONFIG = {
     "low_dose_threshold": 7.0  # Clinical threshold for low-dose insulin
 }
 
-# Definición de la ruta del proyecto
-SUBJECTS_RELATIVE_PATH = "data/Subjects"
-SUBJECTS_PATH = os.path.join(PROJECT_ROOT, SUBJECTS_RELATIVE_PATH)
-
-subject_files = [f for f in os.listdir(SUBJECTS_PATH) if f.startswith("Subject") and f.endswith(".xlsx")]
-print(f"Total sujetos: {len(subject_files)}")
-
 def get_cgm_window(bolus_time, cgm_df: pl.DataFrame, window_hours: int=CONFIG["window_hours"]) -> np.ndarray:
     """
     Obtiene la ventana de datos CGM para un tiempo de bolo específico.
@@ -307,10 +300,10 @@ def preprocess_data(subject_folder: str) -> pl.DataFrame:
 
     # Aplicar transformaciones logarítmicas (np.log1p) como en pandas.py
     df_processed = df_processed.with_columns([
-        pl.col("normal").map_elements(np.log1p).alias("normal"),
-        pl.col("carbInput").map_elements(np.log1p).alias("carbInput"),
-        pl.col("insulinOnBoard").map_elements(np.log1p).alias("insulinOnBoard"),
-        pl.col("bgInput").map_elements(np.log1p).alias("bgInput")
+        pl.col("normal").log1p().alias("normal"),
+        pl.col("carbInput").log1p().alias("carbInput"),
+        pl.col("insulinOnBoard").log1p().alias("insulinOnBoard"),
+        pl.col("bgInput").log1p().alias("bgInput")
     ])
     
     # Para cgm_window, necesitamos extraer, transformar y volver a empaquetar
