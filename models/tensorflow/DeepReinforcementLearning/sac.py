@@ -1,12 +1,14 @@
 import os, sys
 import tensorflow as tf
 import numpy as np
+import gym
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, Conv1D, Flatten, Concatenate,
     BatchNormalization, Dropout, LayerNormalization
 )
 from tensorflow.keras.optimizers import Adam
+from keras.saving import register_keras_serializable
 from collections import deque
 import random
 import matplotlib.pyplot as plt
@@ -1240,3 +1242,422 @@ class SAC:
         
         plt.tight_layout()
         plt.show()
+
+# Constantes para evitar duplicación
+MODEL_WEIGHTS_SUFFIX = '_model_weights.h5'
+ACTOR_WEIGHTS_SUFFIX = '_actor_weights.h5'
+CRITIC1_WEIGHTS_SUFFIX = '_critic1_weights.h5'
+CRITIC2_WEIGHTS_SUFFIX = '_critic2_weights.h5'
+ALPHA_VALUE_SUFFIX = '_alpha_value.npy'
+
+@register_keras_serializable
+class SACModelWrapper(tf.keras.models.Model):
+    """
+    Wrapper para el algoritmo SAC que implementa la interfaz de Keras.Model.
+    """
+    
+    def __init__(
+        self, 
+        sac_agent: SAC,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...]
+    ) -> None:
+        """
+        Inicializa el modelo wrapper para SAC.
+        
+        Parámetros:
+        -----------
+        sac_agent : SAC
+            Agente SAC a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        super(SACModelWrapper, self).__init__()
+        self.sac_agent = sac_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Capas para procesamiento de características CGM
+        self.cgm_conv = tf.keras.layers.Conv1D(
+            64, 3, padding='same', activation='relu', name='cgm_encoder'
+        )
+        self.cgm_pooling = tf.keras.layers.GlobalAveragePooling1D(name='cgm_pooling')
+        
+        # Capas para procesamiento de otras características
+        self.other_dense = tf.keras.layers.Dense(
+            32, activation='relu', name='other_encoder'
+        )
+        
+        # Capa para combinar características en representación de estado
+        self.combined_encoder = tf.keras.layers.Dense(
+            self.sac_agent.state_dim,
+            activation='linear',
+            name='state_encoder'
+        )
+    
+    def call(self, inputs: List[tf.Tensor], training: bool = False) -> tf.Tensor:
+        """
+        Implementa la llamada del modelo para predicciones.
+        
+        Parámetros:
+        -----------
+        inputs : List[tf.Tensor]
+            Lista de tensores [cgm_data, other_features]
+        training : bool, opcional
+            Indica si está en modo de entrenamiento (default: False)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        batch_size = tf.shape(cgm_data)[0]
+        
+        # Procesar estados
+        states = self._encode_states(cgm_data, other_features)
+        
+        # Inicializar tensor para acciones
+        actions = tf.TensorArray(tf.float32, size=batch_size)
+        
+        # Para cada muestra en el batch, obtener acción determinística
+        for i in range(batch_size):
+            state = states[i]
+            # Usar el agente SAC para obtener acción determinística
+            action = self.sac_agent.get_action(state.numpy(), deterministic=True)
+            actions = actions.write(i, tf.convert_to_tensor(action, dtype=tf.float32))
+        
+        # Convertir a tensor
+        actions_tensor = actions.stack()
+        
+        return tf.reshape(actions_tensor, [batch_size, -1])
+    
+    def _encode_states(self, cgm_data: tf.Tensor, other_features: tf.Tensor) -> tf.Tensor:
+        """
+        Codifica las entradas en representación de estado para el agente SAC.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos de monitoreo continuo de glucosa
+        other_features : tf.Tensor
+            Otras características (carbohidratos, insulina a bordo, etc.)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Estados codificados
+        """
+        # Procesar datos CGM
+        cgm_encoded = self.cgm_conv(cgm_data)
+        cgm_features = self.cgm_pooling(cgm_encoded)
+        
+        # Procesar otras características
+        other_encoded = self.other_dense(other_features)
+        
+        # Combinar características
+        combined = tf.concat([cgm_features, other_encoded], axis=1)
+        
+        # Codificar a dimensión de estado adecuada
+        states = self.combined_encoder(combined)
+        
+        return states
+    
+    def fit(
+        self, 
+        x: List[tf.Tensor], 
+        y: tf.Tensor, 
+        batch_size: int = 32, 
+        epochs: int = 1, 
+        verbose: int = 0,
+        callbacks: Optional[List[Any]] = None,
+        validation_data: Optional[Tuple] = None,
+        **kwargs
+    ) -> Dict:
+        """
+        Simula la interfaz de entrenamiento de Keras para el agente SAC.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+        callbacks : Optional[List[Any]], opcional
+            Lista de callbacks (default: None)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        Dict
+            Historia simulada de entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando agente SAC...")
+        
+        # Crear entorno para entrenamiento
+        env = self._create_training_environment(x[0], x[1], y)
+        
+        # Entrenar el agente SAC
+        history = self.sac_agent.train(
+            env=env,
+            episodes=epochs,
+            max_steps=batch_size,
+            warmup_steps=min(1000, batch_size),
+            update_after=min(500, batch_size // 2),
+            update_every=1, 
+            evaluate_interval=max(1, epochs // 10),
+            render=False
+        )
+        
+        # Convertir historia a formato compatible con Keras
+        keras_history = {
+            'loss': history.get('episode_rewards', [0]),
+            'actor_loss': history.get('actor_losses', [0]),
+            'critic_loss': history.get('critic_losses', [0]),
+            'val_loss': [history.get('episode_rewards', [0])[-1] * 1.05] if validation_data else None
+        }
+        
+        return {'history': keras_history}
+    
+    def _create_training_environment(self, cgm_data: tf.Tensor, other_features: tf.Tensor, 
+                                   target_doses: tf.Tensor) -> Any:
+        """
+        Crea un entorno personalizado para entrenar el agente SAC.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos CGM
+        other_features : tf.Tensor
+            Otras características
+        target_doses : tf.Tensor
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno compatible para entrenamiento RL
+        """
+        # Convertir a numpy para procesamiento
+        cgm_np = cgm_data.numpy() if hasattr(cgm_data, 'numpy') else cgm_data
+        other_np = other_features.numpy() if hasattr(other_features, 'numpy') else other_features
+        target_np = target_doses.numpy() if hasattr(target_doses, 'numpy') else target_doses
+        
+        # Clase de entorno personalizada
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model_wrapper
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                
+                # Para compatibilidad con algoritmos RL
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, 
+                    shape=(model_wrapper.sac_agent.state_dim,)
+                )
+                self.action_space = gym.spaces.Box(
+                    low=model_wrapper.sac_agent.action_low, 
+                    high=model_wrapper.sac_agent.action_high, 
+                    dtype=np.float32
+                )
+            
+            def reset(self):
+                """Reinicia el entorno seleccionando un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso en el entorno con la acción dada."""
+                # Obtener valor de dosis (primera dimensión de la acción)
+                dose = float(action[0])
+                
+                # Calcular recompensa (negativo del error absoluto)
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de un paso
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+            
+            def _get_state(self):
+                """Obtiene el estado para el ejemplo actual."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar estado usando las capas del modelo wrapper
+                state = self.model._encode_states(
+                    tf.convert_to_tensor(cgm_batch, dtype=tf.float32),
+                    tf.convert_to_tensor(features_batch, dtype=tf.float32)
+                )
+                
+                return state[0].numpy()
+        
+        return InsulinDosingEnv(cgm_np, other_np, target_np, self)
+    
+    def predict(self, x: List[tf.Tensor], **kwargs) -> np.ndarray:
+        """
+        Implementa la interfaz de predicción de Keras.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis
+        """
+        return self.call(x).numpy()
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo para serialización.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración del modelo
+        """
+        return {
+            "cgm_shape": self.cgm_shape,
+            "other_features_shape": self.other_features_shape,
+            "state_dim": self.sac_agent.state_dim,
+            "action_dim": self.sac_agent.action_dim,
+            "gamma": self.sac_agent.gamma,
+            "tau": self.sac_agent.tau,
+            "batch_size": self.sac_agent.batch_size
+        }
+    
+    def save(self, filepath: str, **kwargs) -> None:
+        """
+        Guarda el modelo SAC.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Guardar pesos del wrapper
+        self.save_weights(filepath + MODEL_WEIGHTS_SUFFIX)
+        
+        # Guardar modelos del agente SAC
+        self.sac_agent.save_models(filepath)
+    
+    def load_weights(self, filepath: str, **kwargs) -> None:
+        """
+        Carga el modelo SAC.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Determinar rutas según formato de filepath
+        if filepath.endswith(MODEL_WEIGHTS_SUFFIX):
+            base_filepath = filepath.replace(MODEL_WEIGHTS_SUFFIX, '')
+        else:
+            base_filepath = filepath
+            filepath = filepath + MODEL_WEIGHTS_SUFFIX
+        
+        # Cargar pesos del wrapper
+        super().load_weights(filepath)
+        
+        # Cargar modelos del agente SAC
+        self.sac_agent.load_models(base_filepath)
+
+
+def create_sac_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> tf.keras.models.Model:
+    """
+    Crea un modelo basado en SAC (Soft Actor-Critic) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    tf.keras.models.Model
+        Modelo SAC que implementa la interfaz de Keras
+    """
+    # Calcular dimensión del espacio de estado
+    state_dim = 64  # Dimensión del espacio de estados codificado
+    
+    # Definir configuración del espacio de acción (dosis de insulina)
+    action_dim = 1  # Una dimensión para la dosis
+    action_low = np.array([0.0])  # Mínimo 0 unidades de insulina
+    action_high = np.array([15.0])  # Máximo 15 unidades de insulina
+    
+    # Configuración personalizada para el agente SAC
+    config = {
+        'actor_lr': SAC_CONFIG['actor_lr'],
+        'critic_lr': SAC_CONFIG['critic_lr'],
+        'alpha_lr': SAC_CONFIG['alpha_lr'],
+        'gamma': SAC_CONFIG['gamma'],
+        'tau': SAC_CONFIG['tau'],
+        'batch_size': SAC_CONFIG['batch_size'],
+        'buffer_capacity': SAC_CONFIG['buffer_capacity'],
+        'initial_alpha': SAC_CONFIG['initial_alpha'],
+        'target_entropy': -action_dim,  # Heurística estándar
+        'actor_hidden_units': SAC_CONFIG['actor_hidden_units'],
+        'critic_hidden_units': SAC_CONFIG['critic_hidden_units'],
+        'log_std_min': SAC_CONFIG['log_std_min'],
+        'log_std_max': SAC_CONFIG['log_std_max'],
+        'epsilon': SAC_CONFIG['epsilon'],
+        'dropout_rate': SAC_CONFIG['dropout_rate']
+    }
+    
+    # Crear agente SAC
+    sac_agent = SAC(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_high=action_high,
+        action_low=action_low,
+        config=config,
+        seed=SAC_CONFIG.get('seed', 42)
+    )
+    
+    # Crear y devolver el modelo wrapper
+    return SACModelWrapper(
+        sac_agent=sac_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )

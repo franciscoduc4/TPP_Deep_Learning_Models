@@ -4,12 +4,14 @@ import numpy as np
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, Conv1D, Flatten, Concatenate,
-    BatchNormalization, Dropout, LayerNormalization
+    BatchNormalization, Dropout, LayerNormalization, GlobalAveragePooling1D
 )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import Huber
+from keras.saving import register_keras_serializable
 from collections import deque
 import random
+import gym
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Any, Optional, Union, Callable
 
@@ -1008,3 +1010,463 @@ class DQN:
         
         plt.tight_layout()
         plt.show()
+
+# Constantes para evitar duplicación
+CGM_ENCODER = 'cgm_encoder'
+OTHER_ENCODER = 'other_encoder'
+STATE_ENCODER = 'state_encoder'
+Q_OUTPUT = 'q_output'
+VALUE_OUTPUT = 'value_output'
+ADVANTAGE_OUTPUT = 'advantage_output'
+MODEL_WEIGHTS_SUFFIX = '_model_weights.h5'
+QTABLE_WEIGHTS_SUFFIX = '_qtable_weights.h5'
+
+
+@register_keras_serializable
+class DQNModelWrapper(Model):
+    """
+    Wrapper para el algoritmo DQN que implementa la interfaz de Keras.Model.
+    """
+    
+    def __init__(
+        self, 
+        dqn_agent: DQN,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...]
+    ) -> None:
+        """
+        Inicializa el modelo wrapper para DQN.
+        
+        Parámetros:
+        -----------
+        dqn_agent : DQN
+            Agente DQN a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        super(DQNModelWrapper, self).__init__()
+        self.dqn_agent = dqn_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Capas para procesar entrada CGM
+        self.cgm_conv = Conv1D(64, 3, padding='same', activation='relu', name=f'{CGM_ENCODER}_conv')
+        self.cgm_pooling = GlobalAveragePooling1D(name=f'{CGM_ENCODER}_pooling')
+        
+        # Capas para procesar otras características
+        self.other_dense = Dense(32, activation='relu', name=OTHER_ENCODER)
+        
+        # Capa para combinar características en representación de estado
+        self.state_dense = Dense(self.dqn_agent.state_dim, activation='relu', name=STATE_ENCODER)
+        
+        # Capa para convertir salida Q a dosis continua
+        self.dose_predictor = Dense(1, kernel_initializer='glorot_uniform', name='dose_predictor')
+        
+    def call(self, inputs: List[tf.Tensor], training: bool = False) -> tf.Tensor:
+        """
+        Implementa la llamada del modelo para predicciones.
+        
+        Parámetros:
+        -----------
+        inputs : List[tf.Tensor]
+            Lista de tensores [cgm_data, other_features]
+        training : bool, opcional
+            Indica si está en modo de entrenamiento (default: False)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones de dosis de insulina
+        """
+        # Procesar entradas
+        cgm_data, other_features = inputs
+        batch_size = tf.shape(cgm_data)[0]
+        
+        # Codificar entradas a representación de estado
+        states = self._encode_states(cgm_data, other_features)
+        
+        # Inicializar tensor para acciones
+        actions = tf.TensorArray(tf.float32, size=batch_size)
+        
+        # Para cada muestra, obtener acción del agente DQN (sin exploración)
+        for i in range(batch_size):
+            state = states[i]
+            # Usar el agente DQN para obtener acción determinística
+            action = self.dqn_agent.q_network.get_action(state.numpy(), epsilon=0.0)
+            actions = actions.write(i, tf.cast(action, tf.float32))
+        
+        # Convertir a tensor
+        actions_tensor = tf.reshape(actions.stack(), [batch_size, 1])
+        
+        # Convertir acción discreta a dosis continua
+        doses = self._map_actions_to_doses(actions_tensor)
+        
+        return doses
+    
+    def _encode_states(self, cgm_data: tf.Tensor, other_features: tf.Tensor) -> tf.Tensor:
+        """
+        Codifica las entradas en una representación de estado para el agente DQN.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos de monitoreo continuo de glucosa
+        other_features : tf.Tensor
+            Otras características (carbohidratos, insulina a bordo, etc.)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Estados codificados
+        """
+        # Procesar datos CGM
+        cgm_encoded = self.cgm_conv(cgm_data)
+        cgm_features = self.cgm_pooling(cgm_encoded)
+        
+        # Procesar otras características
+        other_encoded = self.other_dense(other_features)
+        
+        # Combinar características
+        combined = tf.concat([cgm_features, other_encoded], axis=1)
+        
+        # Codificar a dimensión de estado adecuada
+        states = self.state_dense(combined)
+        
+        return states
+    
+    def _map_actions_to_doses(self, actions: tf.Tensor) -> tf.Tensor:
+        """
+        Mapea índices de acciones discretas a valores continuos de dosis.
+        
+        Parámetros:
+        -----------
+        actions : tf.Tensor
+            Índices de acciones discretas
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Valores de dosis de insulina
+        """
+        # Convertir índices a representación one-hot
+        action_one_hot = tf.one_hot(tf.cast(actions, tf.int32), self.dqn_agent.action_dim)
+        
+        # Convertir a valores de dosis
+        doses = self.dose_predictor(action_one_hot)
+        
+        return doses
+    
+    def fit(
+        self, 
+        x: List[tf.Tensor], 
+        y: tf.Tensor, 
+        batch_size: int = 32, 
+        epochs: int = 1, 
+        verbose: int = 0,
+        callbacks: Optional[List[Any]] = None,
+        validation_data: Optional[Tuple] = None,
+        **kwargs
+    ) -> Dict:
+        """
+        Simula la interfaz de entrenamiento de Keras para el agente DQN.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+        callbacks : Optional[List[Any]], opcional
+            Lista de callbacks (default: None)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        Dict
+            Historia simulada de entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando agente DQN...")
+        
+        # Crear entorno para entrenamiento
+        env = self._create_training_environment(x[0], x[1], y)
+        
+        # Entrenar el agente DQN
+        train_history = self.dqn_agent.train(
+            env=env,
+            episodes=epochs,
+            max_steps=batch_size,
+            update_after=min(1000, batch_size),  # Empezar a actualizar después de acumular suficientes experiencias
+            update_every=4,  # Actualizar red cada 4 pasos
+            render=False,
+            log_interval=max(1, epochs // 10) if verbose > 0 else epochs + 1
+        )
+        
+        # Calibrar mapeo de acciones a dosis
+        self._calibrate_dose_predictor(y)
+        
+        # Convertir a formato compatible con Keras
+        keras_history = {
+            'loss': train_history.get('losses', [0.0]),
+            'episode_rewards': train_history.get('episode_rewards', [0.0]),
+            'val_loss': [train_history.get('losses', [0.0])[-1] * 1.05] if validation_data is not None else None
+        }
+        
+        if verbose > 0:
+            print("Entrenamiento DQN completado.")
+        
+        return {'history': keras_history}
+    
+    def _create_training_environment(self, cgm_data: tf.Tensor, other_features: tf.Tensor, 
+                                   target_doses: tf.Tensor) -> Any:
+        """
+        Crea un entorno personalizado para entrenar el agente DQN.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos CGM
+        other_features : tf.Tensor
+            Otras características
+        target_doses : tf.Tensor
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno compatible para entrenamiento RL
+        """
+        # Convertir tensores a numpy para procesamiento
+        cgm_np = cgm_data.numpy() if hasattr(cgm_data, 'numpy') else cgm_data
+        other_np = other_features.numpy() if hasattr(other_features, 'numpy') else other_features
+        target_np = target_doses.numpy() if hasattr(target_doses, 'numpy') else target_doses
+        
+        # Clase de entorno personalizada
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Para compatibilidad con algoritmos RL
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, 
+                    shape=(model_wrapper.dqn_agent.state_dim,)
+                )
+                self.action_space = gym.spaces.Discrete(model_wrapper.dqn_agent.action_dim)
+            
+            def reset(self):
+                """Reinicia el entorno seleccionando un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso en el entorno con la acción dada."""
+                # Convertir acción discreta a dosis
+                dose = action / (self.model.dqn_agent.action_dim - 1) * 15.0  # Max 15 unidades
+                
+                # Calcular recompensa (negativo del error absoluto)
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de una acción
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+            
+            def _get_state(self):
+                """Obtiene el estado codificado para el ejemplo actual."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar estado usando las capas del modelo wrapper
+                state = self.model._encode_states(
+                    tf.convert_to_tensor(cgm_batch, dtype=tf.float32),
+                    tf.convert_to_tensor(features_batch, dtype=tf.float32)
+                )
+                
+                return state[0].numpy()
+            
+            def render(self):
+                """Renderización dummy del entorno (no implementada)."""
+                pass
+        
+        return InsulinDosingEnv(cgm_np, other_np, target_np, self)
+    
+    def _calibrate_dose_predictor(self, y: tf.Tensor) -> None:
+        """
+        Calibra la capa que mapea acciones discretas a dosis continuas.
+        
+        Parámetros:
+        -----------
+        y : tf.Tensor
+            Dosis objetivo para calibración
+        """
+        y_np = y.numpy() if hasattr(y, 'numpy') else y
+        max_dose = np.max(y_np)
+        min_dose = np.min(y_np)
+        
+        # Configurar pesos para convertir índices discretos a dosis continuas
+        self.dose_predictor.set_weights([
+            np.ones((self.dqn_agent.action_dim, 1)) * (max_dose - min_dose) / self.dqn_agent.action_dim,
+            np.array([min_dose])
+        ])
+    
+    def predict(self, x: List[tf.Tensor], **kwargs) -> np.ndarray:
+        """
+        Implementa la interfaz de predicción de Keras.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis
+        """
+        return self.call(x).numpy()
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo para serialización.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración del modelo
+        """
+        return {
+            "cgm_shape": self.cgm_shape,
+            "other_features_shape": self.other_features_shape,
+            "state_dim": self.dqn_agent.state_dim,
+            "action_dim": self.dqn_agent.action_dim
+        }
+    
+    def save(self, filepath: str, **kwargs) -> None:
+        """
+        Guarda el modelo DQN.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Guardar pesos del wrapper
+        self.save_weights(filepath + MODEL_WEIGHTS_SUFFIX)
+        
+        # Guardar pesos de la red Q
+        self.dqn_agent.save_model(filepath + QTABLE_WEIGHTS_SUFFIX)
+        
+    def load_weights(self, filepath: str, **kwargs) -> None:
+        """
+        Carga el modelo DQN.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Determinar rutas según formato de filepath
+        if filepath.endswith(MODEL_WEIGHTS_SUFFIX):
+            wrapper_path = filepath
+            qtable_path = filepath.replace(MODEL_WEIGHTS_SUFFIX, QTABLE_WEIGHTS_SUFFIX)
+        else:
+            wrapper_path = filepath + MODEL_WEIGHTS_SUFFIX
+            qtable_path = filepath + QTABLE_WEIGHTS_SUFFIX
+        
+        # Cargar pesos del wrapper
+        super().load_weights(wrapper_path)
+        
+        # Cargar red Q
+        self.dqn_agent.load_model(qtable_path)
+
+
+def create_dqn_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> Model:
+    """
+    Crea un modelo basado en DQN (Deep Q-Network) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    Model
+        Modelo DQN que implementa la interfaz de Keras
+    """
+    # Calcular dimensión del espacio de estados combinado
+    state_dim = 64  # Dimensión del espacio de estados codificado
+    
+    # Configurar espacio de acciones (niveles discretos de dosis)
+    action_dim = 20  # 20 niveles discretos para dosis de 0 a 15 unidades
+    
+    # Crear configuración personalizada para el agente DQN
+    config = {
+        'learning_rate': DQN_CONFIG['learning_rate'],
+        'gamma': DQN_CONFIG['gamma'],
+        'epsilon_start': DQN_CONFIG['epsilon_start'],
+        'epsilon_end': DQN_CONFIG['epsilon_end'],
+        'epsilon_decay': DQN_CONFIG['epsilon_decay'],
+        'buffer_capacity': DQN_CONFIG['buffer_capacity'],
+        'batch_size': DQN_CONFIG['batch_size'],
+        'target_update_freq': DQN_CONFIG['target_update_freq'],
+        'dueling': DQN_CONFIG['dueling'],  # Usar arquitectura Dueling DQN
+        'double': DQN_CONFIG['double'],  # Usar Double DQN
+        'prioritized': DQN_CONFIG['prioritized'],  # Usar PER
+        'hidden_units': DQN_CONFIG['hidden_units'],
+        'dropout_rate': DQN_CONFIG['dropout_rate'],
+        'activation': DQN_CONFIG['activation']
+    }
+    
+    # Crear agente DQN
+    dqn_agent = DQN(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        config=config,
+        hidden_units=DQN_CONFIG['hidden_units'],
+        seed=DQN_CONFIG.get('seed', 42)
+    )
+    
+    # Crear y devolver el modelo wrapper
+    return DQNModelWrapper(
+        dqn_agent=dqn_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )

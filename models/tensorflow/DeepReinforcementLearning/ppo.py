@@ -1,14 +1,16 @@
 import os, sys
 import tensorflow as tf
 import numpy as np
+import gym
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, Conv1D, LSTM, Flatten, Concatenate,
-    BatchNormalization, Dropout, LayerNormalization
+    BatchNormalization, Dropout, LayerNormalization, GlobalAveragePooling1D
 )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanSquaredError
 from tensorflow.keras.callbacks import EarlyStopping
+from keras.saving import register_keras_serializable
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Any, Optional, Union, Callable
 
@@ -696,6 +698,10 @@ class PPO:
         window_size : int, opcional
             Tamaño de ventana para suavizado (default: 5)
         """
+        # Constantes para etiquetas de ejes
+        LABEL_EPOCA = 'Época'
+        LABEL_EPISODIO = 'Episodio'
+        
         def smooth(y, window_size):
             """Aplica suavizado con media móvil."""
             box = np.ones(window_size) / window_size
@@ -712,7 +718,7 @@ class PPO:
                     smooth(rewards, window_size), 
                     color='blue', label='Suavizado')
         plt.title('Recompensa por Episodio')
-        plt.xlabel('Episodio')
+        plt.xlabel(LABEL_EPISODIO)
         plt.ylabel('Recompensa')
         plt.grid(alpha=0.3)
         
@@ -721,7 +727,7 @@ class PPO:
         avg_rewards = history['avg_reward']
         plt.plot(avg_rewards, marker='o', color='green')
         plt.title('Recompensa Promedio por Época')
-        plt.xlabel('Época')
+        plt.xlabel(LABEL_EPOCA)
         plt.ylabel('Recompensa Promedio')
         plt.grid(alpha=0.3)
         
@@ -730,7 +736,7 @@ class PPO:
         plt.plot(history['policy_loss'], label='Política', color='red')
         plt.plot(history['value_loss'], label='Valor', color='orange')
         plt.title('Pérdidas')
-        plt.xlabel('Época')
+        plt.xlabel(LABEL_EPOCA)
         plt.ylabel('Pérdida')
         plt.legend()
         plt.grid(alpha=0.3)
@@ -739,9 +745,434 @@ class PPO:
         plt.subplot(2, 2, 4)
         plt.plot(history['entropy'], color='purple')
         plt.title('Entropía')
-        plt.xlabel('Época')
+        plt.xlabel(LABEL_EPOCA)
         plt.ylabel('Entropía')
         plt.grid(alpha=0.3)
         
         plt.tight_layout()
         plt.show()
+
+# Constantes para evitar duplicación
+MODEL_WEIGHTS_SUFFIX = '_model_weights.h5'
+ACTOR_CRITIC_WEIGHTS_SUFFIX = '_actor_critic_weights.h5'
+CGM_ENCODER = 'cgm_encoder'
+OTHER_ENCODER = 'other_encoder'
+COMBINED_LAYER = 'combined_layer'
+
+
+@register_keras_serializable
+class PPOModelWrapper(tf.keras.models.Model):
+    """
+    Wrapper para el algoritmo PPO que implementa la interfaz de Keras.Model.
+    """
+    
+    def __init__(
+        self, 
+        ppo_agent: PPO,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...]
+    ) -> None:
+        """
+        Inicializa el modelo wrapper para PPO.
+        
+        Parámetros:
+        -----------
+        ppo_agent : PPO
+            Agente PPO a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        super(PPOModelWrapper, self).__init__()
+        self.ppo_agent = ppo_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Capas para procesar entrada CGM
+        self.cgm_conv = Conv1D(64, 3, padding='same', activation='relu', name=f'{CGM_ENCODER}_conv')
+        self.cgm_pooling = GlobalAveragePooling1D(name=f'{CGM_ENCODER}_pooling')
+        
+        # Capas para procesar otras características
+        self.other_dense = Dense(32, activation='relu', name=OTHER_ENCODER)
+        
+        # Capa para combinar características en representación de estado
+        self.combined_dense = Dense(self.ppo_agent.state_dim, activation='relu', name=COMBINED_LAYER)
+        
+        # Capa para convertir salidas de política a dosis
+        self.dose_predictor = Dense(1, kernel_initializer='glorot_uniform', name='dose_predictor')
+    
+    def call(self, inputs: List[tf.Tensor], training: bool = False) -> tf.Tensor:
+        """
+        Implementa la llamada del modelo para predicciones.
+        
+        Parámetros:
+        -----------
+        inputs : List[tf.Tensor]
+            Lista de tensores [cgm_data, other_features]
+        training : bool, opcional
+            Indica si está en modo de entrenamiento (default: False)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones de dosis de insulina
+        """
+        # Procesar entradas
+        cgm_data, other_features = inputs
+        batch_size = tf.shape(cgm_data)[0]
+        
+        # Codificar entradas a estados
+        states = self._encode_states(cgm_data, other_features)
+        
+        # Inicializar tensor para acciones
+        actions = tf.TensorArray(tf.float32, size=batch_size)
+        
+        # Para cada muestra en el batch, obtener acción del agente PPO
+        for i in range(batch_size):
+            state = states[i]
+            # Usar política del agente PPO (modo determinístico para predicción)
+            action = self.ppo_agent.model.get_action(state.numpy(), deterministic=True)
+            actions = actions.write(i, tf.convert_to_tensor(action, dtype=tf.float32))
+        
+        # Convertir a tensor
+        actions_tensor = actions.stack()
+        
+        # Mapear acciones a dosis de insulina
+        doses = self.dose_predictor(tf.reshape(actions_tensor, [batch_size, -1]))
+        
+        return doses
+    
+    def _encode_states(self, cgm_data: tf.Tensor, other_features: tf.Tensor) -> tf.Tensor:
+        """
+        Codifica las entradas en una representación de estado para el agente PPO.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos de monitoreo continuo de glucosa
+        other_features : tf.Tensor
+            Otras características (carbohidratos, insulina a bordo, etc.)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Estados codificados
+        """
+        # Procesar CGM con capas convolucionales
+        cgm_encoded = self.cgm_conv(cgm_data)
+        cgm_features = self.cgm_pooling(cgm_encoded)
+        
+        # Procesar otras características
+        other_encoded = self.other_dense(other_features)
+        
+        # Combinar características
+        combined = tf.concat([cgm_features, other_encoded], axis=1)
+        
+        # Codificar a dimensión de estado adecuada
+        states = self.combined_dense(combined)
+        
+        return states
+    
+    def fit(
+        self, 
+        x: List[tf.Tensor], 
+        y: tf.Tensor, 
+        batch_size: int = 32, 
+        epochs: int = 1, 
+        verbose: int = 0,
+        callbacks: Optional[List[Any]] = None,
+        validation_data: Optional[Tuple] = None,
+        **kwargs
+    ) -> Dict:
+        """
+        Simula la interfaz de entrenamiento de Keras para el agente PPO.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+        callbacks : Optional[List[Any]], opcional
+            Lista de callbacks (default: None)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        Dict
+            Historia simulada de entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando agente PPO...")
+        
+        # Crear entorno personalizado para RL a partir de los datos
+        env = self._create_training_environment(x[0], x[1], y)
+        
+        # Entrenar el agente PPO
+        history = self.ppo_agent.train(
+            env=env,
+            epochs=epochs,
+            steps_per_epoch=batch_size,
+            batch_size=min(32, batch_size),
+            log_interval=max(1, epochs // 10) if verbose > 0 else epochs + 1
+        )
+        
+        # Calibrar capa de predicción de dosis
+        self._calibrate_dose_predictor(y)
+        
+        # Crear historia simulada para compatibilidad con Keras
+        keras_history = {
+            'loss': history.get('total_loss', [0.0]),
+            'policy_loss': history.get('policy_loss', [0.0]),
+            'value_loss': history.get('value_loss', [0.0]),
+            'entropy': history.get('entropy', [0.0]),
+            'val_loss': [history.get('total_loss', [0.0])[-1]] if validation_data is not None else None
+        }
+        
+        return {'history': keras_history}
+    
+    def _create_training_environment(self, cgm_data: tf.Tensor, other_features: tf.Tensor, 
+                                   target_doses: tf.Tensor) -> Any:
+        """
+        Crea un entorno personalizado compatible con el agente PPO.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos CGM
+        other_features : tf.Tensor
+            Otras características
+        target_doses : tf.Tensor
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno compatible con Open AI Gym
+        """
+        # Convertir tensores a numpy
+        cgm_np = cgm_data.numpy() if hasattr(cgm_data, 'numpy') else cgm_data
+        other_np = other_features.numpy() if hasattr(other_features, 'numpy') else other_features
+        target_np = target_doses.numpy() if hasattr(target_doses, 'numpy') else target_doses
+        
+        # Clase de entorno personalizada
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model_wrapper
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                
+                # Para compatibilidad con algoritmos RL
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf,
+                    shape=(model_wrapper.ppo_agent.state_dim,)
+                )
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0,
+                    shape=(model_wrapper.ppo_agent.model.mu.units,)
+                )
+            
+            def reset(self):
+                """Reinicia el entorno seleccionando un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso en el entorno con la acción dada."""
+                # Mapear acción (típicamente en [-1, 1]) a dosis de insulina (0-15 unidades)
+                dose = (action[0] + 1) * 7.5  # Escalar de [-1,1] a [0,15]
+                
+                # Calcular recompensa (negativo del error absoluto)
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de un paso (para este problema)
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+            
+            def _get_state(self):
+                """Obtiene el estado codificado para el ejemplo actual."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar a espacio de estado usando el wrapper
+                state = self.model._encode_states(
+                    tf.convert_to_tensor(cgm_batch, dtype=tf.float32),
+                    tf.convert_to_tensor(features_batch, dtype=tf.float32)
+                )
+                
+                return state[0].numpy()
+        
+        return InsulinDosingEnv(cgm_np, other_np, target_np, self)
+    
+    def _calibrate_dose_predictor(self, y: tf.Tensor) -> None:
+        """
+        Calibra la capa que mapea acciones a dosis de insulina.
+        
+        Parámetros:
+        -----------
+        y : tf.Tensor
+            Dosis objetivo para calibración
+        """
+        y_np = y.numpy() if hasattr(y, 'numpy') else y
+        max_dose = np.max(y_np)
+        min_dose = np.min(y_np)
+        
+        # Configurar pesos para convertir acciones a dosis apropiadas
+        # Suponemos acciones en [-1, 1] que se escalan a [min_dose, max_dose]
+        scale = (max_dose - min_dose) / 2.0
+        bias = (min_dose + max_dose) / 2.0
+        
+        self.dose_predictor.set_weights([
+            np.ones((1, 1)) * scale,
+            np.array([bias])
+        ])
+    
+    def predict(self, x: List[tf.Tensor], **kwargs) -> np.ndarray:
+        """
+        Implementa la interfaz de predicción de Keras.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis
+        """
+        return self.call(x).numpy()
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo para serialización.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración del modelo
+        """
+        return {
+            "cgm_shape": self.cgm_shape,
+            "other_features_shape": self.other_features_shape,
+            "state_dim": self.ppo_agent.state_dim,
+            "action_dim": self.ppo_agent.model.mu.units,
+            "hidden_units": self.ppo_agent.hidden_units,
+            "gamma": self.ppo_agent.gamma,
+            "epsilon": self.ppo_agent.epsilon
+        }
+    
+    def save(self, filepath: str, **kwargs) -> None:
+        """
+        Guarda el modelo PPO.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Guardar pesos del wrapper
+        self.save_weights(filepath + MODEL_WEIGHTS_SUFFIX)
+        
+        # Guardar modelo actor-crítico del agente PPO
+        self.ppo_agent.save_model(filepath + ACTOR_CRITIC_WEIGHTS_SUFFIX)
+    
+    def load_weights(self, filepath: str, **kwargs) -> None:
+        """
+        Carga el modelo PPO.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Determinar rutas según formato de filepath
+        if filepath.endswith(MODEL_WEIGHTS_SUFFIX):
+            wrapper_path = filepath
+            ac_path = filepath.replace(MODEL_WEIGHTS_SUFFIX, ACTOR_CRITIC_WEIGHTS_SUFFIX)
+        else:
+            wrapper_path = filepath + MODEL_WEIGHTS_SUFFIX
+            ac_path = filepath + ACTOR_CRITIC_WEIGHTS_SUFFIX
+            
+        # Cargar pesos del wrapper
+        super().load_weights(wrapper_path)
+        
+        # Cargar modelo actor-crítico
+        self.ppo_agent.load_model(ac_path)
+
+
+def create_ppo_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> tf.keras.models.Model:
+    """
+    Crea un modelo basado en PPO (Proximal Policy Optimization) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    tf.keras.models.Model
+        Modelo PPO que implementa la interfaz de Keras
+    """
+    # Determinar dimensión del espacio de estado
+    state_dim = 64  # Dimensión del espacio de estado codificado
+    
+    # Configurar espacio de acción (dosis de insulina)
+    action_dim = 1  # Una dimensión para la dosis continua
+    
+    # Crear agente PPO con configuración desde PPO_CONFIG
+    ppo_agent = PPO(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        learning_rate=PPO_CONFIG['learning_rate'],
+        gamma=PPO_CONFIG['gamma'],
+        epsilon=PPO_CONFIG['clip_epsilon'],
+        hidden_units=PPO_CONFIG['hidden_units'],
+        entropy_coef=PPO_CONFIG['entropy_coef'],
+        value_coef=PPO_CONFIG['value_coef'],
+        max_grad_norm=PPO_CONFIG['max_grad_norm'],
+        seed=42
+    )
+    
+    # Crear y devolver el modelo wrapper
+    return PPOModelWrapper(
+        ppo_agent=ppo_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )

@@ -2,6 +2,7 @@ import os, sys
 import tensorflow as tf
 import numpy as np
 import time
+import gym
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, Conv1D, LSTM, Flatten, Concatenate,
@@ -9,6 +10,7 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import MeanSquaredError
+from keras.saving import register_keras_serializable
 from typing import Dict, List, Tuple, Any, Optional, Union, Callable, TypeVar
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
@@ -1163,3 +1165,434 @@ class TRPO:
         
         plt.tight_layout()
         plt.show()
+
+# Constantes para evitar duplicación
+MODEL_WEIGHTS_SUFFIX = '_model_weights.h5'
+ACTOR_WEIGHTS_SUFFIX = '_actor_weights.h5'
+CRITIC_WEIGHTS_SUFFIX = '_critic_weights.h5'
+CGM_ENCODER = 'cgm_encoder'
+OTHER_ENCODER = 'other_encoder'
+COMBINED_LAYER = 'combined_layer'
+
+
+@register_keras_serializable
+class TRPOModelWrapper(Model):
+    """
+    Wrapper para el algoritmo TRPO que implementa la interfaz de Keras.Model.
+    """
+    
+    def __init__(
+        self, 
+        trpo_agent: TRPO,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...]
+    ) -> None:
+        """
+        Inicializa el modelo wrapper para TRPO.
+        
+        Parámetros:
+        -----------
+        trpo_agent : TRPO
+            Agente TRPO a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        super(TRPOModelWrapper, self).__init__()
+        self.trpo_agent = trpo_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Capas para procesamiento de CGM
+        self.cgm_conv = tf.keras.layers.Conv1D(
+            64, 3, padding='same', activation='relu', name=f'{CGM_ENCODER}_conv')
+        self.cgm_pooling = tf.keras.layers.GlobalAveragePooling1D(
+            name=f'{CGM_ENCODER}_pooling')
+        
+        # Capas para procesamiento de otras características
+        self.other_dense = tf.keras.layers.Dense(
+            32, activation='relu', name=OTHER_ENCODER)
+        
+        # Capa para combinar características
+        self.combined = tf.keras.layers.Dense(
+            self.trpo_agent.state_dim, activation='relu', name=COMBINED_LAYER)
+    
+    def call(self, inputs: List[tf.Tensor], training: bool = False) -> tf.Tensor:
+        """
+        Implementa la llamada del modelo para predicciones.
+        
+        Parámetros:
+        -----------
+        inputs : List[tf.Tensor]
+            Lista de tensores [cgm_data, other_features]
+        training : bool, opcional
+            Indica si está en modo de entrenamiento (default: False)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        batch_size = tf.shape(cgm_data)[0]
+        
+        # Codificar estados
+        states = self._encode_states(cgm_data, other_features)
+        
+        # Inicializar tensor para acciones
+        actions = tf.TensorArray(tf.float32, size=batch_size)
+        
+        # Para cada muestra en el batch, obtener acción determinística
+        for i in range(batch_size):
+            state = states[i]
+            # Usar el modelo ActorCritic para obtener acción determinística
+            action = self.trpo_agent.model.get_action(state.numpy(), deterministic=True)
+            actions = actions.write(i, tf.convert_to_tensor(action, dtype=tf.float32))
+        
+        # Convertir a tensor
+        actions_tensor = actions.stack()
+        
+        # Para casos de acción discreta, convertir a formato adecuado
+        if not self.trpo_agent.continuous:
+            # Expandir para obtener forma compatible con salida de dosis
+            actions_tensor = tf.expand_dims(tf.cast(actions_tensor, tf.float32), -1)
+            
+            # Si son acciones discretas, escalar al rango de dosis
+            # Asumiendo que las dosis van de 0 a 15 unidades
+            actions_tensor = actions_tensor / (self.trpo_agent.action_dim - 1) * 15.0
+        
+        return actions_tensor
+    
+    def _encode_states(self, cgm_data: tf.Tensor, other_features: tf.Tensor) -> tf.Tensor:
+        """
+        Codifica las entradas en una representación de estado para el algoritmo TRPO.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos de monitoreo continuo de glucosa
+        other_features : tf.Tensor
+            Otras características (carbohidratos, insulina a bordo, etc.)
+            
+        Retorna:
+        --------
+        tf.Tensor
+            Estados codificados
+        """
+        # Procesar datos CGM con convoluciones
+        cgm_encoded = self.cgm_conv(cgm_data)
+        cgm_features = self.cgm_pooling(cgm_encoded)
+        
+        # Procesar otras características
+        other_encoded = self.other_dense(other_features)
+        
+        # Combinar características
+        combined = tf.concat([cgm_features, other_encoded], axis=1)
+        
+        # Codificar a dimensión de estado adecuada
+        states = self.combined(combined)
+        
+        return states
+    
+    def fit(
+        self, 
+        x: List[tf.Tensor], 
+        y: tf.Tensor, 
+        batch_size: int = 32, 
+        epochs: int = 1, 
+        verbose: int = 0,
+        callbacks: Optional[List[Any]] = None,
+        validation_data: Optional[Tuple] = None,
+        **kwargs
+    ) -> Dict:
+        """
+        Simula la interfaz de entrenamiento de Keras para el agente TRPO.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        y : tf.Tensor
+            Etiquetas (dosis objetivo)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+        callbacks : Optional[List[Any]], opcional
+            Lista de callbacks (default: None)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        Dict
+            Historia simulada de entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando modelo TRPO...")
+        
+        # Crear entorno personalizado para entrenamiento
+        env = self._create_training_environment(x[0], x[1], y)
+        
+        # Entrenar el agente TRPO
+        history = self.trpo_agent.train(
+            env=env,
+            iterations=epochs,
+            min_steps_per_update=batch_size,
+            render=False
+        )
+        
+        # Convertir historia a formato compatible con Keras
+        keras_history = {
+            'loss': history.get('policy_losses', [0.0]),
+            'val_loss': history.get('value_losses', [0.0]),
+            'kl': history.get('kl_divergences', [0.0]),
+            'entropy': history.get('entropies', [0.0]),
+            'mean_reward': history.get('mean_episode_rewards', [0.0])
+        }
+        
+        if verbose > 0:
+            print("Entrenamiento TRPO completado.")
+        
+        return {'history': keras_history}
+    
+    def _create_training_environment(self, cgm_data: tf.Tensor, other_features: tf.Tensor, 
+                                   target_doses: tf.Tensor) -> Any:
+        """
+        Crea un entorno personalizado para entrenar el agente TRPO.
+        
+        Parámetros:
+        -----------
+        cgm_data : tf.Tensor
+            Datos CGM
+        other_features : tf.Tensor
+            Otras características
+        target_doses : tf.Tensor
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno compatible con OpenAI Gym
+        """
+        # Convertir tensores a numpy para procesamiento
+        cgm_np = cgm_data.numpy() if hasattr(cgm_data, 'numpy') else cgm_data
+        other_np = other_features.numpy() if hasattr(other_features, 'numpy') else other_features
+        target_np = target_doses.numpy() if hasattr(target_doses, 'numpy') else target_doses
+        
+        # Crear clase de entorno personalizado
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(TRPO_CONFIG.get('seed', 42)))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Para compatibilidad con algoritmos RL
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, 
+                    shape=(model_wrapper.trpo_agent.state_dim,)
+                )
+                
+                if model_wrapper.trpo_agent.continuous:
+                    self.action_space = gym.spaces.Box(
+                        low=np.array([0.0]),
+                        high=np.array([15.0]),  # 15 unidades máximo de insulina
+                        dtype=np.float32
+                    )
+                else:
+                    self.action_space = gym.spaces.Discrete(model_wrapper.trpo_agent.action_dim)
+                
+                # Para compatibilidad con render
+                self.render_mode = None
+                
+            def reset(self):
+                """Reinicia el entorno seleccionando un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso en el entorno con la acción dada."""
+                # Convertir acción a dosis según tipo de espacio de acción
+                if isinstance(self.action_space, gym.spaces.Box):
+                    # Para acción continua, usar directamente
+                    dose = action[0]
+                else:
+                    # Para acción discreta, mapear a valores de dosis
+                    dose = action / (self.model.trpo_agent.action_dim - 1) * 15.0
+                
+                # Calcular recompensa (negativo del error absoluto)
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de un paso
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+            
+            def _get_state(self):
+                """Obtiene el estado codificado para el ejemplo actual."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar estado usando las capas del modelo wrapper
+                state = self.model._encode_states(
+                    tf.convert_to_tensor(cgm_batch, dtype=tf.float32),
+                    tf.convert_to_tensor(features_batch, dtype=tf.float32)
+                )
+                
+                return state[0].numpy()
+            
+            def render(self):
+                """Renderización dummy del entorno (no implementada)."""
+                pass
+        
+        return InsulinDosingEnv(cgm_np, other_np, target_np, self)
+    
+    def predict(self, x: List[tf.Tensor], **kwargs) -> np.ndarray:
+        """
+        Implementa la interfaz de predicción de Keras.
+        
+        Parámetros:
+        -----------
+        x : List[tf.Tensor]
+            Lista con [cgm_data, other_features]
+        **kwargs
+            Argumentos adicionales
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis
+        """
+        return self.call(x).numpy()
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo para serialización.
+        
+        Retorna:
+        --------
+        Dict
+            Configuración del modelo
+        """
+        return {
+            "cgm_shape": self.cgm_shape,
+            "other_features_shape": self.other_features_shape,
+            "state_dim": self.trpo_agent.state_dim,
+            "action_dim": self.trpo_agent.action_dim,
+            "continuous": self.trpo_agent.continuous
+        }
+    
+    def save(self, filepath: str, **kwargs) -> None:
+        """
+        Guarda el modelo TRPO.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Guardar pesos de las capas de codificación
+        self.save_weights(filepath + MODEL_WEIGHTS_SUFFIX)
+        
+        # Guardar modelos actor-crítico
+        self.trpo_agent.save_model(filepath + ACTOR_WEIGHTS_SUFFIX, 
+                                  filepath + CRITIC_WEIGHTS_SUFFIX)
+    
+    def load_weights(self, filepath: str, **kwargs) -> None:
+        """
+        Carga el modelo TRPO.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        **kwargs
+            Argumentos adicionales
+        """
+        # Determinar rutas según formato de filepath
+        if filepath.endswith(MODEL_WEIGHTS_SUFFIX):
+            base_path = filepath.replace(MODEL_WEIGHTS_SUFFIX, "")
+        else:
+            base_path = filepath
+            filepath = filepath + MODEL_WEIGHTS_SUFFIX
+        
+        # Cargar pesos de las capas de codificación
+        super().load_weights(filepath)
+        
+        # Cargar modelos actor-crítico
+        self.trpo_agent.load_model(base_path + ACTOR_WEIGHTS_SUFFIX,
+                                  base_path + CRITIC_WEIGHTS_SUFFIX)
+
+
+def create_trpo_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> Model:
+    """
+    Crea un modelo basado en TRPO (Trust Region Policy Optimization) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    Model
+        Modelo TRPO que implementa la interfaz de Keras
+    """
+    # Configuración del espacio de estados y acciones
+    state_dim = 64  # Dimensión del espacio de estado codificado
+    
+    # Definir si usamos espacio continuo o discreto para las acciones
+    continuous = TRPO_CONFIG.get('continuous', True)
+    
+    if continuous:
+        action_dim = 1  # Una dimensión para dosis continua
+    else:
+        action_dim = 20  # 20 niveles discretos para dosis
+
+    # Configurar hiperparámetros adicionales
+    delta = TRPO_CONFIG.get('delta', 0.01)  # Límite de divergencia KL
+    gamma = TRPO_CONFIG.get('gamma', 0.99)  # Factor de descuento
+    hidden_units = TRPO_CONFIG.get('hidden_units', [64, 64])  # Unidades en capas ocultas
+    
+    # Crear agente TRPO
+    trpo_agent = TRPO(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        continuous=continuous,
+        gamma=gamma,
+        delta=delta,
+        hidden_units=hidden_units
+    )
+    
+    # Crear y devolver modelo wrapper
+    return TRPOModelWrapper(
+        trpo_agent=trpo_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )
