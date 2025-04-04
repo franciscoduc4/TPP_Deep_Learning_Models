@@ -20,6 +20,12 @@ from config.params import FRAMEWORK, PROCESSING, USE_TF_MODELS, USE_JAX_MODELS, 
 from processing.pandas import preprocess_data as pd_preprocess, split_data as pd_split
 from processing.polars import preprocess_data as pl_preprocess, split_data as pl_split
 
+# Visualización
+from visualization.plotting import visualize_model_results, plot_model_evaluation_summary
+
+# Reporte
+from report.generate_report import create_report, render_to_pdf
+
 # Constantes para los directorios y nombres
 CONST_MODELS_DIR = "models"
 CONST_RESULTS_DIR = "results"
@@ -194,6 +200,53 @@ ensemble_weights = optimize_ensemble_weights(predictions, y_test)
 ensemble_pred = create_ensemble_prediction(predictions, ensemble_weights)
 ensemble_metrics = calculate_metrics(y_test, ensemble_pred)
 
+cprint("\n==== GENERANDO VISUALIZACIONES POR MODELO ====", 'cyan', 'bold')
+
+# Crear directorio para visualizaciones individuales por modelo
+MODEL_FIGURES_DIR = os.path.join(FIGURES_DIR, "individual_models")
+os.makedirs(MODEL_FIGURES_DIR, exist_ok=True)
+
+# Visualizar resultados de cada modelo individualmente
+model_figures = {}
+for model_name, model_history in histories.items():
+    cprint(f"Generando visualizaciones para modelo: {model_name}", 'green')
+    
+    # Usar la función de visualización completa por modelo
+    figure_paths = visualize_model_results(
+        history=model_history,
+        predictions=predictions[model_name],
+        y_test=y_test,
+        model_name=model_name,
+        save_dir=MODEL_FIGURES_DIR,
+        show_plots=False  # Cambiar a True si deseas ver los gráficos durante la ejecución
+    )
+    
+    model_figures[model_name] = figure_paths
+    
+    # Mostrar rutas de los archivos generados
+    for fig_type, fig_path in figure_paths.items():
+        print(f"  - {fig_type}: {os.path.basename(fig_path)}")
+
+cprint("\n==== GENERANDO VISUALIZACIONES COMPLETAS ====", 'cyan', 'bold')
+
+# Generar todas las visualizaciones de forma organizada
+all_figures = plot_model_evaluation_summary(
+    histories=histories,
+    predictions=predictions,
+    y_true=y_test,
+    metrics=metrics,
+    ensemble_predictions=ensemble_pred,
+    ensemble_weights=ensemble_weights,
+    ensemble_metrics=ensemble_metrics,
+    save_dir=FIGURES_DIR,
+    sample_size=100,
+    show_plots=False
+)
+
+cprint(f"Visualizaciones comparativas guardadas en: {os.path.join(FIGURES_DIR, 'comparative')}", 'green')
+cprint(f"Visualizaciones por modelo guardadas en: {os.path.join(FIGURES_DIR, 'individual_models')}", 'green')
+
+
 # Mostrar métricas del ensemble
 cprint("Métricas del ensemble:", 'green', 'bold')
 print(f"  MAE:  {ensemble_metrics['mae']:.4f}")
@@ -322,3 +375,30 @@ plt.close('all')
 cprint("\n==== PROCESO COMPLETADO ====", 'cyan', 'bold')
 cprint(f"Resultados guardados en: {RESULTS_SAVE_DIR}", 'green')
 cprint(f"Visualizaciones guardadas en: {FIGURES_DIR}", 'green')
+
+# Generar reporte Typst
+cprint("\n==== GENERANDO REPORTE EN TYPST ====", 'cyan', 'bold')
+
+# Crear reporte Typst
+typst_report_path = create_report(
+    model_figures=model_figures,
+    ensemble_metrics=ensemble_metrics,
+    framework=FRAMEWORK,
+    project_root=PROJECT_ROOT,
+    figures_dir=FIGURES_DIR,
+    metrics=metrics
+)
+
+cprint(f"Reporte Typst generado: {typst_report_path}", 'green')
+
+# Intentar renderizar el PDF
+pdf_path = render_to_pdf(typst_report_path)
+if pdf_path:
+    cprint(f"PDF generado: {pdf_path}", 'green')
+
+cprint("\n==== PROCESO COMPLETADO ====", 'cyan', 'bold')
+cprint(f"Resultados guardados en: {RESULTS_SAVE_DIR}", 'green')
+cprint(f"Visualizaciones guardadas en: {FIGURES_DIR}", 'green')
+cprint(f"Reporte guardado en: {typst_report_path}", 'green')
+if pdf_path:
+    cprint(f"PDF guardado en: {pdf_path}", 'green')

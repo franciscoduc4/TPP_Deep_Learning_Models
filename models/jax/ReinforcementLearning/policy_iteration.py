@@ -1052,7 +1052,7 @@ class PolicyIterationWrapper:
         
         # Entrenar agente con un número de iteraciones basado en epochs
         self.pi_agent.max_iterations = max(epochs, 10)
-        pi_history = self.pi_agent.train(env)
+        _ = self.pi_agent.train(env)
         
         # Calcular pérdida en los datos de entrenamiento
         train_preds = self.predict(x)

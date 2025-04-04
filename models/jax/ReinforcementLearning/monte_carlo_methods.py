@@ -2529,7 +2529,7 @@ class MonteCarloWrapper:
         """
         # Extraer características
         cgm_data, other_features = inputs
-        batch_size = cgm_data.shape[0]
+        _ = cgm_data.shape[0]
         
         # Transformar datos a estados (simplificado)
         states = np.argmax(other_features, axis=1) % self.mc_agent.n_states
@@ -2601,7 +2601,7 @@ class MonteCarloWrapper:
         # En un caso real, aquí se implementaría la lógica para adaptar
         # los datos al formato que necesita MonteCarlo y llamar a sus métodos de entrenamiento
         
-        return type('History', (), {'history': history})
+        return {'history': history}
     
     def save(self, filepath: str) -> None:
         """
