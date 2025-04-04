@@ -784,3 +784,416 @@ class QLearning:
             Tabla Q actual
         """
         return np.array(self.state.q_table)
+
+class QLearningWrapper:
+    """
+    Wrapper para hacer que el agente Q-Learning sea compatible con la interfaz de modelos de aprendizaje profundo.
+    """
+    
+    def __init__(
+        self, 
+        q_agent: QLearning, 
+        cgm_shape: Tuple[int, ...], 
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para Q-Learning.
+        
+        Parámetros:
+        -----------
+        q_agent : QLearning
+            Agente Q-Learning a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        self.q_agent = q_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Para discretizar entradas continuas
+        self.cgm_bins = 10
+        self.other_bins = 5
+        
+        # Historial de entrenamiento
+        self.history = {'loss': [], 'val_loss': []}
+    
+    def __call__(self, inputs: List[np.ndarray]) -> np.ndarray:
+        """
+        Implementa la interfaz de llamada para predicción.
+        
+        Parámetros:
+        -----------
+        inputs : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis de insulina
+        """
+        return self.predict(inputs)
+    
+    def predict(self, inputs: List[np.ndarray]) -> np.ndarray:
+        """
+        Realiza predicciones con el modelo Q-Learning.
+        
+        Parámetros:
+        -----------
+        inputs : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        batch_size = cgm_data.shape[0]
+        
+        # Crear array para resultados
+        predictions = np.zeros((batch_size, 1))
+        
+        for i in range(batch_size):
+            # Discretizar estado
+            state = self._discretize_state(cgm_data[i], other_features[i])
+            
+            # Obtener acción según la tabla Q (greedy, sin exploración)
+            action = int(jnp.argmax(self.q_agent.state.q_table[state]))
+            
+            # Convertir acción discreta a dosis continua
+            predictions[i, 0] = self._convert_action_to_dose(action)
+        
+        return predictions
+    
+    def _discretize_state(self, cgm_data: np.ndarray, other_features: np.ndarray) -> int:
+        """
+        Discretiza las entradas continuas a un índice de estado.
+        
+        Parámetros:
+        -----------
+        cgm_data : np.ndarray
+            Datos CGM para un ejemplo
+        other_features : np.ndarray
+            Otras características para un ejemplo
+            
+        Retorna:
+        --------
+        int
+            Índice de estado discretizado
+        """
+        # Simplificar CGM usando valores clave (último valor, pendiente, promedio)
+        cgm_flat = cgm_data.flatten()
+        cgm_mean = np.mean(cgm_flat)
+        cgm_last = cgm_flat[-1]
+        cgm_slope = cgm_flat[-1] - cgm_flat[0]
+        
+        # Discretizar características clave
+        cgm_mean_bin = min(int(cgm_mean * self.cgm_bins), self.cgm_bins - 1)
+        cgm_last_bin = min(int(cgm_last * self.cgm_bins), self.cgm_bins - 1)
+        cgm_slope_bin = min(int((cgm_slope + 1) * self.cgm_bins / 2), self.cgm_bins - 1)
+        
+        # Usar solo las primeras características más relevantes de other_features
+        relevant_features = other_features[:min(3, len(other_features))]
+        other_bins = [min(int(f * self.other_bins), self.other_bins - 1) for f in relevant_features]
+        
+        # Calcular índice de estado combinado
+        state = cgm_mean_bin
+        state = state * self.cgm_bins + cgm_last_bin
+        state = state * self.cgm_bins + cgm_slope_bin
+        
+        for b in other_bins:
+            state = state * self.other_bins + b
+            
+        return min(state, self.q_agent.n_states - 1)
+    
+    def _convert_action_to_dose(self, action: int) -> float:
+        """
+        Convierte una acción discreta a dosis continua.
+        
+        Parámetros:
+        -----------
+        action : int
+            Índice de acción discreta
+            
+        Retorna:
+        --------
+        float
+            Dosis de insulina
+        """
+        # Mapear desde [0, n_actions-1] a [0, 15] unidades de insulina
+        return action * 15.0 / (self.q_agent.n_actions - 1)
+    
+    def fit(
+        self, 
+        x: List[np.ndarray], 
+        y: np.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: List = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Entrena el modelo Q-Learning en los datos proporcionados.
+        
+        Parámetros:
+        -----------
+        x : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+        y : np.ndarray
+            Etiquetas (dosis objetivo)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        callbacks : List, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia del entrenamiento
+        """
+        cgm_data, other_features = x
+        
+        # Crear entorno personalizado para Q-Learning
+        env = self._create_training_environment(cgm_data, other_features, y)
+        
+        if verbose > 0:
+            print("Entrenando modelo Q-Learning...")
+        
+        # Entrenar agente con el número de episodios igual a epochs
+        training_history = self.q_agent.train(
+            env=env,
+            episodes=epochs,
+            max_steps=batch_size,
+            render=False,
+            log_interval=max(1, epochs // 10) if verbose > 0 else epochs + 1
+        )
+        
+        # Actualizar historial con métricas del entrenamiento
+        self.history = {
+            'episode_rewards': training_history['episode_rewards'],
+            'episode_lengths': training_history['episode_lengths'],
+            'epsilons': training_history['epsilons'],
+            'avg_rewards': training_history['avg_rewards']
+        }
+        
+        # Calcular pérdida en los datos de entrenamiento
+        train_preds = self.predict(x)
+        train_loss = float(np.mean((train_preds.flatten() - y) ** 2))
+        self.history['loss'] = [train_loss]
+        
+        # Evaluar en datos de validación si se proporcionan
+        if validation_data:
+            val_x, val_y = validation_data
+            val_preds = self.predict(val_x)
+            val_loss = float(np.mean((val_preds.flatten() - val_y) ** 2))
+            self.history['val_loss'] = [val_loss]
+            
+            if verbose > 0:
+                print(f"Pérdida de validación: {val_loss:.4f}")
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado. Pérdida final: {train_loss:.4f}")
+        
+        return self.history
+    
+    def _create_training_environment(
+        self, 
+        cgm_data: np.ndarray, 
+        other_features: np.ndarray, 
+        targets: np.ndarray
+    ) -> Any:
+        """
+        Crea un entorno de entrenamiento compatible con el agente Q-Learning.
+        
+        Parámetros:
+        -----------
+        cgm_data : np.ndarray
+            Datos CGM
+        other_features : np.ndarray
+            Otras características
+        targets : np.ndarray
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno simulado para Q-Learning
+        """
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Para compatibilidad con algoritmos RL
+                self.observation_space = SimpleNamespace(
+                    shape=(1,),
+                    low=0,
+                    high=model_wrapper.q_agent.n_states - 1
+                )
+                
+                self.action_space = SimpleNamespace(
+                    n=model_wrapper.q_agent.n_actions,
+                    sample=self._sample_action
+                )
+            
+            def _sample_action(self):
+                """Muestrea una acción aleatoria del espacio discreto."""
+                return self.rng.integers(0, self.model.q_agent.n_actions)
+            
+            def reset(self):
+                """Reinicia el entorno eligiendo un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self.model._discretize_state(
+                    self.cgm[self.current_idx],
+                    self.features[self.current_idx]
+                )
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso con la acción dada."""
+                # Convertir acción a dosis
+                dose = self.model._convert_action_to_dose(action)
+                
+                # Calcular recompensa como negativo del error absoluto
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self.model._discretize_state(
+                    self.cgm[self.current_idx],
+                    self.features[self.current_idx]
+                )
+                
+                # Terminal después de cada paso
+                done = True
+                
+                return next_state, reward, done, False, {}
+        
+        from types import SimpleNamespace
+        return InsulinDosingEnv(cgm_data, other_features, targets, self)
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        self.q_agent.save_qtable(filepath + "_qtable.npy")
+        
+        import pickle
+        wrapper_data = {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'cgm_bins': self.cgm_bins,
+            'other_bins': self.other_bins,
+            'n_states': self.q_agent.n_states,
+            'n_actions': self.q_agent.n_actions
+        }
+        
+        with open(filepath + "_wrapper.pkl", 'wb') as f:
+            pickle.dump(wrapper_data, f)
+        
+        print(f"Modelo guardado en {filepath}")
+    
+    def load(self, filepath: str) -> None:
+        """
+        Carga el modelo desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
+        self.q_agent.load_qtable(filepath + "_qtable.npy")
+        
+        import pickle
+        with open(filepath + "_wrapper.pkl", 'rb') as f:
+            wrapper_data = pickle.load(f)
+        
+        self.cgm_shape = wrapper_data['cgm_shape']
+        self.other_features_shape = wrapper_data['other_features_shape']
+        self.cgm_bins = wrapper_data['cgm_bins']
+        self.other_bins = wrapper_data['other_bins']
+        
+        print(f"Modelo cargado desde {filepath}")
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario con configuración del modelo
+        """
+        return {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'n_states': self.q_agent.n_states,
+            'n_actions': self.q_agent.n_actions,
+            'gamma': self.q_agent.gamma,
+            'epsilon': float(self.q_agent.state.epsilon),
+            'learning_rate': self.q_agent.learning_rate
+        }
+
+
+def create_q_learning_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> QLearningWrapper:
+    """
+    Crea un modelo basado en Q-Learning para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    QLearningWrapper
+        Wrapper de Q-Learning que implementa la interfaz compatible con modelos de aprendizaje profundo
+    """
+    # Configurar el tamaño del espacio de estados y acciones
+    # Esto es una simplificación - en un caso real habría que definirlo según los datos
+    n_states = 1000  # Estado discretizado (más estados para mayor precisión)
+    n_actions = 20   # Por ejemplo: 20 niveles discretos de dosis (0 a 15 unidades)
+    
+    # Crear agente Q-Learning
+    q_agent = QLearning(
+        n_states=n_states,
+        n_actions=n_actions,
+        learning_rate=QLEARNING_CONFIG['learning_rate'],
+        gamma=QLEARNING_CONFIG['gamma'],
+        epsilon_start=QLEARNING_CONFIG['epsilon_start'],
+        epsilon_end=QLEARNING_CONFIG['epsilon_end'],
+        epsilon_decay=QLEARNING_CONFIG['epsilon_decay'],
+        use_decay_schedule=QLEARNING_CONFIG['use_decay_schedule'],
+        decay_steps=QLEARNING_CONFIG['decay_steps'],
+        seed=QLEARNING_CONFIG.get('seed', 42)
+    )
+    
+    # Crear y devolver wrapper
+    return QLearningWrapper(q_agent, cgm_shape, other_features_shape)

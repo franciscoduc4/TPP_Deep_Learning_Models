@@ -585,3 +585,543 @@ class ValueIteration:
         }
         
         return history
+
+class ValueIterationWrapper:
+    """
+    Wrapper para hacer que el agente de Iteración de Valor sea compatible con la interfaz de modelos de aprendizaje profundo.
+    """
+    
+    def __init__(
+        self, 
+        vi_agent: ValueIteration, 
+        cgm_shape: Tuple[int, ...], 
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para Iteración de Valor.
+        
+        Parámetros:
+        -----------
+        vi_agent : ValueIteration
+            Agente de Iteración de Valor a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        self.vi_agent = vi_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Para discretizar entradas continuas
+        self.cgm_bins = 8
+        self.other_bins = 4
+        
+        # Historial de entrenamiento
+        self.history = {'loss': [], 'val_loss': []}
+    
+    def __call__(self, inputs: List[np.ndarray]) -> np.ndarray:
+        """
+        Implementa la interfaz de llamada para predicción.
+        
+        Parámetros:
+        -----------
+        inputs : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis de insulina
+        """
+        return self.predict(inputs)
+    
+    def predict(self, inputs: List[np.ndarray]) -> np.ndarray:
+        """
+        Realiza predicciones con el modelo de Iteración de Valor.
+        
+        Parámetros:
+        -----------
+        inputs : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        batch_size = cgm_data.shape[0]
+        
+        # Crear array para resultados
+        predictions = np.zeros((batch_size, 1))
+        
+        for i in range(batch_size):
+            # Discretizar estado
+            state = self._discretize_state(cgm_data[i], other_features[i])
+            
+            # Obtener acción según la política óptima
+            action = self.vi_agent.get_action(state)
+            
+            # Convertir acción discreta a dosis continua
+            predictions[i, 0] = self._convert_action_to_dose(action)
+        
+        return predictions
+    
+    def _discretize_state(self, cgm_data: np.ndarray, other_features: np.ndarray) -> int:
+        """
+        Discretiza las entradas continuas a un índice de estado.
+        
+        Parámetros:
+        -----------
+        cgm_data : np.ndarray
+            Datos CGM para un ejemplo
+        other_features : np.ndarray
+            Otras características para un ejemplo
+            
+        Retorna:
+        --------
+        int
+            Índice de estado discretizado
+        """
+        # Extraer características relevantes de los datos CGM
+        cgm_flat = cgm_data.flatten()
+        
+        # Calcular estadísticas de CGM: último valor, pendiente, promedio, variabilidad
+        cgm_last = cgm_flat[-1]
+        cgm_mean = np.mean(cgm_flat)
+        cgm_slope = cgm_flat[-1] - cgm_flat[0] if len(cgm_flat) > 1 else 0
+        cgm_std = np.std(cgm_flat)
+        
+        # Discretizar cada característica CGM
+        cgm_last_bin = min(int(cgm_last / 400 * self.cgm_bins), self.cgm_bins - 1)
+        cgm_mean_bin = min(int(cgm_mean / 400 * self.cgm_bins), self.cgm_bins - 1)
+        cgm_slope_bin = min(int((cgm_slope + 100) / 200 * self.cgm_bins), self.cgm_bins - 1)
+        cgm_std_bin = min(int(cgm_std / 50 * self.cgm_bins), self.cgm_bins - 1)
+        
+        # Extraer características relevantes de otras entradas (asumiendo carbInput, bgInput, IOB)
+        carb_input = other_features[0]
+        bg_input = other_features[1]
+        iob = other_features[2]
+        
+        # Discretizar características adicionales
+        carb_bin = min(int(carb_input / 100 * self.other_bins), self.other_bins - 1)
+        bg_bin = min(int(bg_input / 400 * self.other_bins), self.other_bins - 1)
+        iob_bin = min(int(iob / 10 * self.other_bins), self.other_bins - 1)
+        
+        # Combinar todas las características discretizadas en un único índice de estado
+        # Usar codificación posicional
+        state_idx = 0
+        state_idx = state_idx * self.cgm_bins + cgm_last_bin
+        state_idx = state_idx * self.cgm_bins + cgm_mean_bin
+        state_idx = state_idx * self.cgm_bins + cgm_slope_bin
+        state_idx = state_idx * self.cgm_bins + cgm_std_bin
+        state_idx = state_idx * self.other_bins + carb_bin
+        state_idx = state_idx * self.other_bins + bg_bin
+        state_idx = state_idx * self.other_bins + iob_bin
+        
+        # Asegurarse de que el índice esté en el rango válido
+        return min(state_idx, self.vi_agent.n_states - 1)
+    
+    def _convert_action_to_dose(self, action: int) -> float:
+        """
+        Convierte una acción discreta a dosis continua.
+        
+        Parámetros:
+        -----------
+        action : int
+            Índice de acción discreta
+            
+        Retorna:
+        --------
+        float
+            Dosis de insulina
+        """
+        # Mapear desde [0, n_actions-1] a [0, 15] unidades de insulina
+        return action * 15.0 / (self.vi_agent.n_actions - 1)
+    
+    def fit(
+        self, 
+        x: List[np.ndarray], 
+        y: np.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: List = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Entrena el modelo de Iteración de Valor en los datos proporcionados.
+        
+        Parámetros:
+        -----------
+        x : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+        y : np.ndarray
+            Etiquetas (dosis objetivo)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        callbacks : List, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia del entrenamiento
+        """
+        cgm_data, other_features = x
+        
+        # Crear entorno de entrenamiento que modeliza las dinámicas del problema
+        env = self._create_training_environment(cgm_data, other_features, y)
+        
+        if verbose > 0:
+            print("Entrenando modelo de Iteración de Valor...")
+        
+        # Configurar máximo de iteraciones basado en epochs
+        self.vi_agent.max_iterations = max(epochs * 10, self.vi_agent.max_iterations)
+        
+        # Entrenar agente
+        vi_history = self.vi_agent.train(env)
+        
+        # Calcular pérdida en datos de entrenamiento
+        train_preds = self.predict(x)
+        train_loss = float(np.mean((train_preds.flatten() - y) ** 2))
+        self.history['loss'].append(train_loss)
+        
+        # Evaluar en datos de validación si se proporcionan
+        if validation_data:
+            val_x, val_y = validation_data
+            val_preds = self.predict(val_x)
+            val_loss = float(np.mean((val_preds.flatten() - val_y) ** 2))
+            self.history['val_loss'].append(val_loss)
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado. Pérdida final: {train_loss:.4f}")
+            if validation_data:
+                print(f"Pérdida de validación: {val_loss:.4f}")
+        
+        # Combinar historiales
+        combined_history = {
+            'loss': self.history['loss'],
+            'iterations': vi_history['iterations'],
+            'value_changes': vi_history['value_changes'],
+            'iteration_times': vi_history['iteration_times'],
+            'total_time': vi_history['total_time']
+        }
+        
+        if validation_data:
+            combined_history['val_loss'] = self.history['val_loss']
+        
+        return combined_history
+    
+    def _create_training_environment(
+        self, 
+        cgm_data: np.ndarray, 
+        other_features: np.ndarray, 
+        targets: np.ndarray
+    ) -> Any:
+        """
+        Crea un entorno de entrenamiento compatible con el agente de Iteración de Valor.
+        
+        Parámetros:
+        -----------
+        cgm_data : np.ndarray
+            Datos CGM
+        other_features : np.ndarray
+            Otras características
+        targets : np.ndarray
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno simulado para RL
+        """
+        from types import SimpleNamespace
+        
+        # Crear e inicializar el entorno con los datos proporcionados
+        env = self._create_env_class()
+        return env(cgm_data, other_features, targets, self)
+    
+    def _create_env_class(self):
+        """Crea y devuelve la clase del entorno de dosificación de insulina."""
+        PROBABILITY_OF_TRANSITION = 1.0
+        
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Modelar las dinámicas de transición necesarias para Value Iteration
+                self.P = self._build_transition_dynamics()
+                
+                # Inicializar espacios para compatibilidad con algoritmos RL
+                self._init_spaces()
+            
+            def _init_spaces(self):
+                """Inicializa los espacios de observación y acción."""
+                from types import SimpleNamespace
+                
+                self.observation_space = SimpleNamespace(
+                    shape=(1,),
+                    low=0,
+                    high=self.model.vi_agent.n_states - 1
+                )
+                
+                self.action_space = SimpleNamespace(
+                    n=self.model.vi_agent.n_actions,
+                    sample=self._sample_action
+                )
+                
+                # Agregar shape para visualización de la política
+                self.shape = (
+                    self.model.cgm_bins**2, 
+                    self.model.cgm_bins**2 * self.model.other_bins
+                )
+            
+            def _sample_action(self):
+                """Muestrea una acción aleatoria del espacio discreto."""
+                return self.rng.integers(0, self.model.vi_agent.n_actions)
+            
+            def _get_reward_for_state_action(self, s, a, dose):
+                """Calcula la recompensa para un estado y acción dados."""
+                rewards = []
+                
+                # Tomar muestras aleatorias para estimar recompensas
+                sample_indices = self.rng.integers(0, self.max_idx, 10)
+                for idx in sample_indices:
+                    state_idx = self.model._discretize_state(
+                        self.cgm[idx], self.features[idx]
+                    )
+                    if state_idx == s:
+                        target = self.targets[idx]
+                        # Recompensa como negativo del error absoluto
+                        reward = -abs(dose - target)
+                        rewards.append(reward)
+                
+                # Si no hay ejemplos relevantes, usar una estimación
+                if not rewards:
+                    # Penalización por defecto más alta para acciones extremas
+                    default_reward = -5.0
+                    if a == 0 or a == self.model.vi_agent.n_actions - 1:
+                        default_reward = -10.0
+                    rewards = [default_reward]
+                
+                return float(np.mean(rewards))
+            
+            def _build_transition_dynamics(self):
+                """Construye el modelo de dinámicas de transición para Value Iteration."""
+                return self._build_transition_batches()
+            
+            def _build_transition_batches(self):
+                """Construye las transiciones en lotes para optimizar memoria."""
+                P = {}
+                n_states = self.model.vi_agent.n_states
+                _ = self.model.vi_agent.n_actions
+                
+                # Cantidad de estados a procesar por iteración
+                batch_size = 1000
+                
+                # Construir modelo de transiciones por lotes
+                for state_batch_start in range(0, n_states, batch_size):
+                    state_batch_end = min(state_batch_start + batch_size, n_states)
+                    self._build_transitions_for_batch(P, state_batch_start, state_batch_end)
+                
+                return P
+            
+            def _build_transitions_for_batch(self, P, start_state, end_state):
+                """Construye transiciones para un lote de estados."""
+                n_actions = self.model.vi_agent.n_actions
+                
+                for s in range(start_state, end_state):
+                    P[s] = {}
+                    for a in range(n_actions):
+                        P[s][a] = []
+                        
+                        # Calcular dosis para esta acción
+                        dose = self.model._convert_action_to_dose(a)
+                        
+                        # Calcular recompensa para esta acción en este estado
+                        avg_reward = self._get_reward_for_state_action(s, a, dose)
+                        
+                        # Para Value Iteration, asumimos estado terminal después de cada acción
+                        P[s][a].append((PROBABILITY_OF_TRANSITION, s, avg_reward, True))
+                
+            def reset(self):
+                """Reinicia el entorno eligiendo un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self.model._discretize_state(
+                    self.cgm[self.current_idx],
+                    self.features[self.current_idx]
+                )
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso con la acción dada."""
+                # Convertir acción a dosis
+                dose = self.model._convert_action_to_dose(action)
+                
+                # Calcular recompensa como negativo del error absoluto
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self.model._discretize_state(
+                    self.cgm[self.current_idx],
+                    self.features[self.current_idx]
+                )
+                
+                # En este caso, consideramos episodios de un solo paso
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+            
+            def state_mapping(self, state_idx):
+                """Convierte un índice de estado a coordenadas para visualización."""
+                total_bins = self.model.cgm_bins**4 * self.model.other_bins**3
+                relative_idx = state_idx / total_bins
+                
+                # Convertir a coordenadas 2D aproximadas para visualización
+                grid_size = self.shape
+                i = int(relative_idx * grid_size[0])
+                j = int((relative_idx * total_bins) % grid_size[1])
+                
+                return i, j
+        
+        return InsulinDosingEnv
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        # Crear directorio si no existe
+        import os
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        # Guardar agente principal
+        self.vi_agent.save(filepath + "_vi_agent.pkl")
+        
+        # Guardar configuración del wrapper
+        import pickle
+        wrapper_data = {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'cgm_bins': self.cgm_bins,
+            'other_bins': self.other_bins
+        }
+        
+        with open(filepath + "_wrapper.pkl", 'wb') as f:
+            pickle.dump(wrapper_data, f)
+        
+        print(f"Modelo guardado en {filepath}")
+    
+    def load(self, filepath: str) -> None:
+        """
+        Carga el modelo desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
+        # Cargar agente principal
+        self.vi_agent.load(filepath + "_vi_agent.pkl")
+        
+        # Cargar configuración del wrapper
+        import pickle
+        with open(filepath + "_wrapper.pkl", 'rb') as f:
+            wrapper_data = pickle.load(f)
+        
+        self.cgm_shape = wrapper_data['cgm_shape']
+        self.other_features_shape = wrapper_data['other_features_shape']
+        self.cgm_bins = wrapper_data['cgm_bins']
+        self.other_bins = wrapper_data['other_bins']
+        
+        print(f"Modelo cargado desde {filepath}")
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario con configuración del modelo
+        """
+        return {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'n_states': self.vi_agent.n_states,
+            'n_actions': self.vi_agent.n_actions,
+            'gamma': self.vi_agent.gamma,
+            'theta': self.vi_agent.theta,
+            'cgm_bins': self.cgm_bins,
+            'other_bins': self.other_bins
+        }
+
+
+def create_value_iteration_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> ValueIterationWrapper:
+    """
+    Crea un modelo basado en Iteración de Valor para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    ValueIterationWrapper
+        Wrapper de Iteración de Valor que implementa la interfaz compatible con modelos de aprendizaje profundo
+    """
+    # Configurar el tamaño del espacio de estados y acciones
+    # Esto es una simplificación - en un caso real habría que definirlo según los datos
+    
+    # Estimación del espacio de estados basado en la discretización
+    cgm_bins = 8  # Bins para cada característica CGM
+    other_bins = 4  # Bins para cada característica adicional
+    cgm_features = 4  # Último valor, promedio, pendiente, variabilidad
+    other_features = 3  # Carbohidratos, glucosa, insulina a bordo
+    
+    # Calcular espacio de estados total (discretizado)
+    n_states = cgm_bins**cgm_features * other_bins**other_features
+    
+    # Para un problema de dosificación, discretizamos en niveles de dosis
+    n_actions = 20  # 20 niveles discretos (0 a 15 unidades)
+    
+    # Crear agente de Iteración de Valor con configuración óptima
+    vi_agent = ValueIteration(
+        n_states=n_states,
+        n_actions=n_actions,
+        gamma=VALUE_ITERATION_CONFIG['gamma'],
+        theta=VALUE_ITERATION_CONFIG['theta'],
+        max_iterations=VALUE_ITERATION_CONFIG['max_iterations']
+    )
+    
+    # Crear y devolver wrapper
+    return ValueIterationWrapper(vi_agent, cgm_shape, other_features_shape)

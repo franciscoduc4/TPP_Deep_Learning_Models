@@ -7,6 +7,7 @@ import pickle
 import time
 from typing import Dict, List, Tuple, Optional, Union, Any, NamedTuple
 from functools import partial
+from types import SimpleNamespace
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT) 
@@ -827,3 +828,437 @@ class SARSA:
         plt.ylabel(f'Dimensión de Estado {dim2}')
         plt.grid(alpha=0.2)
         plt.show()
+
+class SARSAWrapper:
+    """
+    Wrapper para hacer que SARSA sea compatible con la interfaz de modelos de aprendizaje profundo.
+    """
+    
+    def __init__(
+        self, 
+        sarsa_agent: SARSA, 
+        cgm_shape: Tuple[int, ...], 
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para SARSA.
+        
+        Parámetros:
+        -----------
+        sarsa_agent : SARSA
+            Agente SARSA a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        self.sarsa_agent = sarsa_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Para discretizar entradas continuas
+        self.cgm_bins = 10
+        self.other_bins = 5
+        
+        # Historial de entrenamiento
+        self.history = {'loss': [], 'val_loss': []}
+    
+    def __call__(self, inputs: List[np.ndarray]) -> np.ndarray:
+        """
+        Implementa la interfaz de llamada para predicción.
+        
+        Parámetros:
+        -----------
+        inputs : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis de insulina
+        """
+        return self.predict(inputs)
+    
+    def predict(self, inputs: List[np.ndarray]) -> np.ndarray:
+        """
+        Realiza predicciones con el modelo SARSA.
+        
+        Parámetros:
+        -----------
+        inputs : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        batch_size = cgm_data.shape[0]
+        
+        # Crear array para resultados
+        predictions = np.zeros((batch_size, 1))
+        
+        for i in range(batch_size):
+            # Convertir datos continuos a estado discreto
+            state = self._discretize_state(cgm_data[i], other_features[i])
+            
+            # Obtener acción según la política actual (sin exploración)
+            action = self.sarsa_agent.get_action(state, explore=False)
+            
+            # Convertir acción discreta a dosis continua
+            predictions[i, 0] = self._convert_action_to_dose(action)
+        
+        return predictions
+    
+    def _discretize_state(self, cgm_data: np.ndarray, other_features: np.ndarray) -> int:
+        """
+        Discretiza las entradas continuas a un índice de estado.
+        
+        Parámetros:
+        -----------
+        cgm_data : np.ndarray
+            Datos CGM para un ejemplo
+        other_features : np.ndarray
+            Otras características para un ejemplo
+            
+        Retorna:
+        --------
+        int
+            Índice de estado discretizado
+        """
+        # Extraer características clave de CGM
+        cgm_flat = cgm_data.flatten()
+        
+        # Extraer métricas: promedio, último valor, pendiente, variabilidad
+        cgm_mean = np.mean(cgm_flat)
+        cgm_last = cgm_flat[-1]
+        cgm_slope = cgm_flat[-1] - cgm_flat[0]
+        cgm_std = np.std(cgm_flat)
+        
+        # Discretizar características de CGM
+        cgm_mean_bin = min(int(cgm_mean / 300 * self.cgm_bins), self.cgm_bins - 1)
+        cgm_last_bin = min(int(cgm_last / 300 * self.cgm_bins), self.cgm_bins - 1)
+        cgm_slope_bin = min(int((cgm_slope + 100) / 200 * self.cgm_bins), self.cgm_bins - 1)
+        cgm_std_bin = min(int(cgm_std / 50 * self.cgm_bins), self.cgm_bins - 1)
+        
+        # Usar las características más relevantes de otras variables
+        # Asumiendo: carbInput, bgInput, IOB, ICR son las características importantes
+        carb_bin = min(int(other_features[0] / 100 * self.other_bins), self.other_bins - 1)
+        bg_bin = min(int(other_features[1] / 300 * self.other_bins), self.other_bins - 1)
+        iob_bin = min(int(other_features[2] / 10 * self.other_bins), self.other_bins - 1)
+        
+        # Combinar bins para crear un índice de estado único
+        # Usar una codificación posicional
+        state_index = cgm_mean_bin
+        state_index = state_index * self.cgm_bins + cgm_last_bin
+        state_index = state_index * self.cgm_bins + cgm_slope_bin
+        state_index = state_index * self.cgm_bins + cgm_std_bin
+        state_index = state_index * self.other_bins + carb_bin
+        state_index = state_index * self.other_bins + bg_bin
+        state_index = state_index * self.other_bins + iob_bin
+        
+        return state_index
+    
+    def _convert_action_to_dose(self, action: int) -> float:
+        """
+        Convierte una acción discreta a dosis continua.
+        
+        Parámetros:
+        -----------
+        action : int
+            Índice de acción discreta
+            
+        Retorna:
+        --------
+        float
+            Dosis de insulina
+        """
+        # Mapear desde [0, action_space_size-1] a [0, 15] unidades de insulina
+        return action * 15.0 / (self.sarsa_agent.action_space_size - 1)
+    
+    def fit(
+        self, 
+        x: List[np.ndarray], 
+        y: np.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: List = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Entrena el modelo SARSA en los datos proporcionados.
+        
+        Parámetros:
+        -----------
+        x : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+        y : np.ndarray
+            Etiquetas (dosis objetivo)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        callbacks : List, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia del entrenamiento
+        """
+        cgm_data, other_features = x
+        
+        # Crear entorno personalizado para SARSA
+        _ = self._create_training_environment(cgm_data, other_features, y)
+        
+        if verbose > 0:
+            print("Entrenando modelo SARSA...")
+        
+        # Entrenar agente SARSA
+        training_history = self.sarsa_agent.train(
+            episodes=epochs,
+            max_steps=batch_size,
+            render=False
+        )
+        
+        # Calcular pérdida en los datos de entrenamiento
+        train_preds = self.predict(x)
+        train_loss = float(np.mean((train_preds.flatten() - y) ** 2))
+        self.history['loss'].append(train_loss)
+        
+        # Evaluar en datos de validación si se proporcionan
+        if validation_data:
+            val_x, val_y = validation_data
+            val_preds = self.predict(val_x)
+            val_loss = float(np.mean((val_preds.flatten() - val_y) ** 2))
+            self.history['val_loss'].append(val_loss)
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado. Pérdida final: {train_loss:.4f}")
+            if validation_data:
+                print(f"Pérdida de validación: {val_loss:.4f}")
+        
+        # Combinar historial de SARSA con métricas adicionales
+        combined_history = {
+            'episode_rewards': training_history['rewards'],
+            'episode_lengths': training_history['lengths'],
+            'epsilons': training_history['epsilons'],
+            'loss': self.history['loss']
+        }
+        
+        if validation_data:
+            combined_history['val_loss'] = self.history['val_loss']
+            
+        return combined_history
+    
+    def _create_training_environment(
+        self, 
+        cgm_data: np.ndarray, 
+        other_features: np.ndarray, 
+        targets: np.ndarray
+    ) -> Any:
+        """
+        Crea un entorno de entrenamiento personalizado para SARSA.
+        
+        Parámetros:
+        -----------
+        cgm_data : np.ndarray
+            Datos CGM
+        other_features : np.ndarray
+            Otras características
+        targets : np.ndarray
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno de entrenamiento compatible con SARSA
+        """
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Para compatibilidad con interface de entorno
+                # Definir espacios de acción y observación discretos
+                self.action_space = SimpleNamespace(
+                    n=model_wrapper.sarsa_agent.action_space_size,
+                    sample=self._sample_action
+                )
+                
+                # Espacio de observación discreto basado en bins de discretización
+                n_states = model_wrapper.cgm_bins**4 * model_wrapper.other_bins**3
+                self.observation_space = SimpleNamespace(
+                    n=n_states,
+                    low=0,
+                    high=n_states-1
+                )
+            
+            def _sample_action(self):
+                """Muestrea una acción aleatoria del espacio discreto."""
+                return self.rng.integers(0, self.action_space.n)
+            
+            def reset(self):
+                """Reinicia el entorno eligiendo un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self.model._discretize_state(
+                    self.cgm[self.current_idx],
+                    self.features[self.current_idx]
+                )
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso con la acción dada."""
+                # Convertir acción a dosis
+                dose = self.model._convert_action_to_dose(action)
+                
+                # Calcular recompensa como negativo del error absoluto
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                _ = self.current_idx
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Discretizar próximo estado
+                next_state = self.model._discretize_state(
+                    self.cgm[self.current_idx],
+                    self.features[self.current_idx]
+                )
+                
+                # Terminal después de cada paso para entrenamiento episódico
+                done = True
+                
+                return next_state, reward, done, False, {}
+        
+        from types import SimpleNamespace
+        return InsulinDosingEnv(cgm_data, other_features, targets, self)
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        self.sarsa_agent.save(filepath + "_sarsa.pkl")
+        
+        import pickle
+        wrapper_data = {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'cgm_bins': self.cgm_bins,
+            'other_bins': self.other_bins
+        }
+        
+        with open(filepath + "_wrapper.pkl", 'wb') as f:
+            pickle.dump(wrapper_data, f)
+        
+        print(f"Modelo guardado en {filepath}")
+    
+    def load(self, filepath: str) -> None:
+        """
+        Carga el modelo desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
+        self.sarsa_agent.load(filepath + "_sarsa.pkl")
+        
+        import pickle
+        with open(filepath + "_wrapper.pkl", 'rb') as f:
+            wrapper_data = pickle.load(f)
+        
+        self.cgm_shape = wrapper_data['cgm_shape']
+        self.other_features_shape = wrapper_data['other_features_shape']
+        self.cgm_bins = wrapper_data['cgm_bins']
+        self.other_bins = wrapper_data['other_bins']
+        
+        print(f"Modelo cargado desde {filepath}")
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario con configuración del modelo
+        """
+        return {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'cgm_bins': self.cgm_bins,
+            'other_bins': self.other_bins,
+            'sarsa_config': self.sarsa_agent.config
+        }
+
+
+def create_sarsa_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> SARSAWrapper:
+    """
+    Crea un modelo basado en SARSA para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    SARSAWrapper
+        Wrapper de SARSA que implementa la interfaz compatible con modelos de aprendizaje profundo
+    """
+    # Crear un entorno temporal para pasar al constructor de SARSA
+    class TempEnv:
+        def __init__(self):
+            # Configurar espacios de acción y observación
+            # Espacio de acción: 20 niveles discretos (0-15 unidades)
+            self.action_space = SimpleNamespace(n=20)
+            
+            # Espacio de observación: basado en la discretización de características
+            cgm_bins = 10
+            other_bins = 5
+            n_states = cgm_bins**4 * other_bins**3  # 4 características CGM, 3 otras
+            self.observation_space = SimpleNamespace(n=n_states)
+    
+    # Crear entorno temporal
+    temp_env = TempEnv()
+    
+    # Personalizar configuración SARSA
+    sarsa_config = SARSA_CONFIG.copy()
+    sarsa_config.update({
+        'learning_rate': 0.1,
+        'epsilon_start': 0.3,
+        'epsilon_end': 0.01,
+        'epsilon_decay': 0.99,
+        'gamma': 0.95,
+        'episodes': 1000,
+        'max_steps': 100,
+        'log_interval': 100
+    })
+    
+    # Crear agente SARSA
+    sarsa_agent = SARSA(temp_env, sarsa_config, seed=42)
+    
+    # Crear y devolver wrapper
+    return SARSAWrapper(sarsa_agent, cgm_shape, other_features_shape)

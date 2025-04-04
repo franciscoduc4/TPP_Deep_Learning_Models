@@ -869,3 +869,373 @@ class PolicyIteration:
         
         plt.tight_layout()
         plt.show()
+
+class PolicyIterationWrapper:
+    """
+    Wrapper para hacer que el agente de Iteración de Política sea compatible con la interfaz de modelos de aprendizaje profundo.
+    """
+    
+    def __init__(
+        self, 
+        pi_agent: PolicyIteration, 
+        cgm_shape: Tuple[int, ...], 
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para Iteración de Política.
+        
+        Parámetros:
+        -----------
+        pi_agent : PolicyIteration
+            Agente de Iteración de Política a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        self.pi_agent = pi_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Para discretizar entradas continuas
+        self.cgm_bins = 10
+        self.other_bins = 5
+        self.history = {'loss': [], 'val_loss': []}
+    
+    def __call__(self, inputs: List[np.ndarray]) -> np.ndarray:
+        """
+        Implementa la interfaz de llamada para predicción.
+        
+        Parámetros:
+        -----------
+        inputs : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis de insulina
+        """
+        return self.predict(inputs)
+    
+    def predict(self, inputs: List[np.ndarray]) -> np.ndarray:
+        """
+        Realiza predicciones con el modelo de Iteración de Política.
+        
+        Parámetros:
+        -----------
+        inputs : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        np.ndarray
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        batch_size = cgm_data.shape[0]
+        
+        # Crear array para resultados
+        predictions = np.zeros((batch_size, 1))
+        
+        for i in range(batch_size):
+            # Discretizar estado
+            state = self._discretize_state(cgm_data[i], other_features[i])
+            
+            # Obtener acción según la política
+            action = self.pi_agent.get_action(state)
+            
+            # Convertir acción discreta a dosis continua
+            predictions[i, 0] = self._convert_action_to_dose(action)
+        
+        return predictions
+    
+    def _discretize_state(self, cgm_data: np.ndarray, other_features: np.ndarray) -> int:
+        """
+        Discretiza las entradas continuas a un índice de estado.
+        
+        Parámetros:
+        -----------
+        cgm_data : np.ndarray
+            Datos CGM para un ejemplo
+        other_features : np.ndarray
+            Otras características para un ejemplo
+            
+        Retorna:
+        --------
+        int
+            Índice de estado discretizado
+        """
+        # Simplificar CGM usando valores clave (último valor, pendiente, promedio)
+        cgm_flat = cgm_data.flatten()
+        cgm_mean = np.mean(cgm_flat)
+        cgm_last = cgm_flat[-1]
+        cgm_slope = cgm_flat[-1] - cgm_flat[0]
+        
+        # Discretizar características clave
+        cgm_mean_bin = min(int(cgm_mean * self.cgm_bins), self.cgm_bins - 1)
+        cgm_last_bin = min(int(cgm_last * self.cgm_bins), self.cgm_bins - 1)
+        cgm_slope_bin = min(int((cgm_slope + 1) * self.cgm_bins / 2), self.cgm_bins - 1)
+        
+        # Usar solo las primeras características más relevantes de other_features
+        relevant_features = other_features[:min(3, len(other_features))]
+        other_bins = [min(int(f * self.other_bins), self.other_bins - 1) for f in relevant_features]
+        
+        # Calcular índice de estado combinado
+        state = cgm_mean_bin
+        state = state * self.cgm_bins + cgm_last_bin
+        state = state * self.cgm_bins + cgm_slope_bin
+        
+        for b in other_bins:
+            state = state * self.other_bins + b
+            
+        return min(state, self.pi_agent.n_states - 1)
+    
+    def _convert_action_to_dose(self, action: int) -> float:
+        """
+        Convierte una acción discreta a dosis continua.
+        
+        Parámetros:
+        -----------
+        action : int
+            Índice de acción discreta
+            
+        Retorna:
+        --------
+        float
+            Dosis de insulina
+        """
+        # Mapear desde [0, n_actions-1] a [0, 15] unidades de insulina
+        return action * 15.0 / (self.pi_agent.n_actions - 1)
+    
+    def fit(
+        self, 
+        x: List[np.ndarray], 
+        y: np.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: List = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Entrena el modelo de Iteración de Política en los datos proporcionados.
+        
+        Parámetros:
+        -----------
+        x : List[np.ndarray]
+            Lista con [cgm_data, other_features]
+        y : np.ndarray
+            Etiquetas (dosis objetivo)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        callbacks : List, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia del entrenamiento
+        """
+        cgm_data, other_features = x
+        env = self._create_training_environment(cgm_data, other_features, y)
+        
+        if verbose > 0:
+            print("Entrenando modelo de Iteración de Política...")
+        
+        # Entrenar agente con un número de iteraciones basado en epochs
+        self.pi_agent.max_iterations = max(epochs, 10)
+        pi_history = self.pi_agent.train(env)
+        
+        # Calcular pérdida en los datos de entrenamiento
+        train_preds = self.predict(x)
+        train_loss = float(np.mean((train_preds.flatten() - y) ** 2))
+        self.history['loss'].append(train_loss)
+        
+        # Evaluar en datos de validación si se proporcionan
+        if validation_data:
+            val_x, val_y = validation_data
+            val_preds = self.predict(val_x)
+            val_loss = float(np.mean((val_preds.flatten() - val_y) ** 2))
+            self.history['val_loss'].append(val_loss)
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado. Pérdida final: {train_loss:.4f}")
+            if validation_data:
+                print(f"Pérdida de validación: {val_loss:.4f}")
+        
+        return self.history
+    
+    def _create_training_environment(
+        self, 
+        cgm_data: np.ndarray, 
+        other_features: np.ndarray, 
+        targets: np.ndarray
+    ) -> Any:
+        """
+        Crea un entorno de entrenamiento compatible con el agente de Iteración de Política.
+        
+        Parámetros:
+        -----------
+        cgm_data : np.ndarray
+            Datos CGM
+        other_features : np.ndarray
+            Otras características
+        targets : np.ndarray
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno simulado para RL
+        """
+        # Constantes para el entorno
+        TRANSITION_PROB = 1.0
+        
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = cgm
+                self.features = features
+                self.targets = targets
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Definir espacios de acción y observación para compatibilidad con RL
+                self.n_actions = model_wrapper.pi_agent.n_actions
+                self.n_states = model_wrapper.pi_agent.n_states
+                
+                # Modelar las dinámicas de transición
+                self.P = {}
+                for s in range(self.n_states):
+                    self.P[s] = {}
+                    for a in range(self.n_actions):
+                        # Para simplificar, cada acción lleva al terminal con recompensa basada en error
+                        dose = model_wrapper._convert_action_to_dose(a)
+                        self.P[s][a] = []
+                        
+                        # Calcular error promedio para esta acción en todos los estados
+                        errors = []
+                        for i in range(len(self.targets)):
+                            state = model_wrapper._discretize_state(self.cgm[i], self.features[i])
+                            if state == s:
+                                target = self.targets[i]
+                                error = -abs(dose - target)
+                                errors.append(error)
+                        
+                        # Si no hay ejemplos de este estado, usar recompensa neutral
+                        if not errors:
+                            errors = [-5.0]  # Penalización por defecto
+                            
+                        avg_error = np.mean(errors)
+                        
+                        # Transición al terminar episodio con la recompensa promedio
+                        self.P[s][a].append((TRANSITION_PROB, s, avg_error, True))
+            
+            def reset(self):
+                """Reinicia el entorno eligiendo un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self.model._discretize_state(
+                    self.cgm[self.current_idx],
+                    self.features[self.current_idx]
+                )
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso con la acción dada."""
+                state = self.model._discretize_state(
+                    self.cgm[self.current_idx],
+                    self.features[self.current_idx]
+                )
+                
+                # Convertir acción a dosis
+                dose = self.model._convert_action_to_dose(action)
+                
+                # Calcular recompensa
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Terminal después de cada paso
+                done = True
+                
+                return state, reward, done, False, {}
+        
+        return InsulinDosingEnv(cgm_data, other_features, targets, self)
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        self.pi_agent.save(filepath)
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario con configuración del modelo
+        """
+        return {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'n_states': self.pi_agent.n_states,
+            'n_actions': self.pi_agent.n_actions,
+            'gamma': self.pi_agent.gamma,
+            'theta': self.pi_agent.theta
+        }
+
+
+def create_policy_iteration_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> PolicyIterationWrapper:
+    """
+    Crea un modelo basado en Iteración de Política para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    PolicyIterationWrapper
+        Wrapper de Iteración de Política que implementa la interfaz compatible con modelos de aprendizaje profundo
+    """
+    # Configurar el tamaño del espacio de estados y acciones
+    # Esto es una simplificación - en un caso real habría que definirlo según los datos
+    n_states = 1000  # Estado discretizado (más estados para mayor precisión)
+    n_actions = 20   # Por ejemplo: 20 niveles discretos de dosis (0 a 15 unidades)
+    
+    # Crear agente de Iteración de Política
+    pi_agent = PolicyIteration(
+        n_states=n_states,
+        n_actions=n_actions,
+        gamma=POLICY_ITERATION_CONFIG['gamma'],
+        theta=POLICY_ITERATION_CONFIG['theta'],
+        max_iterations=POLICY_ITERATION_CONFIG['max_iterations'],
+        max_iterations_eval=POLICY_ITERATION_CONFIG['max_iterations_eval'],
+        seed=POLICY_ITERATION_CONFIG.get('seed', 42)
+    )
+    
+    # Crear y devolver wrapper
+    return PolicyIterationWrapper(pi_agent, cgm_shape, other_features_shape)
