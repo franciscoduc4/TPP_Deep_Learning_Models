@@ -1282,3 +1282,651 @@ class A3CWorker:
                 self._update_model_with_collected_data(
                     states, actions, rewards, dones, values, done, state, shared_history, model_lock
                 )
+
+class A2CWrapper:
+    """
+    Wrapper para hacer que el agente A2C sea compatible con la interfaz de modelos de aprendizaje profundo.
+    """
+    
+    def __init__(
+        self, 
+        a2c_agent: A2C, 
+        cgm_shape: Tuple[int, ...], 
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para A2C.
+        
+        Parámetros:
+        -----------
+        a2c_agent : A2C
+            Agente A2C a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        self.a2c_agent = a2c_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Inicializar clave para generación de números aleatorios
+        self.key = jax.random.PRNGKey(42)
+        self.key, self.encoder_key = jax.random.split(self.key)
+        
+        # Configurar funciones de codificación para entradas
+        self._setup_encoders()
+        
+        # Historial de entrenamiento
+        self.history = {
+            'loss': [],
+            'val_loss': [],
+            'policy_loss': [],
+            'value_loss': [],
+            'entropy_loss': [],
+            'episode_rewards': []
+        }
+    
+    def _setup_encoders(self) -> None:
+        """
+        Configura las funciones de codificación para procesar las entradas.
+        """
+        # Calcular dimensiones de características aplanadas
+        cgm_dim = np.prod(self.cgm_shape[1:])
+        other_dim = np.prod(self.other_features_shape[1:])
+        
+        # Inicializar matrices de transformación
+        self.key, key_cgm, key_other = jax.random.split(self.key, 3)
+        
+        # Crear matrices de proyección para entradas
+        self.cgm_weight = jax.random.normal(key_cgm, (cgm_dim, self.a2c_agent.state_dim // 2))
+        self.other_weight = jax.random.normal(key_other, (other_dim, self.a2c_agent.state_dim // 2))
+        
+        # JIT-compilar transformaciones para mayor rendimiento
+        self.encode_cgm = jax.jit(self._create_encoder_fn(self.cgm_weight))
+        self.encode_other = jax.jit(self._create_encoder_fn(self.other_weight))
+    
+    def _create_encoder_fn(self, weights: jnp.ndarray) -> Callable:
+        """
+        Crea una función de codificación.
+        
+        Parámetros:
+        -----------
+        weights : jnp.ndarray
+            Matriz de pesos para la transformación
+            
+        Retorna:
+        --------
+        Callable
+            Función de codificación JIT-compilada
+        """
+        def encoder_fn(x):
+            x_flat = x.reshape((x.shape[0], -1))
+            return jnp.tanh(jnp.dot(x_flat, weights))
+        return encoder_fn
+    
+    def __call__(self, inputs: List[jnp.ndarray]) -> jnp.ndarray:
+        """
+        Implementa la interfaz de llamada para predicción.
+        
+        Parámetros:
+        -----------
+        inputs : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Predicciones de dosis de insulina
+        """
+        return self.predict(inputs)
+    
+    def predict(self, inputs: List[jnp.ndarray]) -> jnp.ndarray:
+        """
+        Realiza predicciones con el modelo A2C.
+        
+        Parámetros:
+        -----------
+        inputs : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        
+        # Convertir a arrays de JAX si no lo son
+        cgm_data = jnp.array(cgm_data)
+        other_features = jnp.array(other_features)
+        
+        # Codificar entradas a estado
+        cgm_encoded = self.encode_cgm(cgm_data)
+        other_encoded = self.encode_other(other_features)
+        states = jnp.concatenate([cgm_encoded, other_encoded], axis=1)
+        
+        # Obtener acciones usando el agente A2C (modo determinístico para predicciones)
+        batch_size = states.shape[0]
+        actions = np.zeros((batch_size, 1))
+        
+        # Para cada muestra en el batch, obtener acción determinística
+        for i in range(batch_size):
+            state = np.array(states[i])
+            # Usar PRNG key para cada predicción
+            self.key, action_key = jax.random.split(self.key)
+            # Obtener acción determinística
+            action, _ = self.a2c_agent.model.get_action(
+                self.a2c_agent.state.params, 
+                state, 
+                action_key,
+                deterministic=True
+            )
+            
+            # Convertir a dosis de insulina (asumiendo espacio continuo)
+            if self.a2c_agent.model.continuous:
+                action_value = action[0]  # Acción ya continua
+            else:
+                # Para acciones discretas, convertir índice a valor continuo
+                # Asumiendo 20 niveles discretos que mapean a 0-15 unidades
+                action_value = action / (self.a2c_agent.model.action_dim - 1) * 15.0
+                
+            actions[i, 0] = action_value
+            
+        return actions
+    
+    def fit(
+        self, 
+        x: List[jnp.ndarray], 
+        y: jnp.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: List = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Entrena el modelo A2C en los datos proporcionados.
+        
+        Parámetros:
+        -----------
+        x : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+        y : jnp.ndarray
+            Etiquetas (dosis objetivo)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        callbacks : List, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia del entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando modelo A2C...")
+            
+        # Crear entorno simulado para RL a partir de los datos
+        env = self._create_training_environment(x[0], x[1], y)
+        
+        # Entrenar el agente A2C
+        a2c_history = self.a2c_agent.train(
+            env=env,
+            n_steps=batch_size // 4,  # Tamaño del lote para actualización A2C
+            epochs=epochs,
+            render=False
+        )
+        
+        # Actualizar historial con métricas del entrenamiento
+        self.history['policy_loss'].extend(a2c_history.get('policy_losses', [0.0]))
+        self.history['value_loss'].extend(a2c_history.get('value_losses', [0.0]))
+        self.history['entropy_loss'].extend(a2c_history.get('entropy_losses', [0.0]))
+        self.history['episode_rewards'].extend(a2c_history.get('episode_rewards', [0.0]))
+        
+        # Calcular pérdida en datos de entrenamiento
+        train_preds = self.predict(x)
+        train_loss = float(jnp.mean((train_preds.flatten() - y) ** 2))
+        self.history['loss'].append(train_loss)
+        
+        # Evaluar en datos de validación si se proporcionan
+        if validation_data:
+            val_x, val_y = validation_data
+            val_preds = self.predict(val_x)
+            val_loss = float(jnp.mean((val_preds.flatten() - val_y) ** 2))
+            self.history['val_loss'].append(val_loss)
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado. Pérdida final: {train_loss:.4f}")
+            if validation_data:
+                print(f"Pérdida de validación: {val_loss:.4f}")
+        
+        return self.history
+    
+    def _create_training_environment(
+        self, 
+        cgm_data: jnp.ndarray, 
+        other_features: jnp.ndarray, 
+        targets: jnp.ndarray
+    ) -> Any:
+        """
+        Crea un entorno de entrenamiento para RL a partir de los datos.
+        
+        Parámetros:
+        -----------
+        cgm_data : jnp.ndarray
+            Datos CGM
+        other_features : jnp.ndarray
+            Otras características
+        targets : jnp.ndarray
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno simulado para RL
+        """
+        # Crear entorno personalizado para A2C/A3C
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = np.array(cgm)
+                self.features = np.array(features)
+                self.targets = np.array(targets)
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Para compatibilidad con algoritmos RL
+                self.observation_space = SimpleNamespace(
+                    shape=(model_wrapper.a2c_agent.state_dim,),
+                    low=np.full((model_wrapper.a2c_agent.state_dim,), -10.0),
+                    high=np.full((model_wrapper.a2c_agent.state_dim,), 10.0)
+                )
+                
+                if model_wrapper.a2c_agent.model.continuous:
+                    self.action_space = SimpleNamespace(
+                        shape=(1,),
+                        low=np.array([0.0]),
+                        high=np.array([15.0]), # Max 15 unidades de insulina
+                        sample=self._sample_continuous_action
+                    )
+                else:
+                    self.action_space = SimpleNamespace(
+                        n=model_wrapper.a2c_agent.model.action_dim,
+                        sample=lambda: self.rng.integers(0, model_wrapper.a2c_agent.model.action_dim)
+                    )
+            
+            def _sample_continuous_action(self):
+                """Muestrea una acción aleatoria del espacio continuo."""
+                return self.rng.uniform(
+                    self.action_space.low,
+                    self.action_space.high
+                )
+            
+            def reset(self):
+                """Reinicia el entorno eligiendo un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso con la acción dada."""
+                # Convertir acción a dosis según tipo de espacio de acción
+                if hasattr(self.action_space, 'shape'):  # Acción continua
+                    dose = action[0]
+                else:  # Acción discreta
+                    dose = action / (self.model.a2c_agent.model.action_dim - 1) * 15.0
+                
+                # Calcular recompensa como negativo del error absoluto
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de un paso (para este problema)
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+            
+            def _get_state(self):
+                """Obtiene el estado codificado para el ejemplo actual."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar a espacio de estado
+                cgm_encoded = self.model.encode_cgm(jnp.array(cgm_batch))
+                other_encoded = self.model.encode_other(jnp.array(features_batch))
+                
+                # Combinar características
+                state = np.concatenate([cgm_encoded[0], other_encoded[0]])
+                
+                return state
+        
+        # Importar lo necesario para el entorno
+        from types import SimpleNamespace
+        
+        # Crear y devolver el entorno
+        return InsulinDosingEnv(cgm_data, other_features, targets, self)
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo A2C en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        # Crear directorio si no existe
+        import os
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        # Guardar el agente A2C
+        self.a2c_agent.save_model(filepath + "_a2c.h5")
+        
+        # Guardar datos adicionales del wrapper
+        import pickle
+        wrapper_data = {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'cgm_weight': self.cgm_weight,
+            'other_weight': self.other_weight,
+            'state_dim': self.a2c_agent.state_dim
+        }
+        
+        with open(filepath + "_wrapper.pkl", 'wb') as f:
+            pickle.dump(wrapper_data, f)
+        
+        print(f"Modelo guardado en {filepath}")
+    
+    def load(self, filepath: str) -> None:
+        """
+        Carga el modelo A2C desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
+        # Cargar el agente A2C
+        self.a2c_agent.load_model(filepath + "_a2c.h5")
+        
+        # Cargar datos adicionales del wrapper
+        import pickle
+        with open(filepath + "_wrapper.pkl", 'rb') as f:
+            wrapper_data = pickle.load(f)
+        
+        self.cgm_shape = wrapper_data['cgm_shape']
+        self.other_features_shape = wrapper_data['other_features_shape']
+        self.cgm_weight = wrapper_data['cgm_weight']
+        self.other_weight = wrapper_data['other_weight']
+        
+        # Recompilar funciones de codificación
+        self.encode_cgm = jax.jit(self._create_encoder_fn(self.cgm_weight))
+        self.encode_other = jax.jit(self._create_encoder_fn(self.other_weight))
+        
+        print(f"Modelo cargado desde {filepath}")
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario con configuración del modelo
+        """
+        return {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'state_dim': self.a2c_agent.state_dim,
+            'continuous': self.a2c_agent.model.continuous,
+            'gamma': self.a2c_agent.gamma,
+            'entropy_coef': self.a2c_agent.entropy_coef,
+            'value_coef': self.a2c_agent.value_coef
+        }
+
+
+class A3CWrapper(A2CWrapper):
+    """
+    Wrapper para hacer que el agente A3C sea compatible con la interfaz de modelos de aprendizaje profundo.
+    Extiende el wrapper A2C añadiendo funcionalidad para entrenamiento asíncrono.
+    """
+    
+    def __init__(
+        self, 
+        a3c_agent: A3C, 
+        cgm_shape: Tuple[int, ...], 
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para A3C.
+        
+        Parámetros:
+        -----------
+        a3c_agent : A3C
+            Agente A3C a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        # Llamar al constructor de la clase padre
+        super(A3CWrapper, self).__init__(a3c_agent, cgm_shape, other_features_shape)
+    
+    def fit(
+        self, 
+        x: List[jnp.ndarray], 
+        y: jnp.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: List = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Entrena el modelo A3C en los datos proporcionados utilizando múltiples workers.
+        
+        Parámetros:
+        -----------
+        x : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+        y : jnp.ndarray
+            Etiquetas (dosis objetivo)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        callbacks : List, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia del entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando modelo A3C con múltiples workers...")
+        
+        # Función para crear entornos
+        def create_env_fn():
+            return self._create_training_environment(x[0], x[1], y)
+        
+        # Entrenar el agente A3C en modo asíncrono
+        # Calcula pasos totales como epochs * batch_size
+        total_steps = epochs * batch_size
+        
+        a3c_history = self.a2c_agent.train_async(
+            env_fn=create_env_fn,
+            n_steps=batch_size // 4,  # Tamaño del lote para actualización A3C por worker
+            total_steps=total_steps,
+            render=False
+        )
+        
+        # Actualizar historial con métricas del entrenamiento
+        self.history['episode_rewards'].extend(a3c_history.get('episode_rewards', [0.0]))
+        self.history['policy_loss'].extend(a3c_history.get('policy_losses', [0.0]))
+        self.history['value_loss'].extend(a3c_history.get('value_losses', [0.0]))
+        self.history['entropy_loss'].extend(a3c_history.get('entropy_losses', [0.0]))
+        
+        # Calcular pérdida en datos de entrenamiento
+        train_preds = self.predict(x)
+        train_loss = float(jnp.mean((train_preds.flatten() - y) ** 2))
+        self.history['loss'].append(train_loss)
+        
+        # Evaluar en datos de validación si se proporcionan
+        if validation_data:
+            val_x, val_y = validation_data
+            val_preds = self.predict(val_x)
+            val_loss = float(jnp.mean((val_preds.flatten() - val_y) ** 2))
+            self.history['val_loss'].append(val_loss)
+        
+        if verbose > 0:
+            print(f"Entrenamiento asíncrono completado. Pérdida final: {train_loss:.4f}")
+            if validation_data:
+                print(f"Pérdida de validación: {val_loss:.4f}")
+        
+        return self.history
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo A3C en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        super(A3CWrapper, self).save(filepath.replace("a2c", "a3c"))
+    
+    def load(self, filepath: str) -> None:
+        """
+        Carga el modelo A3C desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
+        super(A3CWrapper, self).load(filepath.replace("a2c", "a3c"))
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario con configuración del modelo
+        """
+        config = super(A3CWrapper, self).get_config()
+        config['n_workers'] = self.a2c_agent.n_workers
+        return config
+
+
+def create_a2c_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> A2CWrapper:
+    """
+    Crea un modelo basado en A2C (Advantage Actor-Critic) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    A2CWrapper
+        Wrapper de A2C que implementa la interfaz compatible con modelos de aprendizaje profundo
+    """
+    # Configurar el espacio de estados y acciones
+    state_dim = 64  # Dimensión del espacio de estado latente
+    action_dim = 1  # Una dimensión para dosis continua
+    continuous = True  # Usar espacio de acción continuo
+    
+    # Crear agente A2C con configuración específica
+    a2c_agent = A2C(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        continuous=continuous,
+        learning_rate=A2C_A3C_CONFIG['learning_rate'],
+        gamma=A2C_A3C_CONFIG['gamma'],
+        entropy_coef=A2C_A3C_CONFIG['entropy_coef'],
+        value_coef=A2C_A3C_CONFIG['value_coef'],
+        max_grad_norm=A2C_A3C_CONFIG['max_grad_norm'],
+        hidden_units=A2C_A3C_CONFIG['hidden_units'],
+        seed=42
+    )
+    
+    # Crear y devolver wrapper
+    return A2CWrapper(
+        a2c_agent=a2c_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )
+
+
+def create_a3c_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> A3CWrapper:
+    """
+    Crea un modelo basado en A3C (Asynchronous Advantage Actor-Critic) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    A3CWrapper
+        Wrapper de A3C que implementa la interfaz compatible con modelos de aprendizaje profundo
+    """
+    # Configurar el espacio de estados y acciones
+    state_dim = 64  # Dimensión del espacio de estado latente
+    action_dim = 1  # Una dimensión para dosis continua
+    continuous = True  # Usar espacio de acción continuo
+    n_workers = A2C_A3C_CONFIG.get('n_workers', 4)  # Número de workers para entrenamiento asíncrono
+    
+    # Crear agente A3C con configuración específica
+    a3c_agent = A3C(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        continuous=continuous,
+        n_workers=n_workers,
+        learning_rate=A2C_A3C_CONFIG['learning_rate'],
+        gamma=A2C_A3C_CONFIG['gamma'],
+        entropy_coef=A2C_A3C_CONFIG['entropy_coef'],
+        value_coef=A2C_A3C_CONFIG['value_coef'],
+        max_grad_norm=A2C_A3C_CONFIG['max_grad_norm'],
+        hidden_units=A2C_A3C_CONFIG['hidden_units'],
+        seed=42
+    )
+    
+    # Crear y devolver wrapper
+    return A3CWrapper(
+        a3c_agent=a3c_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )

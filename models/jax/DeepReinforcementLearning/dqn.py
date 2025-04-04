@@ -960,3 +960,449 @@ class DQN:
         
         plt.tight_layout()
         plt.show()
+
+class DQNWrapper:
+    """
+    Wrapper para hacer que el agente DQN sea compatible con la interfaz de modelos de aprendizaje profundo.
+    """
+    
+    def __init__(
+        self, 
+        dqn_agent: DQN, 
+        cgm_shape: Tuple[int, ...], 
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para DQN.
+        
+        Parámetros:
+        -----------
+        dqn_agent : DQN
+            Agente DQN a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        self.dqn_agent = dqn_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Inicializar clave para generador de números aleatorios
+        self.key = jax.random.PRNGKey(42)
+        self.key, self.encoder_key = jax.random.split(self.key)
+        
+        # Configurar funciones de codificación para entradas
+        self._setup_encoders()
+        
+        # Historial de entrenamiento
+        self.history = {
+            'loss': [],
+            'val_loss': [],
+            'episode_rewards': [],
+            'avg_q_values': []
+        }
+    
+    def _setup_encoders(self) -> None:
+        """
+        Configura las funciones de codificación para procesar las entradas.
+        """
+        # Calcular dimensiones de entrada aplanadas
+        cgm_dim = np.prod(self.cgm_shape[1:])
+        other_dim = np.prod(self.other_features_shape[1:])
+        
+        # Inicializar matrices de transformación
+        self.key, key_cgm, key_other = jax.random.split(self.key, 3)
+        
+        # Crear matrices de proyección para la codificación de entradas
+        self.cgm_weight = jax.random.normal(key_cgm, (cgm_dim, self.dqn_agent.state_dim // 2))
+        self.other_weight = jax.random.normal(key_other, (other_dim, self.dqn_agent.state_dim // 2))
+        
+        # JIT-compilar transformaciones para mayor rendimiento
+        self.encode_cgm = jax.jit(self._create_encoder_fn(self.cgm_weight))
+        self.encode_other = jax.jit(self._create_encoder_fn(self.other_weight))
+    
+    def _create_encoder_fn(self, weights: jnp.ndarray) -> Callable:
+        """
+        Crea una función de codificación.
+        
+        Parámetros:
+        -----------
+        weights : jnp.ndarray
+            Matriz de pesos para la transformación
+            
+        Retorna:
+        --------
+        Callable
+            Función de codificación JIT-compilada
+        """
+        def encoder_fn(x):
+            x_flat = x.reshape((x.shape[0], -1))
+            return jnp.tanh(jnp.dot(x_flat, weights))
+        return encoder_fn
+    
+    def __call__(self, inputs: List[jnp.ndarray]) -> jnp.ndarray:
+        """
+        Implementa la interfaz de llamada para predicción.
+        
+        Parámetros:
+        -----------
+        inputs : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Predicciones de dosis de insulina
+        """
+        return self.predict(inputs)
+    
+    def predict(self, inputs: List[jnp.ndarray]) -> jnp.ndarray:
+        """
+        Realiza predicciones con el modelo DQN.
+        
+        Parámetros:
+        -----------
+        inputs : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        
+        # Convertir a arrays de JAX si no lo son
+        cgm_data = jnp.array(cgm_data)
+        other_features = jnp.array(other_features)
+        
+        # Codificar entradas a representación de estado
+        cgm_encoded = self.encode_cgm(cgm_data)
+        other_encoded = self.encode_other(other_features)
+        states = jnp.concatenate([cgm_encoded, other_encoded], axis=1)
+        
+        # Convertir a dosis usando política DQN (sin exploración)
+        batch_size = states.shape[0]
+        actions = np.zeros((batch_size, 1))
+        
+        # Para cada muestra en el batch, obtener acción determinística
+        for i in range(batch_size):
+            state = np.array(states[i])
+            # Usar DQN para obtener acción sin exploración
+            action = self.dqn_agent.get_action(state, epsilon=0.0)
+            # Convertir índice discreto a valor continuo de dosis (0-15 unidades)
+            action_value = action / (self.dqn_agent.action_dim - 1) * 15.0
+            actions[i, 0] = action_value
+        
+        return actions
+    
+    def fit(
+        self, 
+        x: List[jnp.ndarray], 
+        y: jnp.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: List = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Entrena el modelo DQN en los datos proporcionados.
+        
+        Parámetros:
+        -----------
+        x : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+        y : jnp.ndarray
+            Etiquetas (dosis objetivo)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de episodios (default: 1)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        callbacks : List, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia del entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando modelo DQN...")
+            
+        # Crear entorno simulado para RL a partir de los datos
+        env = self._create_training_environment(x[0], x[1], y)
+        
+        # Entrenar el agente DQN
+        dqn_history = self.dqn_agent.train(
+            env=env,
+            episodes=epochs,
+            max_steps=batch_size,
+            update_after=min(1000, batch_size // 2),
+            update_every=4,
+            render=False,
+            log_interval=max(1, epochs // 10) if verbose > 0 else epochs + 1
+        )
+        
+        # Actualizar historial con métricas del entrenamiento
+        self.history['episode_rewards'].extend(dqn_history.get('episode_rewards', []))
+        self.history['avg_q_values'].extend(dqn_history.get('avg_q_values', []))
+        
+        # Calcular pérdida en los datos de entrenamiento
+        train_preds = self.predict(x)
+        train_loss = float(jnp.mean((train_preds.flatten() - y) ** 2))
+        self.history['loss'].append(train_loss)
+        
+        # Evaluar en datos de validación si se proporcionan
+        if validation_data:
+            val_x, val_y = validation_data
+            val_preds = self.predict(val_x)
+            val_loss = float(jnp.mean((val_preds.flatten() - val_y) ** 2))
+            self.history['val_loss'].append(val_loss)
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado. Pérdida final: {train_loss:.4f}")
+            if validation_data:
+                print(f"Pérdida de validación: {val_loss:.4f}")
+        
+        return self.history
+    
+    def _create_training_environment(
+        self, 
+        cgm_data: jnp.ndarray, 
+        other_features: jnp.ndarray, 
+        targets: jnp.ndarray
+    ) -> Any:
+        """
+        Crea un entorno de entrenamiento para RL a partir de los datos.
+        
+        Parámetros:
+        -----------
+        cgm_data : jnp.ndarray
+            Datos CGM
+        other_features : jnp.ndarray
+            Otras características
+        targets : jnp.ndarray
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno simulado para RL
+        """
+        # Crear entorno personalizado para DQN
+        class InsulinDosingEnv:
+            """Entorno personalizado para problema de dosificación de insulina."""
+            
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = np.array(cgm)
+                self.features = np.array(features)
+                self.targets = np.array(targets)
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Para compatibilidad con algoritmos RL
+                self.observation_space = SimpleNamespace(
+                    shape=(model_wrapper.dqn_agent.state_dim,),
+                    low=np.full((model_wrapper.dqn_agent.state_dim,), -10.0),
+                    high=np.full((model_wrapper.dqn_agent.state_dim,), 10.0)
+                )
+                
+                self.action_space = SimpleNamespace(
+                    n=model_wrapper.dqn_agent.action_dim,
+                    sample=lambda: self.rng.integers(0, model_wrapper.dqn_agent.action_dim)
+                )
+            
+            def reset(self):
+                """Reinicia el entorno eligiendo un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso con la acción dada."""
+                # Convertir acción discreta a dosis continua
+                dose = action / (self.model.dqn_agent.action_dim - 1) * 15.0
+                
+                # Calcular recompensa como negativo del error absoluto
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de un paso
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+            
+            def _get_state(self):
+                """Obtiene el estado codificado para el ejemplo actual."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar a espacio de estado
+                cgm_encoded = self.model.encode_cgm(jnp.array(cgm_batch))
+                other_encoded = self.model.encode_other(jnp.array(features_batch))
+                
+                # Combinar características
+                state = np.concatenate([cgm_encoded[0], other_encoded[0]])
+                
+                return state
+        
+        # Importar lo necesario para el entorno
+        from types import SimpleNamespace
+        
+        # Crear y devolver el entorno
+        return InsulinDosingEnv(cgm_data, other_features, targets, self)
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo DQN en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        # Crear directorio si no existe
+        import os
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        # Guardar el agente DQN
+        self.dqn_agent.save_model(filepath + "_dqn.h5")
+        
+        # Guardar datos adicionales del wrapper
+        import pickle
+        wrapper_data = {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'cgm_weight': self.cgm_weight,
+            'other_weight': self.other_weight,
+            'state_dim': self.dqn_agent.state_dim,
+            'action_dim': self.dqn_agent.action_dim
+        }
+        
+        with open(filepath + "_wrapper.pkl", 'wb') as f:
+            pickle.dump(wrapper_data, f)
+        
+        print(f"Modelo guardado en {filepath}")
+    
+    def load(self, filepath: str) -> None:
+        """
+        Carga el modelo DQN desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
+        # Cargar el agente DQN
+        self.dqn_agent.load_model(filepath + "_dqn.h5")
+        
+        # Cargar datos adicionales del wrapper
+        import pickle
+        with open(filepath + "_wrapper.pkl", 'rb') as f:
+            wrapper_data = pickle.load(f)
+        
+        self.cgm_shape = wrapper_data['cgm_shape']
+        self.other_features_shape = wrapper_data['other_features_shape']
+        self.cgm_weight = wrapper_data['cgm_weight']
+        self.other_weight = wrapper_data['other_weight']
+        
+        # Recompilar funciones de codificación
+        self.encode_cgm = jax.jit(self._create_encoder_fn(self.cgm_weight))
+        self.encode_other = jax.jit(self._create_encoder_fn(self.other_weight))
+        
+        print(f"Modelo cargado desde {filepath}")
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario con configuración del modelo
+        """
+        return {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'state_dim': self.dqn_agent.state_dim,
+            'action_dim': self.dqn_agent.action_dim,
+            'hidden_units': self.dqn_agent.hidden_units,
+            'gamma': self.dqn_agent.gamma,
+            'epsilon': self.dqn_agent.epsilon
+        }
+
+
+def create_dqn_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> DQNWrapper:
+    """
+    Crea un modelo basado en DQN (Deep Q-Network) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    DQNWrapper
+        Wrapper de DQN que implementa la interfaz compatible con modelos de aprendizaje profundo
+    """
+    # Configurar el espacio de estados y acciones
+    state_dim = 64  # Dimensión del espacio de estados codificado
+    action_dim = 20  # 20 niveles discretos para dosis (0 a 15 unidades)
+    
+    # Crear configuración para el agente DQN
+    config = {
+        'learning_rate': DQN_CONFIG['learning_rate'],
+        'gamma': DQN_CONFIG['gamma'],
+        'epsilon_start': DQN_CONFIG['epsilon_start'],
+        'epsilon_end': DQN_CONFIG['epsilon_end'],
+        'epsilon_decay': DQN_CONFIG['epsilon_decay'],
+        'buffer_capacity': DQN_CONFIG['buffer_capacity'],
+        'batch_size': DQN_CONFIG['batch_size'],
+        'target_update_freq': DQN_CONFIG['target_update_freq'],
+        'dueling': DQN_CONFIG['dueling'],
+        'double': DQN_CONFIG['double'],
+        'prioritized': DQN_CONFIG['prioritized'],
+        'hidden_units': DQN_CONFIG['hidden_units'],
+        'dropout_rate': DQN_CONFIG['dropout_rate'],
+        'activation': DQN_CONFIG['activation'],
+        'priority_alpha': DQN_CONFIG['priority_alpha'],
+        'priority_beta': DQN_CONFIG['priority_beta'],
+        'priority_beta_increment': DQN_CONFIG['priority_beta_increment'],
+        'epsilon': DQN_CONFIG['epsilon']
+    }
+    
+    # Crear agente DQN
+    dqn_agent = DQN(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        config=config,
+        hidden_units=DQN_CONFIG['hidden_units'],
+        seed=42
+    )
+    
+    # Crear y devolver wrapper
+    return DQNWrapper(
+        dqn_agent=dqn_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )

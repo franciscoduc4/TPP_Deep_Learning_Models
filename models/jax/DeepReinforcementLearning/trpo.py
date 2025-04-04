@@ -6,6 +6,7 @@ import time
 import flax
 import flax.linen as nn
 import optax
+import pickle
 from flax.training import train_state
 from typing import Dict, List, Tuple, Any, Optional, Union, Callable, Sequence
 
@@ -1537,3 +1538,412 @@ class TRPO:
         
         plt.tight_layout()
         plt.show()
+class TRPOWrapper:
+    """
+    Wrapper para el algoritmo TRPO que implementa la interfaz compatible con modelos de aprendizaje profundo.
+    """
+    
+    def __init__(
+        self, 
+        trpo_agent: TRPO,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para TRPO.
+        
+        Parámetros:
+        -----------
+        trpo_agent : TRPO
+            Agente TRPO a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        self.trpo_agent = trpo_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Preprocesadores para convertir entradas a espacio de estado
+        self.cgm_encoder = None
+        self.other_encoder = None
+        
+        # Configurar funciones de codificación
+        self._setup_encoders()
+        
+        # Historial de entrenamiento
+        self.history = {
+            'loss': [],
+            'val_loss': [],
+            'policy_loss': [],
+            'value_loss': [],
+            'kl': []
+        }
+    
+    def _setup_encoders(self) -> None:
+        """
+        Configura las funciones de codificación para procesar datos de entrada.
+        """
+        # Inicializa parámetros para la codificación
+        self.key = jax.random.key(42)
+        
+        # Funciones de codificación con hparams
+        def init_encoder_params(key, input_shape, hidden_sizes):
+            """Inicializa parámetros para un codificador MLP."""
+            sizes = [np.prod(input_shape)] + hidden_sizes
+            keys = jax.random.split(key, len(sizes))
+            
+            params = []
+            for i in range(len(sizes) - 1):
+                w_key, b_key = jax.random.split(keys[i])
+                w = jax.random.normal(w_key, (sizes[i], sizes[i + 1])) * 0.01
+                b = jax.random.normal(b_key, (sizes[i + 1],)) * 0.01
+                params.append((w, b))
+            
+            return params
+        
+        # Inicializar parámetros para ambos codificadores
+        self.key, key1, key2 = jax.random.split(self.key, 3)
+        self.cgm_params = init_encoder_params(key1, self.cgm_shape[1:], [32, 16])
+        self.other_params = init_encoder_params(key2, self.other_features_shape[1:], [16, 8])
+        
+        # Compilar funciones con JIT para mayor rendimiento
+        self.cgm_encoder = jax.jit(self._create_encoder_fn(self.cgm_params))
+        self.other_encoder = jax.jit(self._create_encoder_fn(self.other_params))
+    
+    def _create_encoder_fn(self, params: List) -> Callable:
+        """
+        Crea una función de codificación JAX.
+        
+        Parámetros:
+        -----------
+        params : List
+            Parámetros del codificador
+            
+        Retorna:
+        --------
+        Callable
+            Función de codificación JIT-compilada
+        """
+        def encoder_fn(x):
+            x = x.reshape((x.shape[0], -1))  # Aplanar entrada
+            for i, (w, b) in enumerate(params):
+                x = jnp.dot(x, w) + b
+                if i < len(params) - 1:
+                    x = jnp.tanh(x)  # Activación no lineal
+            return x
+        return encoder_fn
+    
+    def __call__(self, inputs: List[jnp.ndarray]) -> jnp.ndarray:
+        """
+        Implementa la interfaz de llamada para predicción.
+        
+        Parámetros:
+        -----------
+        inputs : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Predicciones de dosis de insulina
+        """
+        return self.predict(inputs)
+    
+    def predict(self, inputs: List[jnp.ndarray]) -> jnp.ndarray:
+        """
+        Realiza predicciones con el modelo TRPO.
+        
+        Parámetros:
+        -----------
+        inputs : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        
+        # Codificar entradas a representación de estado
+        cgm_encoded = self.cgm_encoder(cgm_data)
+        other_encoded = self.other_encoder(other_features)
+        
+        # Combinar características en representación de estado
+        states = jnp.concatenate([cgm_encoded, other_encoded], axis=-1)
+        
+        # Usar política del agente para predecir acciones (dosis)
+        batch_size = states.shape[0]
+        actions = np.zeros((batch_size, 1))
+        
+        # Predecir para cada ejemplo en el batch
+        for i in range(batch_size):
+            state = np.array(states[i])
+            # Usar política determinística (media de la distribución)
+            action = self.trpo_agent.get_action(state, deterministic=True)
+            actions[i] = action
+        
+        return actions
+    
+    def fit(
+        self, 
+        x: List[jnp.ndarray], 
+        y: jnp.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: list = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Entrena el modelo TRPO en los datos proporcionados.
+        
+        Parámetros:
+        -----------
+        x : List[jnp.ndarray]
+            Lista con [cgm_data, other_features]
+        y : jnp.ndarray
+            Etiquetas (dosis objetivo)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        callbacks : list, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia del entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando modelo TRPO...")
+        
+        # Crear entorno simulado para RL a partir de los datos
+        env = self._create_training_environment(x[0], x[1], y)
+        
+        # Entrenar el agente TRPO
+        train_metrics = self.trpo_agent.train(
+            env=env,
+            iterations=epochs,
+            batch_size=batch_size
+        )
+        
+        # Actualizar historial con métricas del entrenamiento
+        for key, values in train_metrics.items():
+            if key in self.history:
+                self.history[key].extend(values)
+        
+        # Evaluar en datos de validación si se proporcionan
+        if validation_data:
+            val_x, val_y = validation_data
+            val_preds = self.predict(val_x)
+            val_loss = jnp.mean((val_preds.flatten() - val_y) ** 2)
+            self.history['val_loss'].append(float(val_loss))
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado en {len(train_metrics.get('iterations', []))} iteraciones")
+        
+        return self.history
+    
+    def _create_training_environment(
+        self, 
+        cgm_data: jnp.ndarray, 
+        other_features: jnp.ndarray, 
+        targets: jnp.ndarray
+    ) -> Any:
+        """
+        Crea un entorno de entrenamiento para RL a partir de los datos.
+        
+        Parámetros:
+        -----------
+        cgm_data : jnp.ndarray
+            Datos CGM
+        other_features : jnp.ndarray
+            Otras características
+        targets : jnp.ndarray
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno simulado para RL
+        """
+        # Crear entorno personalizado para TRPO
+        class InsulinDosingEnv:
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = np.array(cgm)
+                self.features = np.array(features)
+                self.targets = np.array(targets)
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Para compatibilidad con RL
+                self.observation_space = SimpleNamespace(
+                    shape=(model_wrapper.trpo_agent.state_dim,),
+                    low=np.full((model_wrapper.trpo_agent.state_dim,), -10.0),
+                    high=np.full((model_wrapper.trpo_agent.state_dim,), 10.0)
+                )
+                
+                if model_wrapper.trpo_agent.continuous:
+                    self.action_space = SimpleNamespace(
+                        shape=(model_wrapper.trpo_agent.action_dim,),
+                        low=np.zeros(model_wrapper.trpo_agent.action_dim),
+                        high=np.ones(model_wrapper.trpo_agent.action_dim) * 15.0,  # Max 15 unidades
+                        sample=self._sample_action
+                    )
+                else:
+                    self.action_space = SimpleNamespace(
+                        n=model_wrapper.trpo_agent.action_dim,
+                        sample=lambda: self.rng.integers(0, model_wrapper.trpo_agent.action_dim)
+                    )
+            
+            def _sample_action(self):
+                """Muestrea una acción aleatoria del espacio continuo."""
+                return self.rng.uniform(
+                    self.action_space.low,
+                    self.action_space.high
+                )
+            
+            def reset(self):
+                """Reinicia el entorno eligiendo un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+            
+            def step(self, action):
+                """Ejecuta un paso con la acción dada."""
+                # Convertir acción a dosis según el tipo de espacio
+                if self.model.trpo_agent.continuous:
+                    dose = float(action[0])  # Ya está en escala correcta
+                else:
+                    # Para acciones discretas, mapear a rango de dosis
+                    dose = action / (self.model.trpo_agent.action_dim - 1) * 15.0
+                
+                # Calcular recompensa como negativo del error absoluto
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de una acción
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+            
+            def _get_state(self):
+                """Obtiene el estado codificado para el ejemplo actual."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar a estado
+                cgm_encoded = self.model.cgm_encoder(cgm_batch)
+                other_encoded = self.model.other_encoder(features_batch)
+                
+                # Combinar características 
+                state = np.concatenate([cgm_encoded[0], other_encoded[0]])
+                
+                return state
+        
+        # Importar lo necesario para el entorno
+        from types import SimpleNamespace
+        
+        # Crear y devolver el entorno
+        return InsulinDosingEnv(cgm_data, other_features, targets, self)
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo TRPO en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        # Guardar parámetros del modelo
+        model_data = {
+            'trpo_params': self.trpo_agent.get_params(),
+            'cgm_params': self.cgm_params,
+            'other_params': self.other_params,
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'state_dim': self.trpo_agent.state_dim,
+            'action_dim': self.trpo_agent.action_dim,
+            'continuous': self.trpo_agent.continuous
+        }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        print(f"Modelo guardado en {filepath}")
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario con configuración del modelo
+        """
+        return {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'state_dim': self.trpo_agent.state_dim,
+            'action_dim': self.trpo_agent.action_dim,
+            'continuous': self.trpo_agent.continuous
+        }
+
+def create_trpo_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> TRPOWrapper:
+    """
+    Crea un modelo basado en TRPO (Trust Region Policy Optimization) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    TRPOWrapper
+        Modelo TRPO que implementa la interfaz compatible con modelos de aprendizaje profundo
+    """
+    # Configurar el espacio de estados y acciones
+    state_dim = 64  # Dimensión del espacio de estado latente
+    action_dim = 1  # Una dimensión para dosis continua
+    continuous = True  # TRPO funciona bien con espacios continuos
+    
+    # Crear agente TRPO
+    trpo_agent = TRPO(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        continuous=continuous,
+        gamma=TRPO_CONFIG['gamma'],
+        delta=TRPO_CONFIG['delta'],  # Restricción KL para la región de confianza
+        vf_coeff=TRPO_CONFIG['vf_coeff'],
+        cg_iters=TRPO_CONFIG['cg_iters'],
+        max_backtrack=TRPO_CONFIG['max_backtrack'],
+        backtrack_ratio=TRPO_CONFIG['backtrack_ratio'],
+        hidden_sizes=TRPO_CONFIG['hidden_units'],
+        seed=TRPO_CONFIG.get('seed', 42)
+    )
+    
+    # Crear y devolver wrapper para compatibilidad con la interfaz de modelos
+    return TRPOWrapper(trpo_agent, cgm_shape, other_features_shape)

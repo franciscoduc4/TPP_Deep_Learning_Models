@@ -1320,3 +1320,476 @@ class SAC:
         
         plt.tight_layout()
         plt.show()
+
+class SACWrapper:
+    """
+    Wrapper para hacer que el agente SAC sea compatible con la interfaz de modelos de aprendizaje profundo.
+    """
+    def __init__(
+        self,
+        sac_agent: SAC,
+        cgm_shape: Tuple[int, ...],
+        other_features_shape: Tuple[int, ...],
+    ) -> None:
+        """
+        Inicializa el wrapper para SAC.
+        
+        Parámetros:
+        -----------
+        sac_agent : SAC
+            Agente SAC a utilizar
+        cgm_shape : Tuple[int, ...]
+            Forma de entrada para datos CGM
+        other_features_shape : Tuple[int, ...]
+            Forma de entrada para otras características
+        """
+        self.sac_agent = sac_agent
+        self.cgm_shape = cgm_shape
+        self.other_features_shape = other_features_shape
+        
+        # Crear preprocesadores para convertir las entradas en estados para SAC
+        self.key = jax.random.PRNGKey(42)
+        self.key, self.encoder_key = jax.random.split(self.key)
+        
+        # Configurar funciones de codificación para entradas
+        self._setup_encoders()
+        
+        # Historial de entrenamiento
+        self.history = {
+            'loss': [],
+            'val_loss': [],
+            'actor_losses': [],
+            'critic_losses': [],
+            'alpha_losses': [],
+            'episode_rewards': []
+        }
+    
+    def _setup_encoders(self) -> None:
+        """
+        Configura las funciones de codificación para procesar las entradas.
+        """
+        # En un modelo real, esto inicializaría redes neuronales para codificar entradas
+        # Para simplificar, usaremos funciones de transformación lineales
+        
+        # Dimensiones de características combinadas
+        cgm_dim = np.prod(self.cgm_shape[1:])
+        other_dim = np.prod(self.other_features_shape[1:])
+        
+        # Inicializar matrices de transformación
+        self.key, key_cgm, key_other = jax.random.split(self.key, 3)
+        
+        self.cgm_weight = jax.random.normal(key_cgm, (cgm_dim, self.sac_agent.state_dim // 2))
+        self.other_weight = jax.random.normal(key_other, (other_dim, self.sac_agent.state_dim // 2))
+        
+        # JIT-compilar transformaciones para mayor rendimiento
+        self.encode_cgm = jax.jit(self._create_encoder_fn(self.cgm_weight))
+        self.encode_other = jax.jit(self._create_encoder_fn(self.other_weight))
+    
+    def _create_encoder_fn(self, weights: jnp.ndarray) -> Callable:
+        """
+        Crea una función de codificación.
+        
+        Parámetros:
+        -----------
+        weights : jnp.ndarray
+            Matriz de pesos para la transformación
+            
+        Retorna:
+        --------
+        Callable
+            Función de codificación JIT-compilada
+        """
+        def encoder_fn(x):
+            x_flat = x.reshape((x.shape[0], -1))
+            return jnp.tanh(jnp.dot(x_flat, weights))
+        return encoder_fn
+    
+    def __call__(self, inputs: list) -> jnp.ndarray:
+        """
+        Implementa la interfaz de llamada para predicción.
+        
+        Parámetros:
+        -----------
+        inputs : list
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Predicciones de dosis de insulina
+        """
+        return self.predict(inputs)
+    
+    def predict(self, inputs: list) -> jnp.ndarray:
+        """
+        Realiza predicciones con el modelo SAC.
+        
+        Parámetros:
+        -----------
+        inputs : list
+            Lista con [cgm_data, other_features]
+            
+        Retorna:
+        --------
+        jnp.ndarray
+            Predicciones de dosis de insulina
+        """
+        # Obtener entradas
+        cgm_data, other_features = inputs
+        
+        # Convertir a arrays de JAX si no lo son
+        cgm_data = jnp.array(cgm_data)
+        other_features = jnp.array(other_features)
+        
+        # Codificar entradas a estado
+        cgm_encoded = self.encode_cgm(cgm_data)
+        other_encoded = self.encode_other(other_features)
+        states = jnp.concatenate([cgm_encoded, other_encoded], axis=1)
+        
+        # Obtener acciones usando el agente SAC (en modo determinístico)
+        batch_size = states.shape[0]
+        actions = np.zeros((batch_size, 1))
+        
+        for i in range(batch_size):
+            state = np.array(states[i])
+            action = self.sac_agent.get_action(state, deterministic=True)
+            actions[i] = action
+        
+        return actions
+    
+    def fit(
+        self, 
+        x: list, 
+        y: jnp.ndarray, 
+        validation_data: Optional[Tuple] = None, 
+        epochs: int = 1,
+        batch_size: int = 32,
+        callbacks: list = None,
+        verbose: int = 0
+    ) -> Dict:
+        """
+        Entrena el modelo SAC en los datos proporcionados.
+        
+        Parámetros:
+        -----------
+        x : list
+            Lista con [cgm_data, other_features]
+        y : jnp.ndarray
+            Etiquetas (dosis objetivo)
+        validation_data : Optional[Tuple], opcional
+            Datos de validación (default: None)
+        epochs : int, opcional
+            Número de épocas (default: 1)
+        batch_size : int, opcional
+            Tamaño del lote (default: 32)
+        callbacks : list, opcional
+            Lista de callbacks (default: None)
+        verbose : int, opcional
+            Nivel de verbosidad (default: 0)
+            
+        Retorna:
+        --------
+        Dict
+            Historia del entrenamiento
+        """
+        if verbose > 0:
+            print("Entrenando modelo SAC...")
+            
+        # Crear entorno simulado para RL a partir de los datos
+        env = self._create_training_environment(x[0], x[1], y)
+        
+        # Entrenar el agente SAC
+        sac_history = self.sac_agent.train(
+            env=env,
+            episodes=epochs,
+            max_steps=batch_size,
+            warmup_steps=min(1000, batch_size),
+            update_after=min(500, batch_size // 2),
+            update_every=1,
+            evaluate_interval=max(1, epochs // 5) if verbose > 0 else epochs + 1,
+            render=False
+        )
+        
+        # Actualizar historial con las métricas del entrenamiento
+        self.history['episode_rewards'].extend(sac_history.get('episode_rewards', []))
+        self.history['actor_losses'].extend(sac_history.get('actor_losses', []))
+        self.history['critic_losses'].extend(sac_history.get('critic_losses', []))
+        self.history['alpha_losses'].extend(sac_history.get('alpha_losses', []))
+        
+        # Calcular pérdida en los datos de entrenamiento
+        train_preds = self.predict(x)
+        train_loss = float(jnp.mean((train_preds.flatten() - y) ** 2))
+        self.history['loss'].append(train_loss)
+        
+        # Evaluar en datos de validación si se proporcionan
+        if validation_data:
+            val_x, val_y = validation_data
+            val_preds = self.predict(val_x)
+            val_loss = float(jnp.mean((val_preds.flatten() - val_y) ** 2))
+            self.history['val_loss'].append(val_loss)
+        
+        if verbose > 0:
+            print(f"Entrenamiento completado. Pérdida final: {train_loss:.4f}")
+            if validation_data:
+                print(f"Pérdida de validación: {val_loss:.4f}")
+        
+        return self.history
+    
+    def _create_training_environment(
+        self, 
+        cgm_data: jnp.ndarray, 
+        other_features: jnp.ndarray, 
+        targets: jnp.ndarray
+    ) -> Any:
+        """
+        Crea un entorno de entrenamiento para RL a partir de los datos.
+        
+        Parámetros:
+        -----------
+        cgm_data : jnp.ndarray
+            Datos CGM
+        other_features : jnp.ndarray
+            Otras características
+        targets : jnp.ndarray
+            Dosis objetivo
+            
+        Retorna:
+        --------
+        Any
+            Entorno simulado para RL
+        """
+        # Crear entorno personalizado para SAC
+        class InsulinDosingEnv:
+            def __init__(self, cgm, features, targets, model_wrapper):
+                self.cgm = np.array(cgm)
+                self.features = np.array(features)
+                self.targets = np.array(targets)
+                self.model = model_wrapper
+                self.rng = np.random.Generator(np.random.PCG64(42))
+                self.current_idx = 0
+                self.max_idx = len(targets) - 1
+                
+                # Para compatibilidad con algoritmos RL
+                # Espacio de observación
+                self.observation_space = SimpleNamespace(
+                    shape=(model_wrapper.sac_agent.state_dim,),
+                    low=-np.ones(model_wrapper.sac_agent.state_dim) * 10,
+                    high=np.ones(model_wrapper.sac_agent.state_dim) * 10
+                )
+                
+                # Espacio de acción
+                self.action_space = SimpleNamespace(
+                    shape=model_wrapper.sac_agent.action_high.shape,
+                    low=model_wrapper.sac_agent.action_low,
+                    high=model_wrapper.sac_agent.action_high,
+                    sample=self._sample_action
+                )
+            
+            def _sample_action(self):
+                """Muestrea una acción aleatoria del espacio continuo."""
+                return self.rng.uniform(
+                    self.action_space.low, 
+                    self.action_space.high
+                )
+                
+            def reset(self):
+                """Reinicia el entorno eligiendo un ejemplo aleatorio."""
+                self.current_idx = self.rng.integers(0, self.max_idx)
+                state = self._get_state()
+                return state, {}
+                
+            def step(self, action):
+                """Ejecuta un paso con la acción dada."""
+                # Obtener valor de dosis (primera dimensión de la acción)
+                dose = float(action[0])
+                
+                # Calcular recompensa como negativo del error absoluto
+                target = self.targets[self.current_idx]
+                reward = -abs(dose - target)
+                
+                # Avanzar al siguiente ejemplo
+                self.current_idx = (self.current_idx + 1) % self.max_idx
+                
+                # Obtener próximo estado
+                next_state = self._get_state()
+                
+                # Episodio siempre termina después de un paso (para este problema)
+                done = True
+                truncated = False
+                
+                return next_state, reward, done, truncated, {}
+            
+            def _get_state(self):
+                """Obtiene el estado codificado para el ejemplo actual."""
+                # Obtener datos actuales
+                cgm_batch = self.cgm[self.current_idx:self.current_idx+1]
+                features_batch = self.features[self.current_idx:self.current_idx+1]
+                
+                # Codificar a espacio de estado
+                cgm_encoded = self.model.encode_cgm(jnp.array(cgm_batch))
+                other_encoded = self.model.encode_other(jnp.array(features_batch))
+                
+                # Combinar características
+                state = np.concatenate([cgm_encoded[0], other_encoded[0]])
+                
+                return state
+                
+        # Importar lo necesario para el entorno
+        from types import SimpleNamespace
+        
+        # Crear y devolver el entorno
+        return InsulinDosingEnv(cgm_data, other_features, targets, self)
+    
+    def save(self, filepath: str) -> None:
+        """
+        Guarda el modelo SAC en un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta donde guardar el modelo
+        """
+        # Crear directorio si no existe
+        import os
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        # Guardar datos del modelo
+        import pickle
+        model_data = {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'cgm_weight': self.cgm_weight,
+            'other_weight': self.other_weight,
+            'state_dim': self.sac_agent.state_dim,
+            'action_dim': self.sac_agent.action_dim,
+            'action_high': self.sac_agent.action_high,
+            'action_low': self.sac_agent.action_low,
+        }
+        
+        with open(filepath + "_wrapper.pkl", 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        # Guardar el agente SAC
+        self.sac_agent.save_models(filepath + "_sac")
+        
+        print(f"Modelo guardado en {filepath}")
+    
+    def load(self, filepath: str) -> None:
+        """
+        Carga el modelo SAC desde un archivo.
+        
+        Parámetros:
+        -----------
+        filepath : str
+            Ruta desde donde cargar el modelo
+        """
+        import pickle
+        
+        # Cargar datos del wrapper
+        with open(filepath + "_wrapper.pkl", 'rb') as f:
+            model_data = pickle.load(f)
+            
+        self.cgm_shape = model_data['cgm_shape']
+        self.other_features_shape = model_data['other_features_shape']
+        self.cgm_weight = model_data['cgm_weight']
+        self.other_weight = model_data['other_weight']
+        
+        # Re-compilar funciones de codificación
+        self.encode_cgm = jax.jit(self._create_encoder_fn(self.cgm_weight))
+        self.encode_other = jax.jit(self._create_encoder_fn(self.other_weight))
+        
+        # Cargar el agente SAC
+        self.sac_agent.load_models(filepath + "_sac")
+        
+        print(f"Modelo cargado desde {filepath}")
+    
+    def get_config(self) -> Dict:
+        """
+        Obtiene la configuración del modelo.
+        
+        Retorna:
+        --------
+        Dict
+            Diccionario con configuración del modelo
+        """
+        config = {
+            'cgm_shape': self.cgm_shape,
+            'other_features_shape': self.other_features_shape,
+            'state_dim': self.sac_agent.state_dim,
+            'action_dim': self.sac_agent.action_dim,
+            'action_high': self.sac_agent.action_high.tolist(),
+            'action_low': self.sac_agent.action_low.tolist()
+        }
+        
+        # Añadir configuración del agente SAC
+        sac_config = {
+            'gamma': self.sac_agent.gamma,
+            'tau': self.sac_agent.tau,
+            'batch_size': self.sac_agent.batch_size,
+            'alpha': float(jnp.exp(self.sac_agent.log_alpha))
+        }
+        
+        config['sac_config'] = sac_config
+        return config
+
+
+def create_sac_model(cgm_shape: Tuple[int, ...], other_features_shape: Tuple[int, ...]) -> SACWrapper:
+    """
+    Crea un modelo basado en SAC (Soft Actor-Critic) para predicción de dosis de insulina.
+    
+    Parámetros:
+    -----------
+    cgm_shape : Tuple[int, ...]
+        Forma de los datos CGM (batch_size, time_steps, features)
+    other_features_shape : Tuple[int, ...]
+        Forma de otras características (batch_size, n_features)
+        
+    Retorna:
+    --------
+    SACWrapper
+        Wrapper de SAC que implementa la interfaz compatible con modelos de aprendizaje profundo
+    """
+    # Configurar el espacio de estados y acciones
+    state_dim = 64  # Dimensión del espacio de estado latente
+    action_dim = 1  # Una dimensión para la dosis continua
+    
+    # Límites de acción para dosis de insulina (0-15 unidades)
+    action_high = jnp.array([15.0])  # Máximo 15 unidades de insulina
+    action_low = jnp.array([0.0])    # Mínimo 0 unidades
+    
+    # Configuración personalizada para el agente SAC
+    config = {
+        'actor_lr': SAC_CONFIG['actor_lr'],
+        'critic_lr': SAC_CONFIG['critic_lr'],
+        'alpha_lr': SAC_CONFIG['alpha_lr'],
+        'gamma': SAC_CONFIG['gamma'],
+        'tau': SAC_CONFIG['tau'],
+        'batch_size': min(SAC_CONFIG['batch_size'], 64),  # Adaptado para este problema
+        'buffer_capacity': SAC_CONFIG['buffer_capacity'],
+        'initial_alpha': SAC_CONFIG['initial_alpha'],
+        'target_entropy': -action_dim,  # Heurística común: -dim(A)
+        'actor_hidden_units': SAC_CONFIG['actor_hidden_units'],
+        'critic_hidden_units': SAC_CONFIG['critic_hidden_units'],
+        'log_std_min': SAC_CONFIG['log_std_min'],
+        'log_std_max': SAC_CONFIG['log_std_max'],
+        'dropout_rate': SAC_CONFIG['dropout_rate'],
+        'epsilon': SAC_CONFIG['epsilon'],
+        'seed': 42
+    }
+    
+    # Crear agente SAC
+    sac_agent = SAC(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_high=action_high,
+        action_low=action_low,
+        config=config,
+        seed=42
+    )
+    
+    # Crear y devolver wrapper
+    return SACWrapper(
+        sac_agent=sac_agent,
+        cgm_shape=cgm_shape,
+        other_features_shape=other_features_shape
+    )
