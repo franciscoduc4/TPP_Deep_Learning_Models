@@ -384,6 +384,10 @@ QLEARNING_CONFIG = {
     'epsilon_start': 1.0,           # Valor inicial para política epsilon-greedy
     'epsilon_end': 0.01,            # Valor mínimo para epsilon
     'epsilon_decay': 0.995,         # Factor de decaimiento para epsilon
+    'decay_steps': 1000,             # Pasos para decaimiento de epsilon
+    'use_decay_schedule': True,      # Si usar programación de decaimiento para epsilon
+    'decay_schedule': 'exponential', # Tipo de programación de decaimiento: 'exponential' o 'linear'
+    'decay_rate': 0.99,             # Tasa de decaimiento para programación exponencial
     
     # Discretización del espacio de estados
     'bins': 10,                     # Número de bins por dimensión para discretización
@@ -391,7 +395,7 @@ QLEARNING_CONFIG = {
     
     # Parámetros de entrenamiento
     'episodes': 1000,               # Número de episodios de entrenamiento
-    'max_steps': 500,               # Máximo de pasos por episodio
+    'max_steps_per_episode': 500,               # Máximo de pasos por episodio
     'eval_interval': 100,           # Intervalo de episodios para evaluación
     'eval_episodes': 10,            # Número de episodios para evaluación
     
@@ -399,7 +403,11 @@ QLEARNING_CONFIG = {
     'render_train': False,          # Si renderizar durante entrenamiento
     'render_eval': True,            # Si renderizar durante evaluación
     'log_interval': 50,             # Intervalo para mostrar métricas
-    'smoothing_window': 10          # Ventana para suavizado de métricas
+    'smoothing_window': 10,          # Ventana para suavizado de métricas
+    
+    # Inicialización
+    'optimistic_init': False, # Si usar inicialización optimista de valores Q
+    'optimistic_value': 0.0,    # Valor inicial para inicialización optimista
 }
 
 REINFORCE_CONFIG = {
