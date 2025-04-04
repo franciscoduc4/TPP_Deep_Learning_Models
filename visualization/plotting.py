@@ -7,8 +7,7 @@ from typing import Dict, List, Tuple, Optional, Any, Union, Callable
 import seaborn as sns
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
-from sklearn.base import r2_score
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # Constantes para etiquetas comunes
 CONST_EPISODIO = "Episodio"
