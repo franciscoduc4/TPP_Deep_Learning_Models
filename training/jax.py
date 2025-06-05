@@ -14,25 +14,22 @@ from sklearn.model_selection import KFold
 from joblib import Parallel, delayed
 from scipy.optimize import minimize
 import orbax.checkpoint as orbax_ckpt
-from custom.printer import print_debug
-from training.common import (
-    calculate_metrics, create_ensemble_prediction, optimize_ensemble_weights,
-    enhance_features, get_model_type, process_training_results
-)
-from constants.constants import (
-    CONST_VAL_LOSS, CONST_LOSS, CONST_METRIC_MAE, CONST_METRIC_RMSE, CONST_METRIC_R2,
-    CONST_MODELS, CONST_BEST_PREFIX, CONST_LOGS_DIR, CONST_DEFAULT_EPOCHS, 
-    CONST_DEFAULT_BATCH_SIZE, CONST_DEFAULT_SEED, CONST_FIGURES_DIR, CONST_MODEL_TYPES
-)
-from tqdm.auto import tqdm
-from config.params import DEBUG
 
-CONST_EPOCHS = 3 if DEBUG else CONST_DEFAULT_EPOCHS
+# Constantes para uso común
+CONST_VAL_LOSS = "val_loss"
+CONST_LOSS = "loss"
+CONST_METRIC_MAE = "mae"
+CONST_METRIC_RMSE = "rmse"
+CONST_METRIC_R2 = "r2"
+CONST_MODELS = "models"
+CONST_BEST_PREFIX = "best_"
+CONST_LOGS_DIR = "logs"
+
 
 def create_batched_dataset(x_cgm: np.ndarray, 
                           x_other: np.ndarray, 
                           y: np.ndarray, 
-                          batch_size: int = CONST_DEFAULT_BATCH_SIZE, 
+                          batch_size: int = 32, 
                           shuffle: bool = True, 
                           rng: Optional[jax.random.PRNGKey] = None) -> Tuple[List[Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]], int]:
     """
@@ -64,10 +61,10 @@ def create_batched_dataset(x_cgm: np.ndarray,
     # Crear índices y mezclarlos si es necesario
     indices = np.arange(n_samples)
     if shuffle and rng is not None:
-        indices = jax.random.permutation(rng, indices)
+        indices = random.permutation(rng, indices)
     elif shuffle:
-        rng_np = np.random.Generator(np.random.PCG64(CONST_DEFAULT_SEED))
-        rng_np.shuffle(indices)
+        rng = np.random.Generator(np.random.PCG64(42))
+        rng.shuffle(indices)
     
     # Calcular número de batches
     n_batches = int(np.ceil(n_samples / batch_size))
@@ -75,21 +72,43 @@ def create_batched_dataset(x_cgm: np.ndarray,
     # Crear lista de batches
     batches = []
     for i in range(n_batches):
-        start_idx = i * batch_size
-        end_idx = min(start_idx + batch_size, n_samples)
-        batch_indices = indices[start_idx:end_idx]
+        # Obtener índices para el batch actual
+        batch_indices = indices[i * batch_size:(i + 1) * batch_size]
         
-        # Seleccionar datos correspondientes a los índices
-        x_cgm_batch = x_cgm[batch_indices]
-        x_other_batch = x_other[batch_indices]
-        y_batch = y[batch_indices]
-        
-        batches.append(((x_cgm_batch, x_other_batch), y_batch))
+        # Crear batch
+        batch = (
+            (x_cgm[batch_indices], x_other[batch_indices]),
+            y[batch_indices]
+        )
+        batches.append(batch)
     
     return batches, n_batches
 
-@jit
-def mse_loss(params: Dict, apply_fn: Callable, x_cgm: jnp.ndarray, x_other: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+
+def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """
+    Calcula métricas de rendimiento para las predicciones del modelo.
+    
+    Parámetros:
+    -----------
+    y_true : np.ndarray
+        Valores objetivo verdaderos
+    y_pred : np.ndarray
+        Valores predichos por el modelo
+        
+    Retorna:
+    --------
+    Dict[str, float]
+        Diccionario con métricas MAE, RMSE y R²
+    """
+    return {
+        CONST_METRIC_MAE: float(mean_absolute_error(y_true, y_pred)),
+        CONST_METRIC_RMSE: float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        CONST_METRIC_R2: float(r2_score(y_true, y_pred))
+    }
+
+
+def mse_loss(params, model, x_cgm, x_other, y):
     """
     Función de pérdida de error cuadrático medio para entrenamiento.
     
@@ -97,8 +116,8 @@ def mse_loss(params: Dict, apply_fn: Callable, x_cgm: jnp.ndarray, x_other: jnp.
     -----------
     params : Dict
         Parámetros del modelo
-    apply_fn : Callable
-        Función para aplicar el modelo
+    model : nn.Module o callable
+        Modelo a utilizar o función apply del modelo
     x_cgm : jnp.ndarray
         Datos CGM
     x_other : jnp.ndarray
@@ -111,11 +130,21 @@ def mse_loss(params: Dict, apply_fn: Callable, x_cgm: jnp.ndarray, x_other: jnp.
     jnp.ndarray
         Valor de pérdida MSE
     """
-    # Realizar predicción
-    y_pred = apply_fn(params, x_cgm, x_other).flatten()
+    # Crear PRNG para inferencia
+    dropout_rng = jax.random.PRNGKey(0)  # No afecta en modo deterministic/eval
+    
+    # Realizar predicción - comprobar si model es una función o un objeto con método apply
+    if hasattr(model, 'apply'):
+        y_pred = model.apply(params, x_cgm, x_other, rngs={'dropout': dropout_rng}, training=False).flatten()
+    else:
+        # Si es una función (como state.apply_fn), llamarla directamente
+        y_pred = model(params, x_cgm, x_other, rngs={'dropout': dropout_rng}, training=False).flatten()
     
     # Calcular error cuadrático medio
     return jnp.mean(jnp.square(y_pred - y))
+
+# Versión JIT-compilada de mse_loss
+mse_loss_jit = jit(mse_loss, static_argnames=['model'])
 
 
 @jit
@@ -142,20 +171,9 @@ def train_step(state: train_state.TrainState,
     Tuple[train_state.TrainState, Dict[str, jnp.ndarray]]
         Nuevo estado de entrenamiento y métricas
     """
-    # Generar clave PRNG para dropout
-    dropout_rng = jax.random.PRNGKey(0)  # O bien usar una clave diferente para cada paso
-    
-    # Definir función de pérdida con manejo de PRNG
+    # Definir una función de pérdida para este paso que no necesite el modelo como argumento
     def loss_fn(params):
-        # Pasar rngs para operaciones estocásticas como dropout
-        y_pred = state.apply_fn(
-            params, 
-            x_cgm, 
-            x_other, 
-            training=True,  # Modo entrenamiento
-            rngs={'dropout': dropout_rng}  # Clave PRNG para dropout
-        ).flatten()
-        return jnp.mean(jnp.square(y_pred - y))
+        return mse_loss_jit(params, state.apply_fn, x_cgm, x_other, y)
     
     # Calcular gradiente y pérdida
     grad_fn = value_and_grad(loss_fn, has_aux=False)
@@ -196,11 +214,20 @@ def eval_step(state: train_state.TrainState,
     Dict[str, jnp.ndarray]
         Métricas de evaluación
     """
-    # Calcular pérdida
-    loss = mse_loss(state.params, state.apply_fn, x_cgm, x_other, y)
+    # Usar una función local para calcular la pérdida sin pasar el modelo directamente
+    def loss_fn(params):
+        return mse_loss_jit(params, state.apply_fn, x_cgm, x_other, y)
     
-    # Calcular predicciones
-    y_pred = state.apply_fn(state.params, x_cgm, x_other).flatten()
+    # Calcular pérdida
+    loss = loss_fn(state.params)
+    
+    # Crear un PRNG para la evaluación (modo deterministic)
+    eval_rng = jax.random.PRNGKey(0)
+    
+    # Calcular predicciones con rngs explícito
+    y_pred = state.apply_fn(state.params, x_cgm, x_other, 
+                           rngs={'dropout': eval_rng},
+                           training=False).flatten()
     
     # Calcular error absoluto medio
     mae = jnp.mean(jnp.abs(y_pred - y))
@@ -215,208 +242,105 @@ def eval_step(state: train_state.TrainState,
     }
 
 
-def _setup_training(model: nn.Module,
-                   training_config: Dict[str, Any],
-                   x_cgm_train: np.ndarray,
-                   x_other_train: np.ndarray,
-                   models_dir: str) -> Tuple[train_state.TrainState, Dict, jax.random.PRNGKey]:
+def normalize_array(arr_data, is_cgm=False):
     """
-    Prepara el entorno de entrenamiento inicializando el modelo y optimizador.
+    Normaliza arrays con formas potencialmente heterogéneas.
+    
+    Parámetros:
+    -----------
+    arr_data : array-like
+        Datos a normalizar
+    is_cgm : bool
+        Indica si los datos son CGM (tienen forma especial)
     """
-    # Extraer parámetros de configuración
-    learning_rate = training_config.get('learning_rate', 0.001)
-    seed = training_config.get('seed', CONST_DEFAULT_SEED)
-    
-    # Crear directorio para modelos si no existe
-    os.makedirs(models_dir, exist_ok=True)
-    
-    # Inicializar generador de números aleatorios
-    rng = random.PRNGKey(seed)
-    rng, init_rng = random.split(rng)
-    
-    # Inicializar modelo
-    x_cgm_shape = (1,) + x_cgm_train.shape[1:]
-    x_other_shape = (1,) + x_other_train.shape[1:]
-    
-    params = model.init(init_rng, jnp.ones(x_cgm_shape), jnp.ones(x_other_shape))
-    
-    # Configurar tasa de aprendizaje con decaimiento
-    schedule_fn = optax.exponential_decay(
-        init_value=learning_rate,
-        transition_steps=1000,
-        decay_rate=0.9
-    )
-    
-    # Configurar optimizador con recorte de gradiente
-    tx = optax.chain(
-        optax.clip_by_global_norm(1.0),  # Recorte de gradiente
-        optax.adam(learning_rate=schedule_fn)
-    )
-    
-    # Crear estado de entrenamiento
-    state = train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        tx=tx
-    )
-    
-    return state, params, rng
-
-def _prepare_data(x_cgm_train: np.ndarray, 
-                x_other_train: np.ndarray, 
-                y_train: np.ndarray,
-                x_cgm_val: np.ndarray,
-                x_other_val: np.ndarray,
-                y_val: np.ndarray,
-                batch_size: int,
-                rng: jax.random.PRNGKey) -> Tuple[List, int, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """
-    Prepara los datos para entrenamiento y validación.
-    """
-    # Crear conjuntos de datos en batches
-    train_batches, n_train_batches = create_batched_dataset(
-        x_cgm_train, x_other_train, y_train, batch_size=batch_size, shuffle=True, rng=rng
-    )
-    
-    # Convertir datos de validación para evaluación
-    x_cgm_val_array = jnp.array(x_cgm_val)
-    x_other_val_array = jnp.array(x_other_val)
-    y_val_array = jnp.array(y_val)
-    
-    return train_batches, n_train_batches, x_cgm_val_array, x_other_val_array, y_val_array
-
-def _train_epoch(state: train_state.TrainState,
-               train_batches: List,
-               n_train_batches: int,
-               x_cgm_val_array: jnp.ndarray,
-               x_other_val_array: jnp.ndarray,
-               y_val_array: jnp.ndarray) -> Tuple[float, Dict, train_state.TrainState]:
-    """
-    Entrena una época completa y evalúa en validación.
-    """
-    # Variables para métricas de época
-    epoch_loss = 0.0
-    
-    # Usar tqdm para mostrar progreso dentro de la época
-    for i, batch in enumerate(tqdm(train_batches, desc="Batches", leave=False)):
-        # Desempaquetar batch
-        (x_cgm_batch, x_other_batch), y_batch = batch
+    if isinstance(arr_data, (np.ndarray, jnp.ndarray)):
+        return np.array(arr_data, dtype=np.float32)
         
-        # Convertir a arrays de JAX
-        x_cgm_batch = jnp.array(x_cgm_batch)
-        x_other_batch = jnp.array(x_other_batch)
-        y_batch = jnp.array(y_batch)
-        
-        # Ejecutar paso de entrenamiento
-        state, metrics = train_step(state, x_cgm_batch, x_other_batch, y_batch)
-        
-        # Actualizar pérdida de época
-        batch_loss = float(metrics[CONST_LOSS])
-        epoch_loss += batch_loss / n_train_batches
-        
-        # Mostrar progreso del batch actual (cada 10 batches)
-        if (i + 1) % 10 == 0 or i == 0 or i == len(train_batches) - 1:
-            print(f"  Batch {i+1}/{len(train_batches)}, Loss: {batch_loss:.4f}")
-    
-    # Evaluar en validación
-    val_metrics = eval_step(state, x_cgm_val_array, x_other_val_array, y_val_array)
-    
-    # Asegurarse de que CONST_METRIC_R2 existe en val_metrics
-    val_metrics_dict = {k: float(v) for k, v in val_metrics.items()}
-    if CONST_METRIC_R2 not in val_metrics_dict:
-        val_metrics_dict[CONST_METRIC_R2] = 0.0  # Valor por defecto
-    
-    return epoch_loss, val_metrics_dict, state
-
-
-def _update_history(history: Dict[str, List[float]],
-                  epoch_loss: float,
-                  val_metrics: Dict[str, jnp.ndarray]) -> Dict[str, List[float]]:
-    """
-    Actualiza el historial de métricas.
-    """
-    # Actualizar históricos
-    history[CONST_LOSS].append(epoch_loss)
-    history[CONST_VAL_LOSS].append(float(val_metrics[CONST_LOSS]))
-    history[CONST_METRIC_MAE].append(float(val_metrics[CONST_METRIC_MAE]))
-    history[f"val_{CONST_METRIC_MAE}"].append(float(val_metrics[CONST_METRIC_MAE]))
-    history[CONST_METRIC_RMSE].append(float(val_metrics[CONST_METRIC_RMSE]))
-    history[f"val_{CONST_METRIC_RMSE}"].append(float(val_metrics[CONST_METRIC_RMSE]))
-    
-    return history
-
-def _extract_and_organize_data(data: Dict[str, Dict[str, np.ndarray]]) -> Dict[str, Any]:
-    """
-    Extrae y organiza los datos de entrenamiento, validación y prueba.
-    """
-    return {
-        'train': {
-            'x_cgm': data['train']['x_cgm'],
-            'x_other': data['train']['x_other'],
-            'y': data['train']['y']
-        },
-        'val': {
-            'x_cgm': data['val']['x_cgm'],
-            'x_other': data['val']['x_other'],
-            'y': data['val']['y']
-        },
-        'test': {
-            'x_cgm': data['test']['x_cgm'],
-            'x_other': data['test']['x_other'],
-            'y': data['test']['y']
-        }
-    }
-
-def _init_training_config() -> Dict[str, Any]:
-    """
-    Inicializa la configuración de entrenamiento por defecto.
-    """
-    return {
-        'epochs': CONST_EPOCHS,
-        'batch_size': CONST_DEFAULT_BATCH_SIZE,
-        'learning_rate': 0.001,
-        'patience': 10,
-        'seed': CONST_DEFAULT_SEED
-    }
-
-def _initialize_history() -> Dict[str, List[float]]:
-    """
-    Inicializa el diccionario de historial de métricas.
-    """
-    return {
-        CONST_LOSS: [],
-        CONST_VAL_LOSS: [],
-        CONST_METRIC_MAE: [],
-        f"val_{CONST_METRIC_MAE}": [],
-        CONST_METRIC_RMSE: [],
-        f"val_{CONST_METRIC_RMSE}": []
-    }
-
-def _handle_early_stopping(model, epoch, val_loss, state_params, best_params):
-    """
-    Maneja la lógica de early stopping personalizada.
-    """
-    if hasattr(model, 'early_stopping') and model.early_stopping is not None:
-        if model.early_stopping(epoch, val_loss, state_params):
-            print(f"\nEarly stopping activado en época {epoch+1}")
-            if model.early_stopping.restore_best_weights:
-                return model.early_stopping.get_best_params(), True
-    return best_params, False
-
-def _predict_and_evaluate(best_state, test_data):
-    """
-    Realiza predicciones con el mejor modelo y evalúa métricas.
-    """
-    x_cgm_test_array = jnp.array(test_data['x_cgm'])
-    x_other_test_array = jnp.array(test_data['x_other'])
-    y_test = test_data['y']
-    
-    y_pred_array = best_state.apply_fn(best_state.params, x_cgm_test_array, x_other_test_array)
-    y_pred = np.array(y_pred_array).flatten()
-    
-    metrics = calculate_metrics(y_test, y_pred)
-    
-    return y_pred, metrics
+    if isinstance(arr_data, list):
+        # Si es una lista vacía
+        if not arr_data:
+            return np.array([], dtype=np.float32)
+            
+        # Para datos CGM, necesitamos un manejo especial
+        if is_cgm:
+            # Verificar la estructura de los datos
+            print(f"Forma de los datos CGM (primeros elementos):")
+            for i in range(min(3, len(arr_data))):
+                print(f"Elemento {i}: {np.shape(arr_data[i])}")
+            
+            try:
+                # Intentar convertir cada secuencia a un array numpy primero
+                normalized_sequences = []
+                max_time_steps = 0
+                max_features = 0
+                
+                for seq in arr_data:
+                    if seq is None:
+                        continue
+                    
+                    seq_array = np.array(seq, dtype=np.float32)
+                    if len(seq_array.shape) == 1:
+                        seq_array = seq_array.reshape(-1, 1)
+                    elif len(seq_array.shape) > 2:
+                        # Si tiene más de 2 dimensiones, aplanar las dimensiones extra
+                        seq_array = seq_array.reshape(seq_array.shape[0], -1)
+                    
+                    max_time_steps = max(max_time_steps, seq_array.shape[0])
+                    max_features = max(max_features, seq_array.shape[1])
+                    normalized_sequences.append(seq_array)
+                
+                # Ahora que tenemos las dimensiones máximas, podemos padear todas las secuencias
+                padded_sequences = []
+                for seq in normalized_sequences:
+                    # Padear tiempo y características si es necesario
+                    pad_time = max_time_steps - seq.shape[0]
+                    pad_features = max_features - seq.shape[1]
+                    
+                    if pad_time > 0 or pad_features > 0:
+                        padded_seq = np.pad(
+                            seq,
+                            ((0, pad_time), (0, pad_features)),
+                            mode='constant',
+                            constant_values=0
+                        )
+                    else:
+                        padded_seq = seq
+                    
+                    padded_sequences.append(padded_seq)
+                
+                result = np.array(padded_sequences, dtype=np.float32)
+                print(f"Forma final del array CGM: {result.shape}")
+                return result
+                
+            except Exception as e:
+                print(f"Error al procesar datos CGM: {str(e)}")
+                # Si falla el método anterior, intentar un enfoque más simple
+                try:
+                    # Convertir cada secuencia a un vector 1D
+                    flattened = [np.array(x).flatten() if x is not None else np.array([]) for x in arr_data]
+                    # Encontrar la longitud máxima
+                    max_len = max(len(x) for x in flattened)
+                    # Padear todas las secuencias a la misma longitud
+                    padded = [np.pad(x, (0, max_len - len(x)), mode='constant') if len(x) < max_len else x[:max_len] 
+                             for x in flattened]
+                    return np.array(padded, dtype=np.float32)
+                except Exception as e2:
+                    print(f"Error al procesar datos CGM (método alternativo): {str(e2)}")
+                    raise
+        else:
+            # Para otros datos, intentar convertir directamente
+            try:
+                return np.array(arr_data, dtype=np.float32)
+            except ValueError:
+                # Si falla, intentar aplanar los datos
+                flattened = [np.array(x).flatten() if x is not None else np.array([]) for x in arr_data]
+                max_len = max(len(x) for x in flattened)
+                padded = [np.pad(x, (0, max_len - len(x)), mode='constant') if len(x) < max_len else x[:max_len] 
+                         for x in flattened]
+                return np.array(padded, dtype=np.float32)
+    else:
+        # Si no es lista ni array, intentar convertir directamente
+        return np.array(arr_data, dtype=np.float32)
 
 def train_and_evaluate_model(model: nn.Module, 
                             model_name: str, 
@@ -457,45 +381,112 @@ def train_and_evaluate_model(model: nn.Module,
     Tuple[Dict[str, List[float]], np.ndarray, Dict[str, float]]
         (historial, predicciones, métricas)
     """
-    # Inicializar configuración
+    # Configuración por defecto
     if training_config is None:
-        training_config = _init_training_config()
+        training_config = {
+            'epochs': 100,
+            'batch_size': 32,
+            'learning_rate': 0.001,
+            'patience': 10,
+            'seed': 42
+        }
     
-    # Extraer datos
-    extracted_data = _extract_and_organize_data(data)
-    x_cgm_train = extracted_data['train']['x_cgm']
-    x_other_train = extracted_data['train']['x_other']
-    y_train = extracted_data['train']['y']
+    # Extraer y normalizar datos
+    try:
+        x_cgm_train = normalize_array(data['train']['x_cgm'], is_cgm=True)
+        x_other_train = normalize_array(data['train']['x_other'])
+        y_train = normalize_array(data['train']['y'])
+        
+        x_cgm_val = normalize_array(data['val']['x_cgm'], is_cgm=True)
+        x_other_val = normalize_array(data['val']['x_other'])
+        y_val = normalize_array(data['val']['y'])
+        
+        x_cgm_test = normalize_array(data['test']['x_cgm'], is_cgm=True)
+        x_other_test = normalize_array(data['test']['x_other'])
+        y_test = normalize_array(data['test']['y'])
+    
+        # Verificar si hubo algún problema en la conversión
+        print(f"Forma de x_cgm_train: {x_cgm_train.shape}")
+        print(f"Forma de x_other_train: {x_other_train.shape}")
+        print(f"Forma de y_train: {y_train.shape}")
+    except Exception as e:
+        print(f"Error al convertir datos en {model_name}: {str(e)}")
+        raise
     
     # Extraer parámetros de configuración
-    epochs = training_config.get('epochs', CONST_EPOCHS)
-    batch_size = training_config.get('batch_size', CONST_DEFAULT_BATCH_SIZE)
+    epochs = training_config.get('epochs', 100)
+    batch_size = training_config.get('batch_size', 32)
+    learning_rate = training_config.get('learning_rate', 0.001)
     patience = training_config.get('patience', 10)
+    seed = training_config.get('seed', 42)
     
-    # Configurar entrenamiento
-    state, _, rng = _setup_training(model, training_config, x_cgm_train, x_other_train, models_dir)
+    # Crear directorio para modelos si no existe
+    os.makedirs(models_dir, exist_ok=True)
     
-    # Preparar datos
-    train_batches, n_train_batches, x_cgm_val_array, x_other_val_array, y_val_array = _prepare_data(
-        x_cgm_train, x_other_train, y_train, 
-        extracted_data['val']['x_cgm'], extracted_data['val']['x_other'], extracted_data['val']['y'], 
-        batch_size, rng
+    # Inicializar generador de números aleatorios
+    rng = random.PRNGKey(seed)
+    rng, init_rng = random.split(rng)
+    
+    # Inicializar modelo
+    x_cgm_shape = (1,) + x_cgm_train.shape[1:]
+    x_other_shape = (1,) + x_other_train.shape[1:]
+    
+    # Separar un PRNG específico para dropout
+    init_rng, dropout_rng = random.split(init_rng)
+    
+    # Inicializar modelo con PRNG para dropout
+    params = model.init({'params': init_rng, 'dropout': dropout_rng}, 
+                        jnp.ones(x_cgm_shape), jnp.ones(x_other_shape),
+                        training=True)
+    
+    # Configurar tasa de aprendizaje con decaimiento
+    schedule_fn = optax.exponential_decay(
+        init_value=learning_rate,
+        transition_steps=1000,
+        decay_rate=0.9
     )
     
-    # Inicializar históricos y variables para early stopping
-    history = _initialize_history()
-    wait, best_val_loss = 0, float('inf')
-    best_state, best_params = state, state.params
+    # Configurar optimizador con recorte de gradiente
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),  # Recorte de gradiente
+        optax.adam(learning_rate=schedule_fn)
+    )
     
-    # Bucle de entrenamiento con early stopping
-
+    # Crear estado de entrenamiento
+    state = train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=tx
+    )
+    
+    # Crear conjuntos de datos en batches
+    train_batches, n_train_batches = create_batched_dataset(
+        x_cgm_train, x_other_train, y_train, batch_size=batch_size, shuffle=True, rng=rng
+    )
+    
+    # Convertir datos de validación para evaluación
+    x_cgm_val_array = jnp.array(x_cgm_val)
+    x_other_val_array = jnp.array(x_other_val)
+    y_val_array = jnp.array(y_val)
+    
+    # Inicializar históricos
+    history = {
+        CONST_LOSS: [],
+        CONST_VAL_LOSS: [],
+        CONST_METRIC_MAE: [],
+        f"val_{CONST_METRIC_MAE}": [],
+        CONST_METRIC_RMSE: [],
+        f"val_{CONST_METRIC_RMSE}": []
+    }
+    
+    # Variables para early stopping
+    wait = 0
+    best_val_loss = float('inf')
+    best_state = state
+    
+    # Bucle de entrenamiento
     print(f"\nEntrenando modelo {model_name}...")
-    print(f"Configuración: {epochs} épocas, batch size: {batch_size}")
-    print(f"Datos: {len(x_cgm_train)} ejemplos de entrenamiento, {len(x_cgm_val_array)} ejemplos de validación")
-    
     for epoch in range(epochs):
-        print(f"\nÉpoca {epoch+1}/{epochs}")
-        
         # Mezclar datos para esta época
         rng, shuffle_rng = random.split(rng)
         train_batches, _ = create_batched_dataset(
@@ -503,29 +494,46 @@ def train_and_evaluate_model(model: nn.Module,
             batch_size=batch_size, shuffle=True, rng=shuffle_rng
         )
         
-        # Mostrar información antes de cada época
-        print(f"Procesando {n_train_batches} batches ({len(train_batches)} batches reales)")
+        # Variables para métricas de época
+        epoch_loss = 0.0
         
-        # Entrenar una época y actualizar históricos
-        start_time = time.time()
-        epoch_loss, val_metrics, state = _train_epoch(
-            state, train_batches, n_train_batches, 
-            x_cgm_val_array, x_other_val_array, y_val_array
-        )
-        epoch_time = time.time() - start_time
-        history = _update_history(history, epoch_loss, val_metrics)
+        # Bucle sobre batches
+        for batch in train_batches:
+            # Desempaquetar batch
+            (x_cgm_batch, x_other_batch), y_batch = batch
+            
+            # Convertir a arrays de JAX
+            x_cgm_batch = jnp.array(x_cgm_batch)
+            x_other_batch = jnp.array(x_other_batch)
+            y_batch = jnp.array(y_batch)
+            
+            # Ejecutar paso de entrenamiento
+            state, metrics = train_step(state, x_cgm_batch, x_other_batch, y_batch)
+            
+            # Actualizar pérdida de época
+            epoch_loss += float(metrics[CONST_LOSS]) / n_train_batches
         
-        # Verificar que CONST_METRIC_R2 exista
-        r2_value = val_metrics.get(CONST_METRIC_R2, 0.0)
+        # Evaluar en validación
+        val_metrics = eval_step(state, x_cgm_val_array, x_other_val_array, y_val_array)
         
-        # Imprimir métricas con tiempo
-        print(f"Época {epoch+1}/{epochs} completada en {epoch_time:.2f}s - loss: {epoch_loss:.4f} - val_loss: {float(val_metrics[CONST_LOSS]):.4f} - MAE: {float(val_metrics[CONST_METRIC_MAE]):.4f} - RMSE: {float(val_metrics[CONST_METRIC_RMSE]):.4f} - R2: {float(r2_value):.4f}")
+        # Actualizar históricos
+        history[CONST_LOSS].append(epoch_loss)
+        history[CONST_VAL_LOSS].append(float(val_metrics[CONST_LOSS]))
+        history[CONST_METRIC_MAE].append(float(val_metrics[CONST_METRIC_MAE]))
+        history[f"val_{CONST_METRIC_MAE}"].append(float(val_metrics[CONST_METRIC_MAE]))
+        history[CONST_METRIC_RMSE].append(float(val_metrics[CONST_METRIC_RMSE]))
+        history[f"val_{CONST_METRIC_RMSE}"].append(float(val_metrics[CONST_METRIC_RMSE]))
         
-        # Manejo de early stopping
+        # Mostrar progreso cada 10 épocas
+        if epoch % 10 == 0 or epoch == epochs - 1:
+            print(f"Época {epoch+1}/{epochs} - "
+                  f"loss: {epoch_loss:.4f} - "
+                  f"val_loss: {float(val_metrics[CONST_LOSS]):.4f}")
+        
+        # Early stopping
         val_loss = float(val_metrics[CONST_LOSS])
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_params = state.params
             best_state = state
             wait = 0
             
@@ -540,18 +548,22 @@ def train_and_evaluate_model(model: nn.Module,
             if wait >= patience:
                 print(f"Early stopping en época {epoch+1}")
                 break
-        
-        # Custom early stopping
-        best_params, should_stop = _handle_early_stopping(model, epoch, val_loss, state.params, best_params)
-        if should_stop:
-            break
     
-    # Restaurar los mejores parámetros y guardar modelo final
-    state = state.replace(params=best_params)
-    save_checkpoint(os.path.join(models_dir, model_name), state, step=epoch)
+    # Guardar modelo final
+    save_checkpoint(
+        os.path.join(models_dir, model_name),
+        state,
+        step=epoch
+    )
     
-    # Hacer predicciones y calcular métricas
-    y_pred, metrics = _predict_and_evaluate(best_state, extracted_data['test'])
+    # Hacer predicciones con el mejor modelo
+    x_cgm_test_array = jnp.array(x_cgm_test)
+    x_other_test_array = jnp.array(x_other_test)
+    y_pred_array = best_state.apply_fn(best_state.params, x_cgm_test_array, x_other_test_array)
+    y_pred = np.array(y_pred_array).flatten()
+    
+    # Calcular métricas finales
+    metrics = calculate_metrics(y_test, y_pred)
     
     return history, y_pred, metrics
 
@@ -608,57 +620,30 @@ def train_model_sequential(model_creator: Callable,
     """
     print(f"\nEntrenando modelo {name}...")
     
-    # Identificar tipo de modelo para organización de figuras
-    model_type = get_model_type(name)
-    figures_path = os.path.join(CONST_FIGURES_DIR, CONST_MODEL_TYPES[model_type], name)
-    os.makedirs(figures_path, exist_ok=True)
+    # Crear modelo
+    model = model_creator(input_shapes[0], input_shapes[1])
     
-    # Crear modelo usando el model_creator
-    model_wrapper = model_creator(input_shapes[0], input_shapes[1])
+    # Organizar datos en estructura esperada
+    data = {
+        'train': {'x_cgm': x_cgm_train, 'x_other': x_other_train, 'y': y_train},
+        'val': {'x_cgm': x_cgm_val, 'x_other': x_other_val, 'y': y_val},
+        'test': {'x_cgm': x_cgm_test, 'x_other': x_other_test, 'y': y_test}
+    }
     
-    # Verificar si es un wrapper (DLModelWrapper, RLModelWrapper, DRLModelWrapper)
-    # Modificación: mejorar la condición para detectar wrappers
-    is_wrapper = (hasattr(model_wrapper, 'model') or not hasattr(model_wrapper, 'init')) and not isinstance(model_wrapper, nn.Module)
+    # Configuración por defecto
+    training_config = {
+        'epochs': 100,
+        'batch_size': 32
+    }
     
-    if is_wrapper:
-        # Caso ModelWrapper: usar su API interna
-        # Inicializar con clave aleatoria
-        rng_key = jax.random.PRNGKey(CONST_DEFAULT_SEED)
-        model_wrapper.start(x_cgm_train, x_other_train, y_train, rng_key)
-        
-        # Entrenar
-        history = model_wrapper.train(
-            x_cgm_train, x_other_train, y_train,
-            validation_data=((x_cgm_val, x_other_val), y_val),
-            epochs=CONST_EPOCHS, batch_size=CONST_DEFAULT_BATCH_SIZE
-        )
-        
-        # Predecir
-        y_pred = model_wrapper.predict(x_cgm_test, x_other_test)
-        
-    else:
-        # Caso nn.Module: usar la lógica existente
-        # Organizar datos en estructura esperada
-        data = {
-            'train': {'x_cgm': x_cgm_train, 'x_other': x_other_train, 'y': y_train},
-            'val': {'x_cgm': x_cgm_val, 'x_other': x_other_val, 'y': y_val},
-            'test': {'x_cgm': x_cgm_test, 'x_other': x_other_test, 'y': y_test}
-        }
-        
-        # Configuración por defecto
-        training_config = {
-            'epochs': CONST_EPOCHS,
-            'batch_size': CONST_DEFAULT_BATCH_SIZE
-        }
-        
-        # Entrenar y evaluar modelo
-        history, y_pred, _ = train_and_evaluate_model(
-            model=model_wrapper,
-            model_name=name,
-            data=data,
-            models_dir=models_dir,
-            training_config=training_config
-        )
+    # Entrenar y evaluar modelo
+    history, y_pred, _ = train_and_evaluate_model(
+        model=model,
+        model_name=name,
+        data=data,
+        models_dir=models_dir,
+        training_config=training_config
+    )
     
     # Limpiar memoria
     jax.clear_caches()
@@ -667,7 +652,7 @@ def train_model_sequential(model_creator: Callable,
     return {
         'name': name,
         'history': history,
-        'predictions': y_pred.tolist() if hasattr(y_pred, 'tolist') else y_pred,
+        'predictions': y_pred.tolist(),
     }
 
 def cross_validate_model(create_model_fn: Callable, 
@@ -699,7 +684,7 @@ def cross_validate_model(create_model_fn: Callable,
     Tuple[Dict[str, float], Dict[str, float]]
         (métricas_promedio, métricas_desviación)
     """
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=CONST_EPOCHS)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     scores = []
     
     for fold, (train_idx, val_idx) in enumerate(kf.split(x_cgm)):
@@ -744,6 +729,110 @@ def cross_validate_model(create_model_fn: Callable,
     }
     
     return mean_scores, std_scores
+
+
+def create_ensemble_prediction(predictions_dict: Dict[str, np.ndarray], 
+                             weights: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Combina predicciones de múltiples modelos usando promedio ponderado.
+    
+    Parámetros:
+    -----------
+    predictions_dict : Dict[str, np.ndarray]
+        Diccionario con predicciones de cada modelo
+    weights : Optional[np.ndarray], opcional
+        Pesos para cada modelo. Si es None, usa promedio simple (default: None)
+        
+    Retorna:
+    --------
+    np.ndarray
+        Predicciones combinadas del ensemble
+    """
+    all_preds = np.stack(list(predictions_dict.values()))
+    if weights is None:
+        weights = np.ones(len(predictions_dict)) / len(predictions_dict)
+    return np.average(all_preds, axis=0, weights=weights)
+
+
+def optimize_ensemble_weights(predictions_dict: Dict[str, np.ndarray], 
+                            y_true: np.ndarray) -> np.ndarray:
+    """
+    Optimiza pesos del ensemble usando optimización.
+    
+    Parámetros:
+    -----------
+    predictions_dict : Dict[str, np.ndarray]
+        Diccionario con predicciones de cada modelo
+    y_true : np.ndarray
+        Valores objetivo verdaderos
+        
+    Retorna:
+    --------
+    np.ndarray
+        Pesos optimizados para cada modelo
+    """
+    def objective(weights):
+        # Normalizar pesos
+        weights = weights / np.sum(weights)
+        # Obtener predicción del ensemble
+        ensemble_pred = create_ensemble_prediction(predictions_dict, weights)
+        # Calcular error
+        return mean_squared_error(y_true, ensemble_pred)
+    
+    n_models = len(predictions_dict)
+    initial_weights = np.ones(n_models) / n_models
+    bounds = [(0, 1) for _ in range(n_models)]
+    
+    result = minimize(
+        objective,
+        initial_weights,
+        bounds=bounds,
+        constraints={'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+    )
+    
+    return result.x / np.sum(result.x)
+
+
+def enhance_features(x_cgm: np.ndarray, x_other: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Mejora las características de entrada con características derivadas.
+    
+    Parámetros:
+    -----------
+    x_cgm : np.ndarray
+        Datos CGM
+    x_other : np.ndarray
+        Otras características
+        
+    Retorna:
+    --------
+    Tuple[np.ndarray, np.ndarray]
+        (x_cgm_mejorado, x_other)
+    """
+    # Añadir características derivadas para CGM
+    cgm_diff = np.diff(x_cgm.squeeze(), axis=1)
+    
+    # Ajustar padding según la forma real del array
+    padding = [(0,0) for _ in range(cgm_diff.ndim)]
+    padding[1] = (1,0)  # Añadir padding solo en la segunda dimensión
+    cgm_diff = np.pad(cgm_diff, padding, mode='edge')
+    
+    # Añadir estadísticas móviles
+    window = 5
+    rolling_mean = np.apply_along_axis(
+        lambda x: np.convolve(x, np.ones(window)/window, mode='same'),
+        1, x_cgm.squeeze()
+    )
+    
+    # Concatenar características mejoradas
+    x_cgm_enhanced = np.concatenate([
+        x_cgm,
+        cgm_diff[..., np.newaxis],
+        rolling_mean[..., np.newaxis]
+    ], axis=-1)
+    
+    return x_cgm_enhanced, x_other
+
 
 def predict_model(model_path: str, 
                  model_creator: Callable, 
@@ -807,13 +896,13 @@ def predict_model(model_path: str,
 
 def train_multiple_models(model_creators: Dict[str, Callable], 
                          input_shapes: Tuple[Tuple[int, ...], Tuple[int, ...]],
-                         x_cgm_train: np.ndarray, 
+                         x_cgm_train: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]], 
                          x_other_train: np.ndarray, 
                          y_train: np.ndarray,
-                         x_cgm_val: np.ndarray, 
+                         x_cgm_val: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]], 
                          x_other_val: np.ndarray, 
                          y_val: np.ndarray,
-                         x_cgm_test: np.ndarray, 
+                         x_cgm_test: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]], 
                          x_other_test: np.ndarray, 
                          y_test: np.ndarray,
                          models_dir: str = CONST_MODELS) -> Tuple[Dict[str, Dict], Dict[str, np.ndarray], Dict[str, Dict]]:
@@ -826,20 +915,20 @@ def train_multiple_models(model_creators: Dict[str, Callable],
         Diccionario de funciones creadoras de modelos indexadas por nombre
     input_shapes : Tuple[Tuple[int, ...], Tuple[int, ...]]
         Formas de las entradas (CGM, otras)
-    x_cgm_train : np.ndarray
-        Datos CGM de entrenamiento
+    x_cgm_train : Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]
+        Datos CGM de entrenamiento (o tupla con CGM y otras características)
     x_other_train : np.ndarray
         Otras características de entrenamiento
     y_train : np.ndarray
         Valores objetivo de entrenamiento
-    x_cgm_val : np.ndarray
-        Datos CGM de validación
+    x_cgm_val : Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]
+        Datos CGM de validación (o tupla con CGM y otras características)
     x_other_val : np.ndarray
         Otras características de validación
     y_val : np.ndarray
         Valores objetivo de validación
-    x_cgm_test : np.ndarray
-        Datos CGM de prueba
+    x_cgm_test : Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]
+        Datos CGM de prueba (o tupla con CGM y otras características)
     x_other_test : np.ndarray
         Otras características de prueba
     y_test : np.ndarray
@@ -854,13 +943,36 @@ def train_multiple_models(model_creators: Dict[str, Callable],
     """
     models_names = list(model_creators.keys())
     
+    # Detectar si los datos CGM vienen como tupla y extraerlos
+    if isinstance(x_cgm_train, tuple) and len(x_cgm_train) == 2:
+        print("Detectada tupla de datos (CGM, otros) - Extrayendo correctamente...")
+        x_cgm_train_actual = x_cgm_train[0]  # Tomar solo el primer elemento
+    else:
+        x_cgm_train_actual = x_cgm_train
+        
+    if isinstance(x_cgm_val, tuple) and len(x_cgm_val) == 2:
+        x_cgm_val_actual = x_cgm_val[0]
+    else:
+        x_cgm_val_actual = x_cgm_val
+        
+    if isinstance(x_cgm_test, tuple) and len(x_cgm_test) == 2:
+        x_cgm_test_actual = x_cgm_test[0]
+    else:
+        x_cgm_test_actual = x_cgm_test
+    
     model_results = []
     for name in models_names:
+        print(f"\nEntrenando modelo {name}...")
+        
+        # Imprimir información de formas
+        print(f"Forma de datos CGM de entrenamiento: {x_cgm_train_actual.shape}")
+        print(f"Forma de otras características de entrenamiento: {x_other_train.shape}")
+        
         result = train_model_sequential(
             model_creators[name], name, input_shapes,
-            x_cgm_train, x_other_train, y_train,
-            x_cgm_val, x_other_val, y_val,
-            x_cgm_test, x_other_test, y_test,
+            x_cgm_train_actual, x_other_train, y_train,
+            x_cgm_val_actual, x_other_val, y_val,
+            x_cgm_test_actual, x_other_test, y_test,
             models_dir
         )
         model_results.append(result)
@@ -874,10 +986,6 @@ def train_multiple_models(model_creators: Dict[str, Callable],
                 np.array(result['predictions'])
             ) for result in model_results
         )
-    
-    # metric_results = process_training_results(model_results=model_results, y_test=y_test)
-    print_debug("metric_results:")
-    print_debug(metric_results)
     
     # Almacenar resultados
     histories = {}
