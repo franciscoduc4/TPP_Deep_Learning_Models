@@ -18,12 +18,12 @@ import random
 from collections import deque
 
 from custom.DeepReinforcementLearning.drl_pt import DRLModelWrapperPyTorch
-from custom.printer import print_debug, print_warning
-from models.baseDRL import BaseDRLModel
+from custom.printer import print_critical, print_debug, print_warning
 from constants.constants import (
     IDEAL_LOWER_BOUND, IDEAL_UPPER_BOUND, SEVERE_HYPOGLYCEMIA_THRESHOLD, HYPOGLYCEMIA_THRESHOLD, HYPERGLYCEMIA_THRESHOLD, SEVERE_HYPERGLYCEMIA_THRESHOLD, SEVERE_HYPO_PENALTY, HYPO_PENALTY_BASE, HYPER_PENALTY_BASE, SEVERE_HYPER_PENALTY, MAX_REWARD
 )
 from config.models_config import DDPG_CONFIG
+from training.utils import compute_reward, calculate_iob
 from validation.simulator import GlucoseSimulator
 
 class DDPGActor(nn.Module):
@@ -45,8 +45,17 @@ class DDPGActor(nn.Module):
     """
     
     def __init__(self, cgm_input_dim: tuple, other_input_dim: tuple, 
-                action_dim: int = DDPG_CONFIG['action_dim'], hidden_dim: int = DDPG_CONFIG['hidden_dim'], max_action: float = DDPG_CONFIG['max_action']) -> None:
+             action_dim: int = DDPG_CONFIG['action_dim'], 
+             hidden_dim: int = DDPG_CONFIG['hidden_dim'], 
+             max_action: float = DDPG_CONFIG['max_action']) -> None:
         super().__init__()
+    
+        # Guardar dimensiones de entrada como atributos de instancia
+        self.cgm_input_dim = cgm_input_dim
+        self.other_input_dim = other_input_dim
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+        self.max_action = max_action
         
         # Encoder para datos CGM
         self.cgm_encoder = nn.Sequential(
@@ -87,7 +96,7 @@ class DDPGActor(nn.Module):
             Datos CGM de entrada
         x_other : torch.Tensor
             Otras características de entrada
-                
+            
         Retorna:
         --------
         torch.Tensor
@@ -98,7 +107,21 @@ class DDPGActor(nn.Module):
             x_cgm = x_cgm.reshape(x_cgm.shape[0], -1)
         if len(x_other.shape) > 2:
             x_other = x_other.reshape(x_other.shape[0], -1)
-            
+    
+        # Verificar y manejar entradas vacías o incorrectas
+        if x_cgm.shape[1] != np.prod(self.cgm_input_dim):
+            print_warning(f"x_cgm shape mismatch: expected {np.prod(self.cgm_input_dim)}, got {x_cgm.shape[1]}")
+            # Padding o redimensionamiento según sea necesario
+            if x_cgm.shape[1] < np.prod(self.cgm_input_dim):
+                padding = torch.zeros(x_cgm.shape[0], np.prod(self.cgm_input_dim) - x_cgm.shape[1], device=x_cgm.device)
+                x_cgm = torch.cat([x_cgm, padding], dim=1)
+    
+        if x_other.shape[1] != np.prod(self.other_input_dim):
+            print_warning(f"x_other shape mismatch: expected {np.prod(self.other_input_dim)}, got {x_other.shape[1]}")
+            if x_other.shape[1] < np.prod(self.other_input_dim):
+                padding = torch.zeros(x_other.shape[0], np.prod(self.other_input_dim) - x_other.shape[1], device=x_other.device)
+                x_other = torch.cat([x_other, padding], dim=1)
+    
         # Codificar cada componente
         cgm_features = self.cgm_encoder(x_cgm)
         other_features = self.other_encoder(x_other)
@@ -109,7 +132,14 @@ class DDPGActor(nn.Module):
         
         # Generar acción
         action = torch.sigmoid(self.action_head(features)) * self.max_action
-        
+    
+        # Ajustar acción para dosis de insulina
+        carbs_factor = x_other[:, 0:1] / 20.0  # Simple 1:20 insulin:carb ratio
+        carbs_factor = torch.clamp(carbs_factor, 0.0, self.max_action / 2)
+    
+        # Combinar acción con factor de carbohidratos
+        action = 0.7 * action + 0.3 * carbs_factor
+    
         return action
 
 class DDPGCritic(nn.Module):
@@ -132,6 +162,12 @@ class DDPGCritic(nn.Module):
                 action_dim: int = DDPG_CONFIG['action_dim'], hidden_dim: int = DDPG_CONFIG['hidden_dim']) -> None:
         super().__init__()
         
+        # Guardar dimensiones de entrada como atributos de instancia
+        self.cgm_input_dim = cgm_input_dim
+        self.other_input_dim = other_input_dim
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+    
         # Encoder para datos CGM
         self.cgm_encoder = nn.Sequential(
             nn.Linear(np.prod(cgm_input_dim), hidden_dim),
@@ -188,7 +224,21 @@ class DDPGCritic(nn.Module):
             x_cgm = x_cgm.reshape(x_cgm.shape[0], -1)
         if len(x_other.shape) > 2:
             x_other = x_other.reshape(x_other.shape[0], -1)
-            
+    
+        # Verificar y manejar entradas vacías o incorrectas
+        if x_cgm.shape[1] != np.prod(self.cgm_input_dim):
+            print_warning(f"Critic: x_cgm shape mismatch: expected {np.prod(self.cgm_input_dim)}, got {x_cgm.shape[1]}")
+            # Padding or resizing as needed
+            if x_cgm.shape[1] < np.prod(self.cgm_input_dim):
+                padding = torch.zeros(x_cgm.shape[0], np.prod(self.cgm_input_dim) - x_cgm.shape[1], device=x_cgm.device)
+                x_cgm = torch.cat([x_cgm, padding], dim=1)
+    
+        if x_other.shape[1] != np.prod(self.other_input_dim):
+            print_warning(f"Critic: x_other shape mismatch: expected {np.prod(self.other_input_dim)}, got {x_other.shape[1]}")
+            if x_other.shape[1] < np.prod(self.other_input_dim):
+                padding = torch.zeros(x_other.shape[0], np.prod(self.other_input_dim) - x_other.shape[1], device=x_other.device)
+                x_other = torch.cat([x_other, padding], dim=1)
+    
         # Codificar cada componente
         cgm_features = self.cgm_encoder(x_cgm)
         other_features = self.other_encoder(x_other)
@@ -483,7 +533,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-class DDPGModel(BaseDRLModel):
+class DDPGModel(nn.Module):
     """
     Implementación de Deep Deterministic Policy Gradient (DDPG) para dosificación de insulina.
     
@@ -506,13 +556,30 @@ class DDPGModel(BaseDRLModel):
                  rewards_function = None) -> None:
         """
         Inicializa el modelo DDPG para dosificación de insulina.
+        
+        Parámetros:
+        -----------
+        cgm_input_dim : tuple
+            Dimensiones de entrada para datos CGM
+        other_input_dim : tuple
+            Dimensiones de entrada para otras características
+        config : Dict[str, Any], opcional
+            Configuración del modelo DDPG (default: DDPG_CONFIG)
+        rewards_function : callable, opcional
+            Función para calcular recompensas (default: None)
+        
+        Retorna:
+        --------
+        None
         """
-        action_dim = config.get('action_dim', DDPG_CONFIG['action_dim'])
-        hidden_dim = config.get('hidden_dim', DDPG_CONFIG['hidden_dim'])
-        super().__init__(cgm_input_dim, other_input_dim, action_dim, hidden_dim)
+        super().__init__()
+        
+        # Guardar dimensiones de entrada
+        self.cgm_input_dim = cgm_input_dim
+        self.other_input_dim = other_input_dim
         
         # Inicializar semilla aleatoria para reproducibilidad
-        seed = DDPG_CONFIG['seed']
+        seed = config.get('seed', DDPG_CONFIG['seed'])
         self.seed = seed
         torch.manual_seed(seed)
         self.rng = np.random.Generator(np.random.PCG64(seed))
@@ -520,6 +587,8 @@ class DDPGModel(BaseDRLModel):
         self.config = config
         
         # Parámetros del algoritmo
+        self.action_dim = config.get('action_dim', DDPG_CONFIG['action_dim'])
+        self.hidden_dim = config.get('hidden_dim', DDPG_CONFIG['hidden_dim'])
         self.gamma = config.get('gamma', DDPG_CONFIG['gamma'])
         self.tau = config.get('tau', DDPG_CONFIG['tau'])
         self.max_action = config.get('max_action', DDPG_CONFIG['max_action'])
@@ -530,12 +599,12 @@ class DDPGModel(BaseDRLModel):
         self.buffer_size = config.get('buffer_size', DDPG_CONFIG['buffer_size'])
         
         # Inicializar redes de actor y crítico
-        self.actor = DDPGActor(cgm_input_dim, other_input_dim, action_dim, hidden_dim, self.max_action)
-        self.actor_target = DDPGActor(cgm_input_dim, other_input_dim, action_dim, hidden_dim, self.max_action)
+        self.actor = DDPGActor(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim, self.max_action)
+        self.actor_target = DDPGActor(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim, self.max_action)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
-        self.critic = DDPGCritic(cgm_input_dim, other_input_dim, action_dim, hidden_dim)
-        self.critic_target = DDPGCritic(cgm_input_dim, other_input_dim, action_dim, hidden_dim)
+        self.critic = DDPGCritic(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim)
+        self.critic_target = DDPGCritic(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim)
         self.critic_target.load_state_dict(self.critic.state_dict())
         
         # Optimizadores
@@ -543,7 +612,7 @@ class DDPGModel(BaseDRLModel):
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.critic_lr, weight_decay=1e-5)
         
         # Buffer de experiencia
-        self.buffer = ReplayBuffer(self.buffer_size, cgm_input_dim, other_input_dim, action_dim, self.rng)
+        self.buffer = ReplayBuffer(self.buffer_size, cgm_input_dim, other_input_dim, self.action_dim, self.rng)
         
         # Función de recompensa
         self.compute_rewards = rewards_function
@@ -551,6 +620,32 @@ class DDPGModel(BaseDRLModel):
         # Enviar redes al dispositivo correcto (CPU/GPU)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
+        
+        # Inicializar con pesos adecuados
+        self._initialize_networks()
+    
+    def _initialize_networks(self) -> None:
+        """
+        Inicializa las redes con pesos que producen salidas razonables desde el inicio.
+        """
+        # Inicialización especial para la última capa del actor para generar valores no nulos
+        if hasattr(self.actor, 'action_head'):
+            # Initialize action_head to produce non-zero outputs
+            nn.init.uniform_(self.actor.action_head.weight, -0.003, 0.003)
+            nn.init.uniform_(self.actor.action_head.bias, 0.1, 0.3)  # Positive bias to start
+            print_debug("Initialized actor head with special weights")
+        
+        # Inicialización especial para la última capa del crítico
+        if hasattr(self.critic, 'combined_layer'):
+            last_layer = self.critic.combined_layer[-1]
+            if isinstance(last_layer, nn.Linear):
+                nn.init.uniform_(last_layer.weight, -0.003, 0.003)
+                nn.init.uniform_(last_layer.bias, -0.1, 0.1)
+                print_debug("Initialized critic output layer with special weights")
+        
+        # Asegurar que el actor target y crítico target tengan los mismos pesos
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target.load_state_dict(self.critic.state_dict())
         
     def forward(self, x_cgm: torch.Tensor, x_other: torch.Tensor) -> torch.Tensor:
         """
@@ -595,20 +690,31 @@ class DDPGModel(BaseDRLModel):
         # Aplanar tensores si es necesario
         if len(x_cgm.shape) > 2:
             x_cgm = x_cgm.reshape(x_cgm.shape[0], -1)
+            print_debug(f"Reshaping x_cgm to {x_cgm.shape}")
         if len(x_other.shape) > 2:
             x_other = x_other.reshape(x_other.shape[0], -1)
+            print_debug(f"Reshaping x_other to {x_other.shape}")
     
         # Obtener acción del actor
         with torch.no_grad():
             action = self.actor(x_cgm, x_other)
+            print_debug(f"Raw actor output: {action.cpu().numpy()}")
+            
+            # Check for NaN or zero values
+            if torch.isnan(action).any():
+                print_warning("NaN detected in actor output!")
+            if (action == 0).all():
+                print_warning("All zeros detected in actor output!")
     
         # Agregar ruido de exploración si está habilitado
         if add_noise:
             noise = torch.normal(0, self.exploration_noise, size=action.shape).to(action.device)
             action = action + noise
+            print_debug(f"Action after noise: {action.cpu().numpy()}")
     
         # Recortar a los límites de acción
         action = torch.clamp(action, self.min_action, self.max_action)
+        print_debug(f"Final action after clamp: {action.cpu().numpy()}")
     
         # Volver a modo de entrenamiento
         self.actor.train()
@@ -869,15 +975,146 @@ class DDPGModel(BaseDRLModel):
         
         # Predecir sin ruido
         with torch.no_grad():
+            # print_debug(f"Forma x_cgm_tensor: {x_cgm_tensor.shape}, Forma x_other_tensor: {x_other_tensor.shape}")
+            
             actions = self.select_action(x_cgm_tensor, x_other_tensor, add_noise=False)
         
         # Verificar NaN en las predicciones
         pred_numpy = actions.cpu().numpy()
         if np.isnan(pred_numpy).any():
-            print_warning("Se detectaron NaN en las predicciones. Aplicando corrección.")
-            pred_numpy = np.nan_to_num(pred_numpy, nan=0.5)  # Valor predeterminado seguro
+            print_warning("Se detectaron NaN en las predicciones. Aplicando corrección basada en carbohidratos.")
+            # Extraer carbohidratos para fallback inteligente
+            carbs = float(x_other[0, 0]) if x_other.shape[1] > 0 else 0.0
+            # Aplicar una regla básica: 1U por cada 10g de carbohidratos
+            fallback_dose = carbs / 10.0
+            pred_numpy = np.full_like(pred_numpy, fallback_dose)
         
         return pred_numpy
+    
+    def _extract_current_glucose(self, x_cgm: np.ndarray) -> float:
+        """
+        Extrae el nivel actual de glucosa del array CGM.
+        
+        Parámetros:
+        -----------
+        x_cgm : np.ndarray
+            Datos CGM
+            
+        Retorna:
+        --------
+        float
+            Nivel actual de glucosa
+        """
+        if len(x_cgm.shape) > 2:
+            return float(x_cgm[0, -1, 0])
+        elif len(x_cgm.shape) == 2:
+            return float(x_cgm[0, -1])
+        else:
+            return float(x_cgm[-1])
+    
+    def _prepare_context_inputs(self, x_other: np.ndarray, carb_intake: float, iob: float,
+                              sleep_quality: float, work_intensity: float, 
+                              exercise_intensity: float) -> np.ndarray:
+        """
+        Prepara la entrada con todos los datos contextuales.
+        
+        Parámetros:
+        -----------
+        x_other : np.ndarray
+            Otras características base
+        carb_intake, iob, sleep_quality, work_intensity, exercise_intensity : float
+            Valores contextuales
+            
+        Retorna:
+        --------
+        np.ndarray
+            Entrada modificada con contexto
+        """
+        x_other_with_context = np.copy(x_other)
+        
+        # Si x_other es un array vacío o muy pequeño, ampliarlo
+        if x_other_with_context.shape[1] < 5:
+            extended_x_other = np.zeros((x_other_with_context.shape[0], 5))
+            # Copiar los valores existentes
+            for i in range(min(x_other_with_context.shape[1], 5)):
+                extended_x_other[:, i] = x_other_with_context[:, i]
+            x_other_with_context = extended_x_other
+        
+        # Actualizar con valores contextuales
+        x_other_with_context[0, 0] = carb_intake
+        x_other_with_context[0, 1] = iob
+        if x_other_with_context.shape[1] > 2:
+            x_other_with_context[0, 2] = sleep_quality
+        if x_other_with_context.shape[1] > 3:
+            x_other_with_context[0, 3] = work_intensity
+        if x_other_with_context.shape[1] > 4:
+            x_other_with_context[0, 4] = exercise_intensity
+            
+        return x_other_with_context
+    
+    def _adjust_for_glucose_level(self, prediction_value: float, current_glucose: float) -> float:
+        """
+        Ajusta la dosis basada en el nivel actual de glucosa.
+        
+        Parámetros:
+        -----------
+        prediction_value : float
+            Valor de predicción inicial
+        current_glucose : float
+            Nivel actual de glucosa
+            
+        Retorna:
+        --------
+        float
+            Valor de predicción ajustado
+        """
+        if current_glucose < SEVERE_HYPOGLYCEMIA_THRESHOLD:
+            return prediction_value * 0.1  # Reducción drástica
+        elif current_glucose < HYPOGLYCEMIA_THRESHOLD:
+            return prediction_value * 0.5
+        elif current_glucose > SEVERE_HYPERGLYCEMIA_THRESHOLD:
+            return prediction_value * 1.5
+        elif current_glucose > HYPERGLYCEMIA_THRESHOLD:
+            return prediction_value * 1.2
+        return prediction_value
+    
+    def _adjust_for_carbs_and_iob(self, prediction_value: float, carb_intake: float, iob: float) -> float:
+        """
+        Ajusta la dosis basada en la ingesta de carbohidratos e insulina a bordo.
+        
+        Parámetros:
+        -----------
+        prediction_value : float
+            Valor de predicción actual
+        carb_intake : float
+            Ingesta de carbohidratos
+        iob : float
+            Insulina a bordo
+            
+        Retorna:
+        --------
+        float
+            Valor de predicción ajustado
+        """
+        # Dosificación basada en carbohidratos como componente de respaldo
+        carb_based_component = carb_intake / 10.0  # Ratio I:C típico
+        
+        # Ajustar para carbohidratos
+        if carb_intake > 0:
+            blend_factor = min(0.8, carb_intake / 100.0)
+            blended_dose = (1 - blend_factor) * prediction_value + blend_factor * carb_based_component
+            prediction_value = max(prediction_value, blended_dose * 0.8)
+        
+        # Ajustar por IOB
+        if iob > 3.0:
+            prediction_value *= max(0.5, 1.0 - (iob - 3.0) / 4.0)
+        
+        # Dosis mínima para comidas
+        if carb_intake > 20:
+            minimum_dose = carb_intake / 30.0
+            prediction_value = max(prediction_value, minimum_dose)
+            
+        return prediction_value
     
     def predict_with_context(self, x_cgm: np.ndarray, x_other: np.ndarray, 
                   carb_intake: float,
@@ -907,24 +1144,22 @@ class DDPGModel(BaseDRLModel):
             Nivel actual de glucosa en mg/dL
         iob : float, opcional
             Insulina activa en el cuerpo (Insulin On Board)
-        
+    
         Retorna:
         --------
         float
             Dosis de insulina recomendada
         """
-        # Extraer nivel de glucosa si no se proporciona
+        if carb_intake <= 0.0:
+            print_critical("Ingesta de carbohidratos es 0.0, no se recomienda dosis de insulina.")
+            return 0.0
+        print_debug(f"Predicción con contexto: ingesta de carbohidratos: {carb_intake}, glucosa actual: {current_glucose}, IOB: {iob}, sleep_quality: {sleep_quality}, work_intensity: {work_intensity}, exercise_intensity: {exercise_intensity}")
+        # Extraer o utilizar nivel de glucosa proporcionado
         if current_glucose is None:
-            if len(x_cgm.shape) > 2:
-                current_glucose = float(x_cgm[0, -1, 0])
-            elif len(x_cgm.shape) == 2:
-                current_glucose = float(x_cgm[0, -1])
-            else:
-                current_glucose = float(x_cgm[-1])
+            current_glucose = self._extract_current_glucose(x_cgm)
     
-        # Manejar IOB no proporcionado con estimación
+        # Manejar IOB no proporcionado
         if iob is None:
-            from training.common import calculate_iob
             iob = calculate_iob(x_cgm, carb_intake)
     
         # Valores por defecto para parámetros opcionales
@@ -932,74 +1167,150 @@ class DDPGModel(BaseDRLModel):
         work_intensity = 0.0 if work_intensity is None else float(work_intensity)
         exercise_intensity = 0.0 if exercise_intensity is None else float(exercise_intensity)
     
-        # Preparar entrada modificada con contexto
-        x_other_with_context = np.copy(x_other)
+        # Preparar entrada con contexto
+        x_other_with_context = self._prepare_context_inputs(
+            x_other, carb_intake, iob, sleep_quality, 
+            work_intensity, exercise_intensity
+        )
     
-        # Si x_other es un array vacío o muy pequeño, ampliarlo
-        if x_other_with_context.shape[1] < 5:
-            extended_x_other = np.zeros((x_other_with_context.shape[0], 5))
-            # Copiar los valores existentes
-            for i in range(min(x_other_with_context.shape[1], 5)):
-                extended_x_other[:, i] = x_other_with_context[:, i]
-            x_other_with_context = extended_x_other
-    
-        # Actualizar con valores contextuales
-        x_other_with_context[0, 0] = carb_intake
-        x_other_with_context[0, 1] = iob
-        if x_other_with_context.shape[1] > 2:
-            x_other_with_context[0, 2] = sleep_quality
-        if x_other_with_context.shape[1] > 3:
-            x_other_with_context[0, 3] = work_intensity
-        if x_other_with_context.shape[1] > 4:
-            x_other_with_context[0, 4] = exercise_intensity
-    
-        # Predecir usando la entrada modificada con todo el contexto
+        # Predecir usando la entrada con contexto
         prediction = self.predict(x_cgm, x_other_with_context)
         
         print_debug(f"Predicción inicial: {prediction}, glucosa actual: {current_glucose}, IOB: {iob}, ingesta de carbohidratos: {carb_intake}")
     
-        # Aplicar ajustes basados en reglas para seguridad adicional
+        # Extraer valor de predicción
         prediction_value = float(prediction.item() if hasattr(prediction, 'item') else prediction[0])
-
-        # Ajustar dosis basada en glucosa actual para seguridad
-        if current_glucose < SEVERE_HYPOGLYCEMIA_THRESHOLD:  # < 54 mg/dL
-            # Reducir significativamente la dosis si hay hipoglucemia severa
-            prediction_value *= 0.1  # Reducción drástica
-        elif current_glucose < HYPOGLYCEMIA_THRESHOLD:  # < 70 mg/dL
-            # Reducir moderadamente la dosis si hay hipoglucemia leve
-            prediction_value *= 0.5
-        elif HYPOGLYCEMIA_THRESHOLD <= current_glucose <= HYPERGLYCEMIA_THRESHOLD:  # 70-180 mg/dL
-            # No ajustar dosis si está en rango normal
-            prediction_value *= 1.0
-        elif current_glucose < SEVERE_HYPERGLYCEMIA_THRESHOLD:# > 180 mg/dL
-            # Aumentar moderadamente la dosis si hay hiperglucemia
-            prediction_value *= 1.2
-        else:  # > 250 mg/dL
-            # Aumentar significativamente la dosis si hay hiperglucemia severa
-            prediction_value *= 1.2
-    
-        # Carb-based dosing as a fallback component (based on typical insulin:carb ratio)
-        carb_based_component = carb_intake / 10.0  # Typical I:C ratio
-    
-        # Blend the model prediction with the carb-based component
-        # This ensures we're never giving zero insulin for meals
-        if carb_intake > 0:
-            # Blend more heavily toward carb-based dosing for larger meals
-            blend_factor = min(0.8, carb_intake / 100.0)
-            blended_dose = (1 - blend_factor) * prediction_value + blend_factor * carb_based_component
-            prediction_value = max(prediction_value, blended_dose * 0.8)  # At least 80% of blended dose
-    
-        # Ajustar por IOB: reducir dosis si ya hay mucha insulina activa
-        if iob > 3.0:
-            prediction_value *= max(0.5, 1.0 - (iob - 3.0) / 4.0)
-    
-        # Basic minimum dose for meals
-        if carb_intake > 20:
-            minimum_dose = carb_intake / 30.0  # Conservative minimum
-            prediction_value = max(prediction_value, minimum_dose)
+        
+        # Aplicar ajustes
+        prediction_value = self._adjust_for_glucose_level(prediction_value, current_glucose)
+        prediction_value = self._adjust_for_carbs_and_iob(prediction_value, carb_intake, iob)
     
         # Asegurar límites seguros
         return max(0.0, min(prediction_value, self.max_action))
+    
+    def _extract_initial_glucose(self, x_cgm: np.ndarray) -> np.ndarray:
+        """
+        Extrae los valores iniciales de glucosa para simulación.
+        
+        Parámetros:
+        -----------
+        x_cgm : np.ndarray
+            Datos CGM
+            
+        Retorna:
+        --------
+        np.ndarray
+            Valores iniciales de glucosa
+        """
+        if len(x_cgm.shape) > 2:
+            return np.array([x_cgm[i, -1, 0] for i in range(len(x_cgm))])
+        else:
+            return np.array([x_cgm[i, -1] if len(x_cgm[i]) > 0 else 120.0 for i in range(len(x_cgm))])
+    
+    def _prepare_context(self, i: int, carb_intake: np.ndarray, initial_glucose: np.ndarray,
+                        sleep_quality: np.ndarray = None, work_intensity: np.ndarray = None,
+                        exercise_intensity: np.ndarray = None) -> dict:
+        """
+        Prepara el contexto para una muestra específica.
+        
+        Parámetros:
+        -----------
+        i : int
+            Índice de la muestra
+        carb_intake, initial_glucose : np.ndarray
+            Datos básicos para el contexto
+        sleep_quality, work_intensity, exercise_intensity : np.ndarray, opcional
+            Datos contextuales adicionales
+            
+        Retorna:
+        --------
+        dict
+            Contexto para la predicción
+        """
+        context = {
+            'carb_intake': float(carb_intake[i]),
+            'current_glucose': float(initial_glucose[i])
+        }
+        
+        # Agregar contexto adicional si está disponible
+        if sleep_quality is not None:
+            context['sleep_quality'] = float(sleep_quality[i])
+        if work_intensity is not None:
+            context['work_intensity'] = float(work_intensity[i])
+        if exercise_intensity is not None:
+            context['exercise_intensity'] = float(exercise_intensity[i])
+            
+        return context
+    
+    def _estimate_iob(self, i: int, x_cgm: np.ndarray, context: dict) -> dict:
+        """
+        Estima la insulina a bordo (IOB) basado en tendencias de glucosa.
+        
+        Parámetros:
+        -----------
+        i : int
+            Índice de la muestra
+        x_cgm : np.ndarray
+            Datos CGM
+        context : dict
+            Contexto actual
+            
+        Retorna:
+        --------
+        dict
+            Contexto actualizado con IOB estimado
+        """
+        if len(x_cgm[i]) > 2 and len(x_cgm.shape) > 2:
+            glucose_trend = x_cgm[i, -1, 0] - x_cgm[i, -3, 0]
+            if glucose_trend < -10:  # Bajando
+                estimated_iob = max(1.0, context['carb_intake'] / 20.0)
+            else:
+                estimated_iob = context['carb_intake'] / 30.0
+            context['iob'] = min(estimated_iob, 5.0)
+        return context
+    
+    def _process_trajectory(self, trajectory: np.ndarray) -> dict:
+        """
+        Procesa la trayectoria de glucosa para calcular métricas de tiempo en rango.
+        
+        Parámetros:
+        -----------
+        trajectory : np.ndarray
+            Trayectoria de glucosa
+            
+        Retorna:
+        --------
+        dict
+            Porcentajes de tiempo en diferentes rangos
+        """
+        # Definir rangos de glucosa
+        severely_below_range = trajectory < SEVERE_HYPOGLYCEMIA_THRESHOLD
+        below_range = np.logical_and(trajectory >= SEVERE_HYPOGLYCEMIA_THRESHOLD, 
+                                    trajectory < HYPOGLYCEMIA_THRESHOLD)
+        in_range_low = np.logical_and(trajectory >= HYPOGLYCEMIA_THRESHOLD, 
+                                    trajectory < IDEAL_LOWER_BOUND)
+        in_range_ideal = np.logical_and(trajectory >= IDEAL_LOWER_BOUND, 
+                                        trajectory <= IDEAL_UPPER_BOUND)
+        in_range_high = np.logical_and(trajectory > IDEAL_UPPER_BOUND, 
+                                    trajectory <= HYPERGLYCEMIA_THRESHOLD)
+        above_range = np.logical_and(trajectory > HYPERGLYCEMIA_THRESHOLD, 
+                                    trajectory < SEVERE_HYPERGLYCEMIA_THRESHOLD)
+        severely_above_range = trajectory >= SEVERE_HYPERGLYCEMIA_THRESHOLD
+        
+        # Tiempo total en rango (70-180 mg/dL)
+        in_range_total = np.logical_and(trajectory >= HYPOGLYCEMIA_THRESHOLD, 
+                                      trajectory <= HYPERGLYCEMIA_THRESHOLD)
+        
+        return {
+            'severely_below': 100.0 * np.mean(severely_below_range),
+            'below': 100.0 * np.mean(below_range),
+            'in_range_low': 100.0 * np.mean(in_range_low),
+            'in_range_ideal': 100.0 * np.mean(in_range_ideal),
+            'in_range_high': 100.0 * np.mean(in_range_high),
+            'in_range_total': 100.0 * np.mean(in_range_total),
+            'above': 100.0 * np.mean(above_range),
+            'severely_above': 100.0 * np.mean(severely_above_range)
+        }
     
     def evaluate_with_context(self, x_cgm: np.ndarray, x_other: np.ndarray, 
                     carb_intake: np.ndarray,
@@ -1032,101 +1343,61 @@ class DDPGModel(BaseDRLModel):
             Métricas de evaluación
         """
         predictions = []
-        time_in_range_total = []
-        time_in_range_ideal = []
-        time_in_range_low = []
-        time_in_range_high = []
-        time_below_range = []
-        time_severely_below_range = []
-        time_above_range = []
-        time_severely_above_range = []
+        time_metrics = {
+            'time_in_range_total': [], 'time_in_range_ideal': [], 'time_in_range_low': [],
+            'time_in_range_high': [], 'time_below_range': [], 'time_severely_below_range': [],
+            'time_above_range': [], 'time_severely_above_range': []
+        }
         
         # Extraer valores de glucosa para simulación
-        if len(x_cgm.shape) > 2:
-            initial_glucose = np.array([x_cgm[i, -1, 0] for i in range(len(x_cgm))])
-        else:
-            initial_glucose = np.array([x_cgm[i, -1] if len(x_cgm[i]) > 0 else 120.0 for i in range(len(x_cgm))])
+        initial_glucose = self._extract_initial_glucose(x_cgm)
 
         for i in range(len(x_cgm)):
             # Preparar contexto para esta muestra
-            context = {
-                'carb_intake': float(carb_intake[i]),
-                'current_glucose': float(initial_glucose[i])
-            }
-            
-            # Agregar contexto adicional si está disponible
-            if sleep_quality is not None:
-                context['sleep_quality'] = float(sleep_quality[i])
-            if work_intensity is not None:
-                context['work_intensity'] = float(work_intensity[i])
-            if exercise_intensity is not None:
-                context['exercise_intensity'] = float(exercise_intensity[i])
-    
-        # Estimar IOB si es posible
-        # Podemos usar la tendencia de glucosa como proxy
-        if len(x_cgm[i]) > 2 and len(x_cgm.shape) > 2:
-            glucose_trend = x_cgm[i, -1, 0] - x_cgm[i, -3, 0]
-            if glucose_trend < -10:  # Bajando
-                estimated_iob = max(1.0, context['carb_intake'] / 20.0)
-            else:
-                estimated_iob = context['carb_intake'] / 30.0
-            context['iob'] = min(estimated_iob, 5.0)
-    
-        # Predecir dosis
-        dose = self.predict_with_context(
-            x_cgm[i:i+1], x_other[i:i+1], **context
-        )
-        predictions.append(dose)
-        
-        # Evaluar con simulador si está disponible
-        if simulator is not None:
-            trajectory = simulator.predict_glucose_trajectory(
-                initial_glucose=initial_glucose[i],
-                insulin_doses=[dose],
-                carb_intakes=[float(carb_intake[i])],
-                timestamps=[0],
-                prediction_horizon=6
+            context = self._prepare_context(
+                i, carb_intake, initial_glucose, 
+                sleep_quality, work_intensity, exercise_intensity
             )
             
-            # Definir correctamente los rangos de glucosa
-            severely_below_range = trajectory < SEVERE_HYPOGLYCEMIA_THRESHOLD
-            below_range = np.logical_and(trajectory >= SEVERE_HYPOGLYCEMIA_THRESHOLD, trajectory < HYPOGLYCEMIA_THRESHOLD)
-            in_range_low = np.logical_and(trajectory >= HYPOGLYCEMIA_THRESHOLD, trajectory < IDEAL_LOWER_BOUND)
-            in_range_ideal = np.logical_and(trajectory >= IDEAL_LOWER_BOUND, trajectory <= IDEAL_UPPER_BOUND)
-            in_range_high = np.logical_and(trajectory > IDEAL_UPPER_BOUND, trajectory <= HYPERGLYCEMIA_THRESHOLD)
-            above_range = np.logical_and(trajectory > HYPERGLYCEMIA_THRESHOLD, 
-                                        trajectory < SEVERE_HYPERGLYCEMIA_THRESHOLD)
-            severely_above_range = trajectory >= SEVERE_HYPERGLYCEMIA_THRESHOLD
+            # Estimar IOB si es posible
+            context = self._estimate_iob(i, x_cgm, context)
             
-            # Calcular tiempo total en rango (70-180 mg/dL)
-            in_range_total = np.logical_and(trajectory >= HYPOGLYCEMIA_THRESHOLD, 
-                                          trajectory <= HYPERGLYCEMIA_THRESHOLD)
+            # Predecir dosis
+            dose = self.predict_with_context(
+                x_cgm[i:i+1], x_other[i:i+1], **context
+            )
+            print_debug(f"Predicción para muestra {i}: {dose}, contexto: {context}")
+            predictions.append(dose)
             
-            # Calcular porcentajes para cada rango
-            time_severely_below_range.append(100.0 * np.mean(severely_below_range))
-            time_below_range.append(100.0 * np.mean(below_range))
-            time_in_range_low.append(100.0 * np.mean(in_range_low))
-            time_in_range_ideal.append(100.0 * np.mean(in_range_ideal))
-            time_in_range_high.append(100.0 * np.mean(in_range_high))
-            time_in_range_total.append(100.0 * np.mean(in_range_total))
-            time_above_range.append(100.0 * np.mean(above_range))
-            time_severely_above_range.append(100.0 * np.mean(severely_above_range))
+            # Evaluar con simulador si está disponible
+            if simulator is not None:
+                trajectory = simulator.predict_glucose_trajectory(
+                    initial_glucose=initial_glucose[i],
+                    insulin_doses=[dose],
+                    carb_intakes=[float(carb_intake[i])],
+                    timestamps=[0],
+                    prediction_horizon=6
+                )
+                
+                # Procesar trayectoria y actualizar métricas
+                ranges = self._process_trajectory(trajectory)
+                time_metrics['time_severely_below_range'].append(ranges['severely_below'])
+                time_metrics['time_below_range'].append(ranges['below'])
+                time_metrics['time_in_range_low'].append(ranges['in_range_low'])
+                time_metrics['time_in_range_ideal'].append(ranges['in_range_ideal'])
+                time_metrics['time_in_range_high'].append(ranges['in_range_high'])
+                time_metrics['time_in_range_total'].append(ranges['in_range_total'])
+                time_metrics['time_above_range'].append(ranges['above'])
+                time_metrics['time_severely_above_range'].append(ranges['severely_above'])
 
-        # Preparar métricas
+        # Preparar métricas de resultado
         metrics = {}
 
         # Métricas clínicas si se utilizó simulador
         if simulator is not None:
-            metrics.update({
-                'time_in_range_total': float(np.mean(time_in_range_total)),
-                'time_in_range_ideal': float(np.mean(time_in_range_ideal)),
-                'time_in_range_low': float(np.mean(time_in_range_low)),
-                'time_in_range_high': float(np.mean(time_in_range_high)),
-                'time_below_range': float(np.mean(time_below_range)),
-                'time_severely_below_range': float(np.mean(time_severely_below_range)),
-                'time_above_range': float(np.mean(time_above_range)),
-                'time_severely_above_range': float(np.mean(time_severely_above_range))
-            })
+            for key, values in time_metrics.items():
+                if values:  # Solo si hay valores
+                    metrics[key] = float(np.mean(values))
 
         # Métricas de error si hay dosis reales
         if true_doses is not None:
@@ -1177,8 +1448,6 @@ def create_ddpg_model(cgm_input_dim: tuple, other_input_dim: tuple) -> DRLModelW
     DRLModelWrapperPyTorch
         Modelo DDPG inicializado envuelto en DRLModelWrapperPyTorch
     """
-    from training.common import compute_reward
-    
     model = DDPGModel(
         cgm_input_dim=cgm_input_dim,
         other_input_dim=other_input_dim,

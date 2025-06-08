@@ -8,7 +8,7 @@ from tqdm.auto import tqdm
 from constants.constants import CONST_DEFAULT_SEED, CONST_DEFAULT_EPOCHS, CONST_DEFAULT_BATCH_SIZE, CONST_ACTOR, CONST_CRITIC, CONST_TARGET, CONST_PARAMS, CONST_DEVICE, CONST_MODEL_INIT_ERROR, CONST_LOSS, CONST_VAL_LOSS, CONST_EPSILON
 from config.models_config import EARLY_STOPPING_POLICY
 from custom.model_wrapper import ModelWrapper
-from custom.printer import print_debug, print_info, print_warning, print_error, print_success
+from custom.printer import print_critical, print_debug, print_info, print_warning, print_error, print_success
 
 class DRLModelWrapperPyTorch(ModelWrapper, nn.Module):
     """
@@ -903,7 +903,9 @@ class DRLModelWrapperPyTorch(ModelWrapper, nn.Module):
             raise ValueError("El modelo debe ser inicializado antes de realizar predicciones con contexto")
     
         try:
+            print_critical("Usando predict_with_context para calcular dosis de insulina")
             if hasattr(self.model, 'predict_with_context'):
+                print_critical("El modelo tiene predict_with_context, usando este método")
                 context = {
                     'carb_intake': carb_intake,
                     'sleep_quality': sleep_quality,
@@ -922,6 +924,7 @@ class DRLModelWrapperPyTorch(ModelWrapper, nn.Module):
                     dose = float(np.mean(dose))
                 return float(dose)
             else:
+                print_critical("El modelo no tiene predict_with_context, usando predict regular")
                 # Fallback a predict regular si predict_with_context no está disponible
                 predictions = self.predict(x_cgm, x_other)
                 return float(np.mean(predictions))

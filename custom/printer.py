@@ -122,6 +122,15 @@ def print_warning(text):
     """
     print(coloured("WARNING", colour='black', background='yellow', style='bold') + " " + coloured(text, colour='yellow', style='bold'))
 
+def print_critical(text):
+    """
+    Imprime un mensaje crítico en rojo con fondo blanco.
+    
+    Args:
+        text (str): Mensaje crítico a imprimir.
+    """
+    print(coloured("CRITICAL", colour='white', background='red', style='bold') + " " + coloured(text, colour='red', style='bold'))
+
 def print_success(text):
     """
     Imprime un mensaje de éxito en verde.
