@@ -43,3 +43,81 @@ DDPG_CONFIG = {
     # Otros parámetros
     "seed": CONST_DEFAULT_SEED                      # Semilla aleatoria para reproducibilidad
 }
+
+DQN_CONFIG = {
+    # Discretización del espacio de acción
+    'action_bins': 20,  # Número de valores discretos de dosis
+    'max_action': 10.0,  # Dosis máxima de insulina
+    'min_action': 0.0,   # Dosis mínima de insulina
+    
+    # Parámetros del algoritmo
+    'gamma': 0.99,       # Factor de descuento
+    'tau': 0.005,        # Tasa de actualización suave
+    'learning_rate': 3e-4,  # Tasa de aprendizaje
+    
+    # Parámetros para exploración
+    'epsilon_start': 1.0,  # Epsilon inicial para exploración
+    'epsilon_decay': 0.995,  # Tasa de decaimiento de epsilon
+    'epsilon_min': 0.01,  # Epsilon mínimo
+    
+    # Parámetros del entrenamiento
+    'buffer_size': 100000,  # Tamaño del buffer de experiencia
+    'batch_size': 64,  # Tamaño del batch
+    'target_update_freq': 10,  # Frecuencia de actualización de la red target
+    
+    # Reproducibilidad
+    'seed': CONST_DEFAULT_SEED  # Semilla para generación de números aleatorios
+}
+
+SAC_CONFIG = {
+    # Dimensiones de entrada y salida
+    'action_dim': 1,  # Dosis de insulina (escalar)
+    'hidden_dim': 256,  # Dimensión de capas ocultas
+    
+    # Parámetros del algoritmo
+    'gamma': 0.99,  # Factor de descuento
+    'tau': 0.005,  # Tasa de actualización suave para redes objetivo
+    'alpha_lr': 3e-4,  # Tasa de aprendizaje para parámetro de temperatura
+    'actor_lr': 3e-4,  # Tasa de aprendizaje para actor
+    'critic_lr': 3e-4,  # Tasa de aprendizaje para crítico
+    'initial_alpha': 0.2,  # Valor inicial de la temperatura (coef. de entropía)
+    
+    # Limitaciones de acción
+    'max_action': 10.0,  # Dosis máxima de insulina
+    'min_action': 0.0,  # Dosis mínima de insulina
+    
+    # Parámetros del buffer
+    'buffer_size': 100000,  # Tamaño del buffer de experiencia
+    
+    # Reproducibilidad
+    'seed': CONST_DEFAULT_SEED  # Semilla para generación de números aleatorios
+}
+
+TD3_BC_CONFIG = {
+    # Dimensiones de entrada y salida
+    'action_dim': 1,  # Dosis de insulina (escalar)
+    'hidden_dim': 256,  # Dimensión de capas ocultas
+    
+    # Parámetros del algoritmo
+    'gamma': 0.99,  # Factor de descuento
+    'tau': 0.005,  # Tasa de actualización suave para redes objetivo
+    'policy_noise': 0.2,  # Ruido de la política para target policy smoothing
+    'noise_clip': 0.5,  # Recorte de ruido para target policy smoothing
+    'policy_delay': 2,  # Frecuencia de actualización del actor (2 = cada 2 actualizaciones)
+    'alpha': 2.5,  # Peso para balancear la pérdida de BC vs RL
+    
+    # Limitaciones de acción
+    'max_action': 10.0,  # Dosis máxima de insulina
+    'min_action': 0.0,  # Dosis mínima de insulina
+    'exploration_noise': 0.1,  # Ruido de exploración durante entrenamiento
+    
+    # Optimización
+    'actor_lr': 3e-4,  # Tasa de aprendizaje para actor
+    'critic_lr': 3e-4,  # Tasa de aprendizaje para crítico
+    
+    # Parámetros del buffer
+    'buffer_size': 100000,  # Tamaño del buffer de experiencia
+    
+    # Reproducibilidad
+    'seed': CONST_DEFAULT_SEED  # Semilla para generación de números aleatorios
+}

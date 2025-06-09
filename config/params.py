@@ -4,6 +4,10 @@ from typing import Dict, Union
 ## PyTorch
 ### Modelos de Aprendizaje por Refuerzo Profundo
 from models.drl.ddpg import create_ddpg_model
+from models.drl.dqn import create_dqn_model
+from models.drl.sac import create_sac_model
+from models.drl.td3_bc import create_td3_bc_model
+
 # Evaluadores
 from validation.fqe import create_fqe_evaluator
 from validation.dre import create_dre_evaluator
@@ -96,18 +100,18 @@ TRAINING_CONFIG: Dict[str, Union[int, float, str]] = {
 MODELS = {
     ## Modelos de Aprendizaje por Refuerzo Profundo
     "pt_ddpg": create_ddpg_model,
-    "pt_dqn": "",
-    "pt_sac": "",
-    "pt_td3_bc": "",
+    "pt_dqn": create_dqn_model,
+    "pt_sac": create_sac_model,
+    "pt_td3_bc": create_td3_bc_model,
 }
 
 # Modelos Pytorch a utilizar
 MODELS_USAGE: Dict[str, bool] = {
     ## Modelos de Aprendizaje por Refuerzo Profundo
     "pt_ddpg": True,
-    "pt_dqn": False,
-    "pt_sac": False,
-    "pt_td3_bc": False,
+    "pt_dqn": True,
+    "pt_sac": True,
+    "pt_td3_bc": True,
 }
 
 EVALUATE = {
