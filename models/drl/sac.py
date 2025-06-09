@@ -25,6 +25,7 @@ from constants.constants import (
     HYPER_PENALTY_BASE, SEVERE_HYPER_PENALTY, MAX_REWARD
 )
 from config.models_config import SAC_CONFIG
+from models.utils.replay_buffer import ReplayBuffer
 from training.utils import compute_reward, calculate_iob
 from validation.simulator import GlucoseSimulator
 
@@ -1017,11 +1018,6 @@ class SACModel(nn.Module):
         self.critic2_target = self.critic2_target.to(device)
         self.log_alpha = self.log_alpha.to(device)
         return self
-
-
-# Reutilizar ReplayBuffer del DDPG (asumimos que está definida en el mismo archivo)
-from models.drl.ddpg import ReplayBuffer
-
 
 def create_sac_model(cgm_input_dim: tuple, other_input_dim: tuple) -> DRLModelWrapperPyTorch:
     """

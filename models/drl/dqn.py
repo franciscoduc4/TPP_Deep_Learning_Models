@@ -27,7 +27,7 @@ from constants.constants import (
 from config.models_config import DQN_CONFIG
 from training.utils import compute_reward, calculate_iob
 from validation.simulator import GlucoseSimulator
-from models.drl.ddpg import ReplayBuffer  # Reutilizamos el buffer de experiencia
+from models.utils.replay_buffer import ReplayBuffer
 
 
 class QNetwork(nn.Module):

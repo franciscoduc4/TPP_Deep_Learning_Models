@@ -28,7 +28,7 @@ from constants.constants import (
 from config.models_config import TD3_BC_CONFIG
 from training.utils import compute_reward, calculate_iob
 from validation.simulator import GlucoseSimulator
-from models.drl.ddpg import ReplayBuffer
+from models.utils.replay_buffer import ReplayBuffer
 
 
 class TD3Actor(nn.Module):

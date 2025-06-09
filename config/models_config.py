@@ -16,6 +16,14 @@ EARLY_STOPPING_POLICY = {
     'early_stopping_best_weights': None,            # Mejores pesos del modelo
 }
 
+BUFFER_CONFIG = {
+    'buffer_size': 100000,  # Tamaño máximo del buffer de experiencia
+    'batch_size': 64,       # Tamaño del batch para entrenamiento
+    'action_dim': 1,      # Dimensión de la acción (dosis de insulina)
+    'hidden_dim': 256,     # Dimensión de las capas ocultas en la red neuronal
+    'seed': CONST_DEFAULT_SEED  # Semilla para reproducibilidad
+}
+
 ###########################################################
 ###         Deep Reinforcement Learning Models          ###
 ###########################################################
