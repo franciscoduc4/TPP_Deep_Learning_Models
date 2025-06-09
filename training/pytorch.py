@@ -13,6 +13,7 @@ from scipy.optimize import minimize
 from typing import Dict, List, Tuple, Callable, Optional, Any, Union
 from config.params import DEBUG, TRAINING_CONFIG
 from custom.early_stopping import ClinicalEarlyStopping
+from models.utils.replay_buffer import ReplayBuffer
 from training.common import (
     calculate_metrics, evaluate_clinical_metrics, optimize_ensemble_weights_clinical, get_model_type, enhance_features
 )
@@ -944,6 +945,240 @@ def debug_tensor_info(tensor: torch.Tensor, name: str) -> None:
     if torch.isinf(tensor).any():
         print_warning(f"{name} contiene valores Inf")
 
+def _process_batch_data(simulator: GlucoseSimulator, model_wrapper: DRLModelWrapperPyTorch, x_cgm: np.array, x_other: np.array, replay_buffer: ReplayBuffer, 
+                       batch_start: int, batch_end: int, device: torch.device) -> list:
+    """
+    Procesa un batch de datos para el entrenamiento de RL.
+    
+    Parámetros:
+    -----------
+    simulator : GlucoseSimulator
+        Simulador de glucosa para generar recompensas
+    model_wrapper : DRLModelWrapperPyTorch
+        Modelo a entrenar
+    x_cgm, x_other : np.ndarray
+        Datos de entrada
+    replay_buffer : ReplayBuffer
+        Buffer para almacenar experiencias
+    batch_start, batch_end : int
+        Índices de inicio y fin del batch
+    device : torch.device
+        Dispositivo para procesamiento
+        
+    Retorna:
+    --------
+    list
+        Lista de recompensas para este batch
+    """
+    # Estados y acciones en batch
+    batch_cgm = torch.FloatTensor(x_cgm[batch_start:batch_end]).to(device)
+    batch_other = torch.FloatTensor(x_other[batch_start:batch_end]).to(device)
+    
+    with torch.no_grad():
+        batch_actions = model_wrapper.model.actor(batch_cgm, batch_other).cpu().numpy()
+    
+    batch_rewards = []
+    
+    # Coleccionar experiencias en el buffer
+    for i in range(batch_start, batch_end):
+        idx = i - batch_start
+        
+        # Obtener estado y acción
+        state_cgm = batch_cgm[idx:idx+1]
+        state_other = batch_other[idx:idx+1]
+        action = batch_actions[idx]
+        
+        # Simular el siguiente nivel de glucosa
+        next_glucose = simulator.predict_glucose_trajectory(
+            initial_glucose=x_cgm[i, -1, 0],
+            insulin_doses=[action],
+            carb_intakes=[x_other[i, 0]],
+            timestamps=[0],
+            prediction_horizon=6
+        )
+        reward = compute_reward(glucose_level=next_glucose)
+        batch_rewards.append(np.mean(reward))
+        
+        # Agregar el siguiente estado
+        next_idx = i + 1
+        if next_idx < len(x_cgm):
+            next_state_cgm = torch.FloatTensor(x_cgm[next_idx:next_idx+1]).to(device)
+            next_state_other = torch.FloatTensor(x_other[next_idx:next_idx+1]).to(device)
+        else:
+            next_state_cgm = state_cgm
+            next_state_other = state_other
+        
+        done = next_idx >= len(x_cgm)
+        
+        # Agregar al ReplayBuffer
+        replay_buffer.push(
+            (state_cgm, state_other), 
+            action, 
+            reward, 
+            (next_state_cgm, next_state_other), 
+            done
+        )
+    
+    return batch_rewards
+
+
+def _run_episode(simulator: GlucoseSimulator, model_wrapper: DRLModelWrapperPyTorch, x_cgm: np.array, x_other: np.array, replay_buffer: ReplayBuffer, 
+                min_buffer_samples: int, batch_size: int, update_freq: int, processing_batch_size: int) -> tuple:
+    """
+    Ejecuta un episodio completo de entrenamiento.
+    
+    Parámetros:
+    -----------
+    simulator : GlucoseSimulator
+        Simulador de glucosa
+    model_wrapper : DRLModelWrapperPyTorch
+        Modelo a entrenar
+    x_cgm, x_other : np.ndarray
+        Datos de entrada
+    replay_buffer : ReplayBuffer
+        Buffer para almacenar experiencias
+    min_buffer_samples : int
+        Mínimo de muestras en buffer antes de actualizar
+    batch_size : int
+        Tamaño del batch para actualizar el modelo
+    update_freq : int
+        Frecuencia de actualización del modelo
+    processing_batch_size : int
+        Tamaño del batch para procesamiento
+        
+    Retorna:
+    --------
+    tuple
+        (recompensas, pérdida_actor, pérdida_crítico, número_actualizaciones)
+    """
+    device = model_wrapper.model.device
+    episode_rewards = []
+    episode_actor_loss = 0.0
+    episode_critic_loss = 0.0
+    updates_count = 0
+    
+    # Barra de progreso para batches
+    batch_bar = tqdm(
+        range(0, len(x_cgm), processing_batch_size),
+        desc="Procesando batches",
+        position=1,
+        leave=False,
+        total=len(x_cgm)//processing_batch_size + (1 if len(x_cgm) % processing_batch_size > 0 else 0)
+    )
+    
+    for batch_start in batch_bar:
+        batch_end = min(batch_start + processing_batch_size, len(x_cgm))
+        
+        # Procesar batch
+        batch_rewards = _process_batch_data(
+            simulator, model_wrapper, x_cgm, x_other, replay_buffer,
+            batch_start, batch_end, device
+        )
+        
+        # Actualizar descripción de la barra de batches
+        mean_batch_reward = np.mean(batch_rewards) if batch_rewards else 0
+        episode_rewards.extend(batch_rewards)
+        batch_bar.set_description(f"Batch {batch_start//processing_batch_size + 1}: Buffer={len(replay_buffer)}, Recompensa={mean_batch_reward:.2f}")
+        
+        # Actualizar modelo
+        if len(replay_buffer) > min_buffer_samples and (batch_start // processing_batch_size) % update_freq == 0:
+            batch = replay_buffer.sample(batch_size)
+            loss_info = model_wrapper.model.update(batch)
+            
+            # Actualizar métricas del episodio
+            episode_actor_loss += loss_info.get('actor_loss', 0)
+            episode_critic_loss += loss_info.get('critic_loss', 0)
+            updates_count += 1
+    
+    # Cerrar barra de batches
+    batch_bar.close()
+    
+    return episode_rewards, episode_actor_loss, episode_critic_loss, updates_count
+
+
+def _create_context_for_sample(x_cgm_test: np.array, x_other_test: np.array, i: int) -> dict:
+    """
+    Crea el contexto para una muestra específica.
+    
+    Parámetros:
+    -----------
+    x_cgm_test, x_other_test : np.ndarray
+        Datos de test
+    i : int
+        Índice de la muestra
+        
+    Retorna:
+    --------
+    dict
+        Contexto para la predicción
+    """
+    context = {
+        'carb_intake': float(x_other_test[i, 0]),
+        'current_glucose': float(x_cgm_test[i, -1, 0])
+    }
+    
+    # Añadir características adicionales si están disponibles
+    if x_other_test.shape[1] > 2:
+        context['sleep_quality'] = float(x_other_test[i, 2])
+    if x_other_test.shape[1] > 3:
+        context['work_intensity'] = float(x_other_test[i, 3])
+    if x_other_test.shape[1] > 4:
+        context['exercise_intensity'] = float(x_other_test[i, 4])
+    
+    # Cálculo de IOB (Insulin on Board)
+    context['iob'] = calculate_iob(x_cgm_test[i:i+1], context['carb_intake'])
+    
+    return context
+
+
+def _predict_test_samples(model_wrapper: DRLModelWrapperPyTorch, x_cgm_test: np.array, x_other_test: np.array) -> tuple:
+    """
+    Realiza predicciones en los datos de test.
+    
+    Parámetros:
+    -----------
+    model_wrapper : DRLModelWrapperPyTorch
+        Modelo entrenado
+    x_cgm_test, x_other_test : np.ndarray
+        Datos de test
+        
+    Retorna:
+    --------
+    tuple
+        (predicciones, glucosa_inicial, ingesta_carbohidratos)
+    """
+    # Extracción de las variables de contexto
+    num_samples = len(x_cgm_test)
+    initial_glucose = np.array([x_cgm_test[i, -1, 0] for i in range(num_samples)])
+    carb_intake = np.array([x_other_test[i, 0] for i in range(num_samples)])
+    
+    # Array de predicciones
+    y_pred = np.zeros(num_samples)
+    
+    # Barra de progreso para predicciones
+    pred_bar = tqdm(range(num_samples), desc="Predicciones finales", leave=True)
+    
+    # Predicciones con contexto para cada muestra
+    for i in pred_bar:
+        context = _create_context_for_sample(x_cgm_test, x_other_test, i)
+        
+        # Realizar la predicción con el contexto
+        y_pred[i] = model_wrapper.model.predict_with_context(
+            x_cgm=x_cgm_test[i:i+1],
+            x_other=x_other_test[i:i+1],
+            **context
+        )
+        
+        # Actualizar descripción cada 10 muestras
+        if i % 10 == 0:
+            pred_bar.set_description(f"Predicción {i+1}/{num_samples}: Dosis={y_pred[i]:.2f}")
+    
+    # Cerrar barra de predicciones
+    pred_bar.close()
+    
+    return y_pred, initial_glucose, carb_intake
+
+
 def train_and_evaluate_model(model_wrapper: DRLModelWrapperPyTorch,
                         model_name: str,
                         data: Dict[str, Dict[str, np.ndarray]],
@@ -970,131 +1205,40 @@ def train_and_evaluate_model(model_wrapper: DRLModelWrapperPyTorch,
     Tuple[Dict[str, List[float]], np.ndarray, Dict[str, float], DRLModelWrapperPyTorch]
         (historial de entrenamiento, predicciones, métricas clínicas, modelo entrenado)
     """
-    # Batch experience collection
+    # Inicializar simulador
     simulator = GlucoseSimulator()
     
-    # Config for efficient processing
+    # Extraer configuración
     episodes = training_config.get('episodes', 100)
     batch_size = training_config.get('batch_size', 64)
     update_freq = training_config.get('update_freq', 10) 
     processing_batch_size = training_config.get('processing_batch_size', 128)
     
-    # Pre-allocate tensors for batch processing
-    device = model_wrapper.model.device
+    # Preparar buffers y métricas
+    _device = model_wrapper.model.device
     replay_buffer = model_wrapper.model.buffer
-    
-    # Skip updates when buffer is too small
     min_buffer_samples = max(batch_size * 0.2, 10)
+    episode_metrics = {'actor_loss': 0.0, 'critic_loss': 0.0, 'rewards': [], 'buffer_size': 0}
     
-    # Track metrics for logging
-    loss_history = []
-    
-    # Métricas para seguimiento
-    episode_metrics = {
-        'actor_loss': 0.0,
-        'critic_loss': 0.0,
-        'rewards': [],
-        'buffer_size': 0
-    }
-    
-    # Barra de progreso principal para episodios
+    # Barra de progreso principal
     episode_bar = tqdm(range(episodes), desc="Episodios", position=0, leave=True)
     
+    # Entrenar por episodios
     for _episode in episode_bar:
         x_cgm, x_other = data['train']['x_cgm'], data['train']['x_other']
         
-        # Reiniciar métricas por episodio
-        episode_rewards = []
-        episode_actor_loss = 0.0
-        episode_critic_loss = 0.0
-        updates_count = 0
-        
-        # Barra de progreso para batches
-        batch_bar = tqdm(
-            range(0, len(x_cgm), processing_batch_size),
-            desc="Procesando batches",
-            position=1,
-            leave=False,
-            total=len(x_cgm)//processing_batch_size + (1 if len(x_cgm) % processing_batch_size > 0 else 0)
+        # Ejecutar un episodio completo
+        episode_rewards, episode_actor_loss, episode_critic_loss, updates_count = _run_episode(
+            simulator, model_wrapper, x_cgm, x_other, replay_buffer,
+            min_buffer_samples, batch_size, update_freq, processing_batch_size
         )
-        
-        for batch_start in batch_bar:
-            batch_end = min(batch_start + processing_batch_size, len(x_cgm))
-            
-            # Estados y acciones en batch
-            batch_cgm = torch.FloatTensor(x_cgm[batch_start:batch_end]).to(device)
-            batch_other = torch.FloatTensor(x_other[batch_start:batch_end]).to(device)
-            
-            with torch.no_grad():
-                batch_actions = model_wrapper.model.actor(batch_cgm, batch_other).cpu().numpy()
-            
-            batch_rewards = []
-            
-            # Coleccionar experiencias en el buffer
-            for i in range(batch_start, batch_end):
-                idx = i - batch_start
-                
-                # Obtener estado y acción
-                state_cgm = batch_cgm[idx:idx+1]
-                state_other = batch_other[idx:idx+1]
-                action = batch_actions[idx]
-                
-                # Simular el siguiente nivel de glucosa
-                next_glucose = simulator.predict_glucose_trajectory(
-                    initial_glucose=x_cgm[i, -1, 0],
-                    insulin_doses=[action],
-                    carb_intakes=[x_other[i, 0]],
-                    timestamps=[0],
-                    prediction_horizon=6
-                )
-                reward = compute_reward(glucose_level=next_glucose)
-                batch_rewards.append(np.mean(reward))
-                
-                # Agregar el siguiente estado
-                next_idx = i + 1
-                if next_idx < len(x_cgm):
-                    next_state_cgm = torch.FloatTensor(x_cgm[next_idx:next_idx+1]).to(device)
-                    next_state_other = torch.FloatTensor(x_other[next_idx:next_idx+1]).to(device)
-                else:
-                    next_state_cgm = state_cgm
-                    next_state_other = state_other
-                
-                done = next_idx >= len(x_cgm)
-                
-                # Agregar al ReplayBuffer
-                replay_buffer.push(
-                    (state_cgm, state_other), 
-                    action, 
-                    reward, 
-                    (next_state_cgm, next_state_other), 
-                    done
-                )
-            
-            # Actualizar descripción de la barra de batches
-            mean_batch_reward = np.mean(batch_rewards) if batch_rewards else 0
-            episode_rewards.extend(batch_rewards)
-            batch_bar.set_description(f"Batch {batch_start//processing_batch_size + 1}: Buffer={len(replay_buffer)}, Recompensa={mean_batch_reward:.2f}")
-            
-            # Actualizar modelo
-            if len(replay_buffer) > min_buffer_samples and (batch_start // processing_batch_size) % update_freq == 0:
-                batch = replay_buffer.sample(batch_size)
-                loss_info = model_wrapper.model.update(batch)
-                loss_history.append(loss_info)
-                
-                # Actualizar métricas del episodio
-                episode_actor_loss += loss_info.get('actor_loss', 0)
-                episode_critic_loss += loss_info.get('critic_loss', 0)
-                updates_count += 1
-        
-        # Cerrar barra de batches
-        batch_bar.close()
         
         # Calcular métricas promedio del episodio
         avg_episode_reward = np.mean(episode_rewards) if episode_rewards else 0
         avg_actor_loss = episode_actor_loss / max(1, updates_count)
         avg_critic_loss = episode_critic_loss / max(1, updates_count)
         
-        # Actualizar descripción de la barra de episodios
+        # Actualizar descripción y métricas
         episode_bar.set_description(
             f"Episodio {_episode+1}/{episodes}: "
             f"Recompensa={avg_episode_reward:.2f}, "
@@ -1103,70 +1247,28 @@ def train_and_evaluate_model(model_wrapper: DRLModelWrapperPyTorch,
             f"Buffer={len(replay_buffer)}"
         )
         
-        # Guardar métricas para seguimiento
+        # Guardar métricas
         episode_metrics['actor_loss'] = avg_actor_loss
         episode_metrics['critic_loss'] = avg_critic_loss
         episode_metrics['rewards'].append(avg_episode_reward)
         episode_metrics['buffer_size'] = len(replay_buffer)
     
-    # Cerrar barra de episodios al finalizar
+    # Finalizar entrenamiento
     episode_bar.close()
-    
-    # Mostrar resumen del entrenamiento
     print_info(f"\nEntrenamiento completado: {episodes} episodios, {len(replay_buffer)} experiencias en buffer")
     print_info(f"Recompensa media final: {np.mean(episode_metrics['rewards'][-10:]):.2f}")
     
-    # Evaluación final del modelo
-    x_cgm_test = data['test']['x_cgm']
-    x_other_test = data['test']['x_other']
+    # Evaluar modelo en datos de prueba
+    y_pred, initial_glucose, carb_intake = _predict_test_samples(
+        model_wrapper, data['test']['x_cgm'], data['test']['x_other']
+    )
     
-    # Extracción de las variables de contexto
-    num_samples = len(x_cgm_test)
-    initial_glucose = np.array([x_cgm_test[i, -1, 0] for i in range(num_samples)])
-    carb_intake = np.array([x_other_test[i, 0] for i in range(num_samples)])
-    
-    # Array de predicciones
-    y_pred = np.zeros(num_samples)
-    
-    # Barra de progreso para predicciones
-    pred_bar = tqdm(range(num_samples), desc="Predicciones finales", leave=True)
-    
-    # Predicciones con contexto para cada muestra
-    for i in pred_bar:
-        context = {
-            'carb_intake': float(carb_intake[i]),
-            'current_glucose': float(initial_glucose[i])
-        }
-        if x_other_test.shape[1] > 2:
-            context['sleep_quality'] = float(x_other_test[i, 2])
-        if x_other_test.shape[1] > 3:
-            context['work_intensity'] = float(x_other_test[i, 3])
-        if x_other_test.shape[1] > 4:
-            context['exercise_intensity'] = float(x_other_test[i, 4])
-        
-        # Cálculo de IOB (Insulin on Board) si es necesario
-        context['iob'] = calculate_iob(x_cgm_test[i:i+1], context['carb_intake'])
-        
-        # Realizar la predicción con el contexto
-        y_pred[i] = model_wrapper.model.predict_with_context(
-            x_cgm=x_cgm_test[i:i+1],
-            x_other=x_other_test[i:i+1],
-            **context
-        )
-        
-        # Actualizar descripción cada 10 muestras
-        if i % 10 == 0:
-            pred_bar.set_description(f"Predicción {i+1}/{num_samples}: Dosis={y_pred[i]:.2f}")
-    
-    # Cerrar barra de predicciones
-    pred_bar.close()
-    
+    # Mostrar estadísticas de predicción
     print_debug(f"Predicciones del modelo {model_name} con contexto: {y_pred}")
-    
-    # Predicciones válidas
     non_zero_predictions = np.count_nonzero(y_pred)
     print_info(f"Número de predicciones no cero: {non_zero_predictions}/{len(y_pred)} ({non_zero_predictions/len(y_pred)*100:.2f}%)")
     
+    # Calcular métricas clínicas
     clinical_metrics = evaluate_clinical_metrics(
         simulator=simulator,
         predictions=y_pred,
@@ -1174,7 +1276,7 @@ def train_and_evaluate_model(model_wrapper: DRLModelWrapperPyTorch,
         carb_intake=carb_intake
     )
     
-    # Historia de entrenamiento para retornar (incluyendo métricas de episodios)
+    # Historia de entrenamiento para retornar
     training_history = {
         'rewards': episode_metrics['rewards'],
         'actor_loss': episode_metrics['actor_loss'],
