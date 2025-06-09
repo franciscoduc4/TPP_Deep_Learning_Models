@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from typing import Tuple, Any
-from config.params import BUFFER_CONFIG
+from config.models_config import BUFFER_CONFIG
 from custom.printer import print_warning
 
 class ReplayBuffer:
