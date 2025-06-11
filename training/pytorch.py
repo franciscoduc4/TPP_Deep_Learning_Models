@@ -22,7 +22,7 @@ from training.common import (
 )
 from training.utils import calculate_iob, compute_reward
 from constants.constants import (
-    CONST_VAL_LOSS, CONST_LOSS, CONST_METRIC_MAE, CONST_METRIC_RMSE, CONST_METRIC_R2,
+    CONST_EPSILON, CONST_VAL_LOSS, CONST_LOSS, CONST_METRIC_MAE, CONST_METRIC_RMSE, CONST_METRIC_R2,
     CONST_MODELS, CONST_BEST_PREFIX, CONST_LOGS_DIR, CONST_DEFAULT_EPOCHS, 
     CONST_DEFAULT_BATCH_SIZE, CONST_DEFAULT_SEED, CONST_FIGURES_DIR, CONST_MODEL_TYPES, CONST_DURATION_HOURS, CONTEXT_FEATURE_ORDER
 )
@@ -1387,75 +1387,83 @@ def _create_context_for_sample(current_cgm_value: float,
 def _predict_test_samples(model_wrapper: Union[DLModelWrapperPyTorch, RLModelWrapperPyTorch, DRLModelWrapperPyTorch], 
                          x_cgm_test: np.ndarray, 
                          x_other_test: np.ndarray,
-                         context_test: Dict[str, np.ndarray] # Contexto de test
+                         context_test: Dict[str, np.ndarray]
                          ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Realiza predicciones en los datos de test usando el contexto.
-    
+    Realiza predicciones sobre el conjunto de prueba utilizando el modelo DRL entrenado.
+    Utiliza el contexto completo para cada predicción.
+
     Parámetros:
     -----------
-    // ... (otros parámetros) ...
+    model_wrapper : Union[DLModelWrapperPyTorch, RLModelWrapperPyTorch, DRLModelWrapperPyTorch]
+        Wrapper del modelo DRL entrenado.
+    x_cgm_test : np.ndarray
+        Datos CGM del conjunto de prueba.
     x_other_test : np.ndarray
-        Otras características generales de test.
+        Otras características del conjunto de prueba.
     context_test : Dict[str, np.ndarray]
-        Diccionario con arrays de datos contextuales de test.
-        
+        Contexto completo para el conjunto de prueba.
+
     Retorna:
     --------
-    tuple
-        (predicciones, glucosa_inicial_test, ingesta_carbohidratos_test)
+    Tuple[np.ndarray, np.ndarray, np.ndarray]
+        (Predicciones y_pred, glucosa inicial, ingesta de carbohidratos para evaluación)
     """
     num_samples = len(x_cgm_test)
-    
-    # Extraer glucosa inicial de x_cgm_test
-    initial_glucose_values = np.array([x_cgm_test[i, -1, 0] for i in range(num_samples)])
-    
-    # Extraer ingesta de carbohidratos del contexto de test
-    # Asegurarse que 'carb_intake' existe en context_test y tiene la longitud correcta
-    carb_intake_values = context_test.get('carb_intake', np.zeros(num_samples))
-    if len(carb_intake_values) != num_samples:
-        print_warning(f"Longitud de carb_intake ({len(carb_intake_values)}) no coincide con num_samples ({num_samples}). Usando ceros.")
-        carb_intake_values = np.zeros(num_samples)
-
     y_pred = np.zeros(num_samples)
-    pred_bar = tqdm(range(num_samples), desc="Predicciones finales DRL", leave=True)
     
-    for i in pred_bar:
-        current_cgm_sample_np = x_cgm_test[i:i+1]
-        current_other_sample_np = x_other_test[i:i+1]
+    initial_glucose_test = np.zeros(num_samples)
+    carb_intake_test = np.zeros(num_samples)
+    
+    pred_bar = tqdm(range(num_samples), desc="Predicciones finales DRL", unit="pred", leave=True) # leave=True para DRL
 
+    for i in pred_bar:
+        # Extraer la muestra actual como NumPy array (sin añadir una dimensión de batch)
+        # model_wrapper.predict_with_context espera una única muestra (timesteps, features)
+        current_cgm_sample_np = x_cgm_test[i] 
+        current_other_sample_np = x_other_test[i]
+        
         # Construir el diccionario de contexto para esta muestra específica
         sample_context_features = {key: val[i] for key, val in context_test.items()}
         
+        # Guardar glucosa inicial y carbohidratos para este punto de prueba
+        # La glucosa inicial es el último valor de la ventana CGM actual
+        if current_cgm_sample_np.ndim == 2 and current_cgm_sample_np.shape[0] > 0 and current_cgm_sample_np.shape[1] > 0:
+            initial_glucose_test[i] = current_cgm_sample_np[-1, 0]
+        elif current_cgm_sample_np.ndim == 1 and current_cgm_sample_np.shape[0] > 0: # Si CGM es 1D (solo una característica)
+            initial_glucose_test[i] = current_cgm_sample_np[-1]
+        else: # Fallback si la forma no es la esperada
+            initial_glucose_test[i] = sample_context_features.get('current_glucose', 0.0)
+            if initial_glucose_test[i] < CONST_EPSILON: # Uso de CONST_EPSILON para evitar problemas de precisión de punto flotante.
+                 print_warning(f"No se pudo determinar la glucosa inicial para la muestra {i} desde CGM. Usando valor de contexto o 0.0.")
+
+
+        carb_intake_test[i] = float(sample_context_features.get('carb_intake', 0.0))
+
         # Crear el contexto completo para la predicción
-        # current_cgm_value es el último valor de la ventana CGM actual
         full_context_for_prediction = _create_context_for_sample(
-            current_cgm_value=current_cgm_sample_np[0, -1, 0],
+            current_cgm_value=initial_glucose_test[i], # Usar la glucosa actual ya extraída
             sample_context_features=sample_context_features,
             cgm_history_for_iob=current_cgm_sample_np # Pasar la ventana cgm actual para IOB
         )
         
-        # Convertir a tensores para el modelo
-        current_cgm_tensor = torch.FloatTensor(current_cgm_sample_np).to(model_wrapper.model.device)
-        current_other_tensor = torch.FloatTensor(current_other_sample_np).to(model_wrapper.model.device)
-
-        # Realizar la predicción con el contexto
-        # Asumiendo que DRLModelWrapperPyTorch tiene predict_with_context
+        # Realizar la predicción con el contexto llamando al método del WRAPPER
+        # El wrapper se encarga de la conversión a tensores y de llamar al modelo subyacente.
         with torch.no_grad():
-            prediction_value = model_wrapper.model.predict_with_context(
-                x_cgm=current_cgm_tensor,
-                x_other=current_other_tensor, # Características generales
-                **full_context_for_prediction # Contexto específico como kwargs
+            prediction_value = model_wrapper.predict_with_context(
+                x_cgm=current_cgm_sample_np,         # Pasar NumPy array
+                x_other=current_other_sample_np,     # Pasar NumPy array
+                **full_context_for_prediction        # Kwargs como current_glucose, carb_intake, etc.
             )
-        y_pred[i] = prediction_value.cpu().item() # Asumiendo que devuelve un tensor escalar
+        # model_wrapper.predict_with_context devuelve un float directamente
+        y_pred[i] = prediction_value 
         
         if i % 10 == 0:
             pred_bar.set_description(f"Predicción {i+1}/{num_samples}: Dosis={y_pred[i]:.2f}")
     
     pred_bar.close()
     
-    return y_pred, initial_glucose_values, carb_intake_values
-
+    return y_pred, initial_glucose_test, carb_intake_test
 
 def train_and_evaluate_model_drl(model_wrapper: Union[DLModelWrapperPyTorch, RLModelWrapperPyTorch, DRLModelWrapperPyTorch],
                         model_name: str,

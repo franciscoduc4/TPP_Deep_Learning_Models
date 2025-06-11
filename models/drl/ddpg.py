@@ -148,11 +148,19 @@ class DDPG(nn.Module):
         torch.Tensor
             Tensor de estado concatenado y aplanado.
         """
-        cgm_flat = torch.FloatTensor(x_cgm_sample.flatten()).to(self.device)
-        other_tensor = torch.FloatTensor(x_other_sample).to(self.device)
+        # Asegurar que las entradas sean NumPy arrays
+        if not isinstance(x_cgm_sample, np.ndarray):
+            print_warning(f"_build_state_representation: x_cgm_sample no es ndarray ({type(x_cgm_sample)}). Intentando convertir.")
+            x_cgm_sample = np.array(x_cgm_sample)
+        if not isinstance(x_other_sample, np.ndarray):
+            print_warning(f"_build_state_representation: x_other_sample no es ndarray ({type(x_other_sample)}). Intentando convertir.")
+            x_other_sample = np.array(x_other_sample)
+
+        cgm_flat = torch.tensor(x_cgm_sample.flatten(), dtype=torch.float32, device=self.device)
+        other_tensor = torch.tensor(x_other_sample, dtype=torch.float32, device=self.device)
         
         context_values = [context_dict.get(k, 0.0) for k in CONTEXT_FEATURE_ORDER]
-        context_tensor = torch.FloatTensor(context_values).to(self.device)
+        context_tensor = torch.tensor(context_values, dtype=torch.float32, device=self.device)
         
         # Asegurarse que todos los tensores sean 1D antes de concatenar
         if cgm_flat.ndim == 0: cgm_flat = cgm_flat.unsqueeze(0)

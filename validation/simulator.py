@@ -164,16 +164,13 @@ class GlucoseSimulator:
         dt = 5 / 60  # Paso de tiempo de 5 minutos en horas
 
         # Efecto de la insulina administrada en este paso
-        # Usando la lógica de la fase creciente de predict_glucose_trajectory:
-        # effect_fraction = time_since_dose / 2 (donde time_since_dose = dt)
-        # insulin_effect_calc = action_insulin * self.insulin_sensitivity * effect_fraction * dt
-        insulin_effect_calc = action_insulin * self.insulin_sensitivity * (dt / 2.0) * dt
+        # Asumimos self.insulin_sensitivity * self._get_insulin_effect_fraction(t) es la tasa de cambio de glucosa por unidad de insulina en mg/dL por dt_simulation_step
+        # Para un nuevo bolo, t (tiempo desde la dosis) es pequeño, aproximado por dt/2.0 para la fracción de efecto.
+        insulin_effect_calc = action_insulin * self.insulin_sensitivity * self._get_insulin_effect_fraction(dt / 2.0)
 
         # Efecto de los carbohidratos ingeridos en este paso
-        # Usando la lógica de la fase creciente de predict_glucose_trajectory:
-        # effect_fraction = time_since_intake / 1 (donde time_since_intake = dt, pico a 1h)
-        # carb_effect_calc = carb_intake * 5 * effect_fraction * dt (5 es factor de conversión g a mg/dL)
-        carb_effect_calc = carb_intake * 5 * (dt / 1.0) * dt
+        # Asumimos 5 * self._get_carb_effect_fraction(t) es la tasa de cambio de glucosa por gramo de carbohidrato en mg/dL por dt_simulation_step
+        carb_effect_calc = carb_intake * 5 * self._get_carb_effect_fraction(dt / 2.0)
         
         # Efecto de producción de glucosa basal
         basal_effect_calc = self.basal_glucose_impact * dt
