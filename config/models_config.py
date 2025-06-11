@@ -37,6 +37,7 @@ DDPG_CONFIG = {
     "critic_lr": 1e-3,              # Tasa de aprendizaje para el crítico
     "gamma": 0.99,                  # Factor de descuento para recompensas futuras
     "tau": 0.001,                   # Parámetro de actualización suave para redes objetivo
+    "weight_decay": 1e-5,          # Decaimiento de peso para regularización
     
     # Parámetros del buffer de experiencia
     "buffer_size": 50000,          # Capacidad máxima del buffer
@@ -62,6 +63,7 @@ DQN_CONFIG = {
     'gamma': 0.99,       # Factor de descuento
     'tau': 0.005,        # Tasa de actualización suave
     'learning_rate': 3e-4,  # Tasa de aprendizaje
+    'weight_decay': 1e-5,  # Decaimiento de peso para regularización
     
     # Parámetros para exploración
     'epsilon_start': 1.0,  # Epsilon inicial para exploración
@@ -88,6 +90,7 @@ SAC_CONFIG = {
     'alpha_lr': 3e-4,  # Tasa de aprendizaje para parámetro de temperatura
     'actor_lr': 3e-4,  # Tasa de aprendizaje para actor
     'critic_lr': 3e-4,  # Tasa de aprendizaje para crítico
+    'weight_decay': 1e-5,  # Decaimiento de peso para regularización
     'initial_alpha': 0.2,  # Valor inicial de la temperatura (coef. de entropía)
     
     # Limitaciones de acción
@@ -122,6 +125,7 @@ TD3_BC_CONFIG = {
     # Optimización
     'actor_lr': 3e-4,  # Tasa de aprendizaje para actor
     'critic_lr': 3e-4,  # Tasa de aprendizaje para crítico
+    'weight_decay': 1e-5,  # Decaimiento de peso para regularización
     
     # Parámetros del buffer
     'buffer_size': 100000,  # Tamaño del buffer de experiencia

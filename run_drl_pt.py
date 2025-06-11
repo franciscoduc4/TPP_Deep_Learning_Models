@@ -12,26 +12,26 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Any
 from validation.model_validation import validate_dosing_model
 from validation.simulator import GlucoseSimulator
-from constants.constants import CONST_METRIC_MAE, CONST_METRIC_R2, CONST_METRIC_RMSE, SEVERE_HYPOGLYCEMIA_THRESHOLD, HYPOGLYCEMIA_THRESHOLD, HYPERGLYCEMIA_THRESHOLD, SEVERE_HYPERGLYCEMIA_THRESHOLD, IDEAL_UPPER_BOUND, IDEAL_LOWER_BOUND
+from constants.constants import CONST_DEFAULT_SEED, CONST_METRIC_MAE, CONST_METRIC_R2, CONST_METRIC_RMSE, SEVERE_HYPOGLYCEMIA_THRESHOLD, HYPOGLYCEMIA_THRESHOLD, HYPERGLYCEMIA_THRESHOLD, SEVERE_HYPERGLYCEMIA_THRESHOLD, IDEAL_UPPER_BOUND, IDEAL_LOWER_BOUND
 from training.pytorch import (
     train_multiple_models, calculate_metrics, evaluate_clinical_metrics, 
     optimize_ensemble_weights_clinical, enhance_features
 )
-
+from config.feature_selection import prepare_data_for_drl_training, prepare_features_for_drl, get_feature_groups, validate_contextual_data_coverage
 
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.append(PROJECT_ROOT)
 
 # Printer
-from custom.printer import cprint, coloured, print_debug, print_warning
+from custom.printer import coloured, print_debug, print_error, print_info, print_warning
 
 # Configuración 
 from config.params import FRAMEWORK, PROCESSING, MODELS, MODELS_USAGE, EVALUATE, EVALUATE_USAGE
 
 # Procesamiento
 from processing.pandas import preprocess_data as pd_preprocess, split_data as pd_split
-from processing.polars import preprocess_data as pl_preprocess, split_data as pl_split
+from processing.polars import preprocess_data as pl_preprocess
 
 # Visualización
 from visualization.plotting import visualize_model_results, plot_model_evaluation_summary
@@ -76,13 +76,13 @@ def is_model_creator(fn: Any) -> bool:
     return False
 
 # Importación dinámica de módulos de entrenamiento según el framework seleccionado
-cprint(f"Framework seleccionado: {FRAMEWORK}", 'blue', 'bold')
+coloured(f"Framework seleccionado: {FRAMEWORK}", 'blue', 'bold')
 
 if torch.cuda.is_available():
-    cprint(f"GPU available: {torch.cuda.device_count()} devices", 'green')
-    cprint(f"Using: {torch.cuda.get_device_name(0)}", 'green')
+    coloured(f"GPU available: {torch.cuda.device_count()} devices", 'green')
+    coloured(f"Using: {torch.cuda.get_device_name(0)}", 'green')
 else:
-    cprint("No GPUs detected, using CPU", 'yellow')
+    coloured("No GPUs detected, using CPU", 'yellow')
 
 # Constante para mensaje repetido
 CONST_MODEL_ACTIVATED = "Modelo {} activado."
@@ -96,45 +96,45 @@ for model_name, use in MODELS_USAGE.items():
         if is_model_creator(model_fn):
             model_fn = model_fn()
         use_models[model_name] = model_fn
-        cprint(CONST_MODEL_ACTIVATED.format(model_name), 'green', 'bold')
+        coloured(CONST_MODEL_ACTIVATED.format(model_name), 'green', 'bold')
     else:
-        cprint(CONST_MODEL_DEACTIVATED.format(model_name), 'red', 'bold')
+        coloured(CONST_MODEL_DEACTIVATED.format(model_name), 'red', 'bold')
 
 # Validaciones Previas
 if PROCESSING not in ["pandas", "polars"]:
-    cprint(f"Error: El procesamiento debe ser 'pandas' o 'polars'. Se recibió '{PROCESSING}'", 'red', 'bold')
+    coloured(f"Error: El procesamiento debe ser 'pandas' o 'polars'. Se recibió '{PROCESSING}'", 'red', 'bold')
     sys.exit(1)
 if not use_models:
-    cprint("Error: No se ha activado ningún modelo. Por favor, activa al menos un modelo en 'MODELS_USAGE'.", 'red', 'bold')
+    coloured("Error: No se ha activado ningún modelo. Por favor, activa al menos un modelo en 'MODELS_USAGE'.", 'red', 'bold')
     sys.exit(1)
 if MODELS_USAGE.values() == [False] * len(use_models):
-    cprint("Error: Todos los modelos están desactivados. Por favor, activa al menos un modelo en 'MODELS_USAGE'.", 'red', 'bold')
+    coloured("Error: Todos los modelos están desactivados. Por favor, activa al menos un modelo en 'MODELS_USAGE'.", 'red', 'bold')
     sys.exit(1)
 if len(use_models) == 0:
-    cprint("Error: No se ha activado ningún modelo. Por favor, activa al menos un modelo en 'MODELS_USAGE'.", 'red', 'bold')
+    coloured("Error: No se ha activado ningún modelo. Por favor, activa al menos un modelo en 'MODELS_USAGE'.", 'red', 'bold')
     sys.exit(1)
 
 # Rutas de datos y figuras
 SUBJECTS_PATH = os.path.join(PROJECT_ROOT, "data", "subjects")
-cprint(f"Ruta de sujetos: {SUBJECTS_PATH}", 'yellow', 'bold')
+coloured(f"Ruta de sujetos: {SUBJECTS_PATH}", 'yellow', 'bold')
 
 # Crear directorio para modelos según el framework
 MODELS_SAVE_DIR = os.path.join(PROJECT_ROOT, CONST_RESULTS_DIR, CONST_MODELS_DIR, FRAMEWORK)
 os.makedirs(MODELS_SAVE_DIR, exist_ok=True)
-cprint(f"Ruta para guardar modelos: {MODELS_SAVE_DIR}", 'yellow', 'bold')
+coloured(f"Ruta para guardar modelos: {MODELS_SAVE_DIR}", 'yellow', 'bold')
 
 # Crear directorio para resultados según el framework
 RESULTS_SAVE_DIR = os.path.join(PROJECT_ROOT, CONST_RESULTS_DIR, FRAMEWORK)
 os.makedirs(RESULTS_SAVE_DIR, exist_ok=True)
-cprint(f"Ruta para guardar resultados: {RESULTS_SAVE_DIR}", 'yellow', 'bold')
+coloured(f"Ruta para guardar resultados: {RESULTS_SAVE_DIR}", 'yellow', 'bold')
 
 # Crear directorios para figuras
 FIGURES_DIR = os.path.join(PROJECT_ROOT, "figures", "various_models", FRAMEWORK)
 os.makedirs(FIGURES_DIR, exist_ok=True)
-cprint(f"Ruta de figuras: {FIGURES_DIR}", 'yellow', 'bold')
+coloured(f"Ruta de figuras: {FIGURES_DIR}", 'yellow', 'bold')
 
 subject_files = [f for f in os.listdir(SUBJECTS_PATH) if f.startswith("Subject") and f.endswith(".xlsx")]
-cprint(f"Total sujetos: {len(subject_files)}", 'yellow', 'bold')
+coloured(f"Total sujetos: {len(subject_files)}", 'yellow', 'bold')
 
 # Procesamiento de datos
 (x_cgm_train, x_cgm_val, x_cgm_test, x_other_train, x_other_val, x_other_test, 
@@ -144,7 +144,7 @@ cprint(f"Total sujetos: {len(subject_files)}", 'yellow', 'bold')
                                                         None, None, None, None)
 
 if PROCESSING == "pandas":
-    cprint("Procesando datos con pandas...", 'blue', 'bold')
+    coloured("Procesando datos con pandas...", 'blue', 'bold')
     df_pd: pd.DataFrame = pd_preprocess()
     # No usamos pd_split, trabajamos con todo el dataset
     
@@ -153,162 +153,91 @@ if PROCESSING == "pandas":
     x_other = df_pd.drop(['cgm_window', 'bolus'], axis=1).to_numpy()
     y = df_pd['bolus'].to_numpy()
     
-    # Normalizar datos si es necesario
-    scaler_cgm = StandardScaler().fit(x_cgm.reshape(x_cgm.shape[0], -1))
-    scaler_other = StandardScaler().fit(x_other)
-    scaler_y = StandardScaler().fit(y.reshape(-1, 1))
+    # # Normalizar datos si es necesario
+    # scaler_cgm = StandardScaler().fit(x_cgm.reshape(x_cgm.shape[0], -1))
+    # scaler_other = StandardScaler().fit(x_other)
+    # scaler_y = StandardScaler().fit(y.reshape(-1, 1))
     
-    x_cgm = scaler_cgm.transform(x_cgm.reshape(x_cgm.shape[0], -1)).reshape(x_cgm.shape)
-    x_other = scaler_other.transform(x_other)
+    # x_cgm = scaler_cgm.transform(x_cgm.reshape(x_cgm.shape[0], -1)).reshape(x_cgm.shape)
+    # x_other = scaler_other.transform(x_other)
     y = y.reshape(-1, 1).flatten()
 elif PROCESSING == "polars":
-    cprint("Procesando datos con polars...", 'blue', 'bold')
+    coloured("Procesando datos con polars...", 'blue', 'bold')
     df_pl: pl.DataFrame = pl_preprocess()
     
-    print(df_pl.head())
-    print(df_pl.columns)
-    # Métricas de los pacientes antes del entrenamiento
-    tir_average = df_pl["time_in_range_24h"].mean()
-    hypo_average = df_pl["hypo_percentage_24h"].mean()
-    hyper_average = df_pl["hyper_percentage_24h"].mean()
+    # Validar cobertura de datos contextuales
+    coloured("\n==== VALIDACIÓN DE DATOS CONTEXTUALES ====", 'cyan', 'bold')
+    contextual_coverage = validate_contextual_data_coverage(df_pl)
+    # Preparar datos con división temporal apropiada
+    coloured("\n==== PREPARACIÓN DE DATOS PARA DRL ====", 'cyan', 'bold')
+    # Se asume que prepare_data_for_drl_training ahora retorna también los diccionarios de contexto
+    (x_cgm_train, x_other_train, y_train, context_train,
+     x_cgm_val, x_other_val, y_val, context_val,
+     x_cgm_test, x_other_test, y_test, context_test) = prepare_data_for_drl_training(df_pl)
+    
+    # Mostrar información sobre características seleccionadas
+    feature_groups = get_feature_groups()
 
-    print_debug(f"Average Time in Range: {tir_average:.2f}%")
-    print_debug(f"Average Time in Hypoglycemia: {hypo_average:.2f}%")
-    print_debug(f"Average Time in Hyperglycemia: {hyper_average:.2f}%")
-
-    # Métricas por paciente antes del entrenamiento
-    metrics_by_patient = (
-        df_pl.group_by("SubjectID")
-        .agg([
-            pl.mean("time_in_range_24h").alias("avg_time_in_range"),
-            pl.mean("hypo_percentage_24h").alias("avg_time_hypo"),
-            pl.mean("hyper_percentage_24h").alias("avg_time_hyper")
-        ])
-    )
-
-    print(metrics_by_patient)
-    
-    # Verificar si existen columnas CGM secuenciales
-    cgm_cols = [col for col in df_pl.columns if col.startswith('cgm_') and col[4:].isdigit()]
-    cgm_cols.sort(key=lambda x: int(x.split('_')[1]))  # Ordenar numéricamente
-    
-    if not cgm_cols:
-        cprint("Advertencia: No se encontraron columnas CGM secuenciales (cgm_0, cgm_1, etc.)", 'yellow', 'bold')
-        cprint("Generando datos CGM a partir de columnas de glucosa disponibles...", 'blue')
-        
-        # Utilizar columnas de glucosa disponibles para crear datos de CGM
-        glucose_cols = [col for col in df_pl.columns if 'glucose' in col.lower() and df_pl[col].dtype in 
-                       [pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.Int16, pl.Int8]]
-        
-        if not glucose_cols:
-            cprint("Error: No se encontraron columnas de glucosa utilizables", 'red', 'bold')
-            sys.exit(1)
-            
-        cprint(f"Usando columnas de glucosa: {', '.join(glucose_cols)}", 'blue')
-        
-        # Crear un array de CGM sintético a partir de las columnas de glucosa disponibles
-        glucose_values = df_pl.select(glucose_cols).to_numpy()
-        # Asegurar que tenemos al menos 12 puntos (replicando si es necesario)
-        if glucose_values.shape[1] < 12:
-            repeats = int(np.ceil(12 / glucose_values.shape[1]))
-            glucose_values = np.tile(glucose_values, (1, repeats))
-            glucose_values = glucose_values[:, :12]  # Limitar a 12 puntos
-            
-        # Reshape para obtener la forma [muestras, pasos_tiempo, 1]
-        x_cgm = glucose_values.reshape(glucose_values.shape[0], glucose_values.shape[1], 1)
-    else:
-        # Proceder con columnas CGM secuenciales como antes
-        cprint(f"Usando {len(cgm_cols)} columnas CGM secuenciales", 'blue')
-        cgm_values = df_pl.select(cgm_cols).to_numpy()
-        x_cgm = cgm_values.reshape(cgm_values.shape[0], len(cgm_cols), 1)
-    
-    # Extraer columnas para features adicionales, SOLO NUMÉRICAS
-    exclude_cols = cgm_cols + ['bolus']
-    
-    # Identificar columnas de fecha/hora y strings para excluir
-    datetime_cols = [col for col in df_pl.columns if df_pl[col].dtype == pl.Datetime]
-    string_cols = [col for col in df_pl.columns if df_pl[col].dtype == pl.Utf8]
-    
-    # Agregar todas las columnas no numéricas a la lista de exclusión
-    exclude_cols += datetime_cols + string_cols
-    
-    # Seleccionar solo columnas numéricas para features
-    feature_cols = [col for col in df_pl.columns 
-                   if col not in exclude_cols 
-                   and col != 'bolus' 
-                   and df_pl[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.Int16, pl.Int8]]
-    
-    # Verificar que tenemos columnas para usar
-    if not feature_cols:
-        cprint("Error: No se encontraron columnas numéricas para features", 'red', 'bold')
-        sys.exit(1)
-    
-    cprint(f"Usando {len(feature_cols)} columnas numéricas como features", 'blue')
-    
-    x_other = df_pl.select(feature_cols).to_numpy()
-    y = df_pl['bolus'].to_numpy()
-    
-    # Normalizar datos
-    scaler_cgm = StandardScaler().fit(x_cgm.reshape(x_cgm.shape[0], -1))
-    scaler_other = StandardScaler().fit(x_other)
-    scaler_y = StandardScaler().fit(y.reshape(-1, 1))
-    
-    x_cgm = scaler_cgm.transform(x_cgm.reshape(x_cgm.shape[0], -1)).reshape(x_cgm.shape)
-    x_other = scaler_other.transform(x_other)
-    y = y.reshape(-1, 1).flatten()
-
-# Mostrar información sobre los datos
-cprint("\n==== INFORMACIÓN DE DATOS ====", 'cyan', 'bold')
-print(f"x_cgm: {x_cgm.shape}")
-print(f"x_other: {x_other.shape}")
-print(f"y: {y.shape}")
-
-# Crear conjuntos de validación (10% de los datos)
-# Esto mantiene algo de validación para monitoreo del entrenamiento
-val_size = int(0.1 * len(y))
-indices = np.random.permutation(len(y))
-val_indices = indices[:val_size]
-train_indices = indices[val_size:]
-
-x_cgm_train, x_cgm_val = x_cgm[train_indices], x_cgm[val_indices]
-x_other_train, x_other_val = x_other[train_indices], x_other[val_indices]
-y_train, y_val = y[train_indices], y[val_indices]
-
-# Para test, usamos también datos de validación (temporalmente)
-x_cgm_test, x_other_test, y_test = x_cgm_val, x_other_val, y_val
-
+# Mostrar información sobre los datos preparados
+coloured("\n==== INFORMACIÓN DE DATOS PREPARADOS ====", 'cyan', 'bold')
+coloured(f"Entrenamiento - CGM: {x_cgm_train.shape}, Otros: {x_other_train.shape}, Target: {y_train.shape}", 'green')
+coloured(f"Validación    - CGM: {x_cgm_val.shape}, Otros: {x_other_val.shape}, Target: {y_val.shape}", 'green')
+coloured(f"Test          - CGM: {x_cgm_test.shape}, Otros: {x_other_test.shape}, Target: {y_test.shape}", 'green')
+if context_train is not None:
+    coloured(f"Contexto Train - Claves: {list(context_train.keys())}, Muestra forma: {context_train[list(context_train.keys())[0]].shape if context_train else 'N/A'}", 'green')
+if context_val is not None:
+    coloured(f"Contexto Val   - Claves: {list(context_val.keys())}, Muestra forma: {context_val[list(context_val.keys())[0]].shape if context_val else 'N/A'}", 'green')
+if context_test is not None:
+    coloured(f"Contexto Test  - Claves: {list(context_test.keys())}, Muestra forma: {context_test[list(context_test.keys())[0]].shape if context_test else 'N/A'}", 'green')
 # Mejorar características utilizando la función del framework seleccionado
-cprint("\n==== GENERACIÓN DE CARACTERÍSTICAS ADICIONALES ====", 'cyan', 'bold')
+coloured("\n==== GENERACIÓN DE CARACTERÍSTICAS ADICIONALES ====", 'cyan', 'bold')
 x_cgm_train_enhanced, x_other_train_enhanced = enhance_features(x_cgm_train, x_other_train)
 x_cgm_val_enhanced, x_other_val_enhanced = enhance_features(x_cgm_val, x_other_val)
 x_cgm_test_enhanced, x_other_test_enhanced = enhance_features(x_cgm_test, x_other_test)
 
-cprint(f"Forma de datos mejorados - CGM: {x_cgm_train_enhanced.shape}, Otros: {x_other_train_enhanced.shape}", 'green')
+coloured("Forma de datos mejorados:", 'green')
+coloured(f"  Train - CGM: {x_cgm_train_enhanced.shape}, Otros: {x_other_train_enhanced.shape}", 'green')
+coloured(f"  Val   - CGM: {x_cgm_val_enhanced.shape}, Otros: {x_other_val_enhanced.shape}", 'green')
+coloured(f"  Test  - CGM: {x_cgm_test_enhanced.shape}, Otros: {x_other_test_enhanced.shape}", 'green')
 
 # Definir formas de entrada para los modelos
 input_shapes = (x_cgm_train_enhanced.shape[1:], x_other_train_enhanced.shape[1:])
-cprint(f"Formas de entrada para los modelos: CGM {input_shapes[0]}, Otros {input_shapes[1]}", 'green')
+coloured(f"Formas de entrada para los modelos: CGM {input_shapes[0]}, Otros {input_shapes[1]}", 'green')
+
+# Estructurar all_data para pasar a train_multiple_models
+all_data = {
+    'train': {
+        'x_cgm': x_cgm_train_enhanced,
+        'x_other': x_other_train_enhanced,
+        'y': y_train,
+        'context': context_train
+    },
+    'val': {
+        'x_cgm': x_cgm_val_enhanced,
+        'x_other': x_other_val_enhanced,
+        'y': y_val,
+        'context': context_val
+    },
+    'test': {
+        'x_cgm': x_cgm_test_enhanced,
+        'x_other': x_other_test_enhanced,
+        'y': y_test,
+        'context': context_test
+    }
+}
 
 # Entrenamiento de modelos
-cprint("\n==== ENTRENAMIENTO DE MODELOS ====", 'cyan', 'bold')
+coloured("\n==== ENTRENAMIENTO DE MODELOS ====", 'cyan', 'bold')
 
 histories, predictions, clinical_metrics, trained_models = train_multiple_models(
     model_creators=use_models,
     input_shapes=input_shapes,
-    x_cgm_train=x_cgm_train_enhanced,
-    x_other_train=x_other_train_enhanced,
-    y_train=y_train,
-    x_cgm_val=x_cgm_val_enhanced,
-    x_other_val=x_other_val_enhanced,
-    y_val=y_val,
-    x_cgm_test=x_cgm_test_enhanced,
-    x_other_test=x_other_test_enhanced,
-    y_test=y_test,
+    all_data=all_data,
     models_dir=MODELS_SAVE_DIR
 )
 
 # Creación del Ensamble
-cprint("\n==== CREACIÓN DEL ENSAMBLE ====", 'cyan', 'bold')
+coloured("\n==== CREACIÓN DEL ENSAMBLE ====", 'cyan', 'bold')
 ensemble_prediction = None
 ensemble_metrics = None
 clinical_results = {}
@@ -320,22 +249,27 @@ simulator = GlucoseSimulator()
 initial_glucose = np.array([x_cgm_test_enhanced[i, -1, 0] for i in range(len(x_cgm_test_enhanced))])
 
 # Manera más robusta de identificar la columna de carbohidratos
-carb_intake_idx = 0  # Valor por defecto en caso de no encontrarla
-
-# Si x_other_test es un DataFrame con columnas nombradas
-if hasattr(x_other_test, 'columns'):
-    columns = x_other_test.columns
-    carb_columns = [i for i, col in enumerate(columns) if 'carb' in str(col).lower()]
-    if carb_columns:
-        carb_intake_idx = carb_columns[0]
-# Si no tiene columnas nombradas, asumimos que es la primera columna de x_other_test_enhanced
+# Ahora se extrae del diccionario de contexto del conjunto de prueba
+carb_intake_key = 'meal_carbs' # o 'carb_intake' si se renombra en prepare_drl_data
+if context_test and carb_intake_key in context_test:
+    carb_intake = context_test[carb_intake_key]
+    if carb_intake.ndim > 1 and carb_intake.shape[1] == 1: # Asegurar que sea 1D
+        carb_intake = carb_intake.flatten()
 elif x_other_test_enhanced.shape[1] > 0:
-    # Usamos la primera columna como fallback
-    carb_intake_idx = 0
-    print_warning("No se encontraron nombres de columnas. Asumiendo que los carbohidratos están en la primera columna.")
-
-carb_intake = np.array([x_other_test_enhanced[i, carb_intake_idx] for i in range(len(x_other_test_enhanced))])
-
+    # Fallback si no está en el contexto, intentar buscar en x_other_test_enhanced
+    # Esto requeriría conocer el índice o nombre de la columna de carbohidratos en x_other_test_enhanced
+    print_warning(f"'{carb_intake_key}' no encontrado en context_test. Intentando fallback (puede ser incorrecto).")
+    # Asumir un índice (esto es frágil, idealmente carb_intake siempre vendrá de context_test)
+    # Por ejemplo, si 'meal_carbs_log1p' fuera la primera columna de x_other_test_enhanced:
+    # carb_intake_idx = 0 # Esto es un placeholder, debe ajustarse si se usa este fallback
+    # carb_intake = np.array([x_other_test_enhanced[i, carb_intake_idx] for i in range(len(x_other_test_enhanced))])
+    # Es mejor asegurar que context_test contenga la ingesta de carbohidratos.
+    # Por ahora, si no está en el contexto, se podría generar un error o un valor por defecto.
+    print_error("No se pudo determinar la ingesta de carbohidratos para la evaluación clínica. Usando valores por defecto (0).")
+    carb_intake = np.zeros(len(x_cgm_test_enhanced))
+else:
+    print_error("No se pudo determinar la ingesta de carbohidratos para la evaluación clínica. Usando valores por defecto (0).")
+    carb_intake = np.zeros(len(x_cgm_test_enhanced))
 # Evaluar métricas clínicas para cada modelo
 for model_name, model_pred in predictions.items():
     clinical_metrics = evaluate_clinical_metrics(
@@ -346,12 +280,12 @@ for model_name, model_pred in predictions.items():
     )
     clinical_results[model_name] = clinical_metrics
     
-    cprint(f"\nMétricas clínicas para {model_name}:", 'green', 'bold')
-    cprint(f"  Tiempo Severamente Bajo Rango: {clinical_metrics['time_severe_below']:.2f}%", 'red')
-    cprint(f"  Tiempo Bajo Rango: {clinical_metrics['time_below_range']:.2f}%", 'yellow')
-    cprint(f"  Tiempo en Rango: {clinical_metrics['time_in_range']:.2f}%", 'green')
-    cprint(f"  Tiempo Sobre Rango: {clinical_metrics['time_above_range']:.2f}%", 'yellow')
-    cprint(f"  Tiempo Severamente Sobre Rango: {clinical_metrics['time_severe_above']:.2f}%", 'red')
+    coloured(f"\nMétricas clínicas para {model_name}:", 'green', 'bold')
+    coloured(f"  Tiempo Severamente Bajo Rango: {clinical_metrics['time_severe_below']:.2f}%", 'red')
+    coloured(f"  Tiempo Bajo Rango: {clinical_metrics['time_below_range']:.2f}%", 'yellow')
+    coloured(f"  Tiempo en Rango: {clinical_metrics['time_in_range']:.2f}%", 'green')
+    coloured(f"  Tiempo Sobre Rango: {clinical_metrics['time_above_range']:.2f}%", 'yellow')
+    coloured(f"  Tiempo Severamente Sobre Rango: {clinical_metrics['time_severe_above']:.2f}%", 'red')
     
     # Guardar métricas clínicas
     with open(os.path.join(RESULTS_SAVE_DIR, f"{model_name}_clinical_metrics.json"), 'w') as f:
@@ -359,7 +293,7 @@ for model_name, model_pred in predictions.items():
 
 # Crear ensamble si hay más de un modelo
 if len(predictions) > 1:
-    cprint("\nCreando ensamble optimizado para métricas clínicas...", 'blue', 'bold')
+    coloured("\nCreando ensamble optimizado para métricas clínicas...", 'blue', 'bold')
     
     # Optimizar pesos para tiempo en rango
     weights, ensemble_prediction = optimize_ensemble_weights_clinical(
@@ -380,14 +314,14 @@ if len(predictions) > 1:
     )
     
     # Mostrar pesos y métricas del ensamble
-    cprint("\nPesos del ensamble:", 'green', 'bold')
+    coloured("\nPesos del ensamble:", 'green', 'bold')
     for i, (model_name, weight) in enumerate(zip(predictions.keys(), weights)):
-        cprint(f"  {model_name}: {weight:.4f}", 'green')
+        coloured(f"  {model_name}: {weight:.4f}", 'green')
     
-    cprint("\nMétricas clínicas del ensamble:", 'green', 'bold')
-    cprint(f"  Tiempo en Rango: {ensemble_clinical['time_in_range']:.2f}%", 'green')
-    cprint(f"  Tiempo Bajo Rango: {ensemble_clinical['time_below_range']:.2f}%", 'yellow')
-    cprint(f"  Tiempo Sobre Rango: {ensemble_clinical['time_above_range']:.2f}%", 'yellow')
+    coloured("\nMétricas clínicas del ensamble:", 'green', 'bold')
+    coloured(f"  Tiempo en Rango: {ensemble_clinical['time_in_range']:.2f}%", 'green')
+    coloured(f"  Tiempo Bajo Rango: {ensemble_clinical['time_below_range']:.2f}%", 'yellow')
+    coloured(f"  Tiempo Sobre Rango: {ensemble_clinical['time_above_range']:.2f}%", 'yellow')
     
     # Guardar predicciones y métricas del ensamble
     clinical_results[CONST_ENSEMBLE] = ensemble_clinical
@@ -395,10 +329,10 @@ if len(predictions) > 1:
     with open(os.path.join(RESULTS_SAVE_DIR, f"{CONST_ENSEMBLE}_metrics.json"), 'w') as f:
         json.dump({**ensemble_metrics, **ensemble_clinical}, f, indent=2)
 else:
-    cprint("No se puede crear ensamble con menos de 2 modelos", 'yellow', 'bold')
+    coloured("No se puede crear ensamble con menos de 2 modelos", 'yellow', 'bold')
     
 # Evaluación con FQE y Doubly Robust
-cprint("\n==== EVALUACIÓN OFFLINE RL ====", 'cyan', 'bold')
+coloured("\n==== EVALUACIÓN OFFLINE RL ====", 'cyan', 'bold')
 
 # Seleccionar evaluadores activados
 active_evaluators = {}
@@ -408,9 +342,9 @@ for eval_name, use in EVALUATE_USAGE.items():
         if is_model_creator(evaluator_fn):
             evaluator_fn = evaluator_fn()
         active_evaluators[eval_name] = evaluator_fn
-        cprint(f"Evaluador {eval_name} activado", 'green', 'bold')
+        coloured(f"Evaluador {eval_name} activado", 'green', 'bold')
     else:
-        cprint(f"Evaluador {eval_name} desactivado", 'red', 'bold')
+        coloured(f"Evaluador {eval_name} desactivado", 'red', 'bold')
 
 # Realizar evaluación si hay evaluadores activos
 if active_evaluators:
@@ -418,11 +352,11 @@ if active_evaluators:
     
     # Evaluar cada modelo con cada evaluador activo
     for model_name, model in trained_models.items():
-        cprint(f"\nEvaluando modelo {model_name}...", 'blue')
+        coloured(f"\nEvaluando modelo {model_name}...", 'blue')
         model_results = {}
         
         for eval_name, evaluator_creator in active_evaluators.items():
-            cprint(f"  Aplicando evaluador {eval_name}...", 'blue')
+            coloured(f"  Aplicando evaluador {eval_name}...", 'blue')
             eval_instance = evaluator_creator(input_shapes[0], input_shapes[1])
             
             # Entrenar evaluador con los datos de entrenamiento
@@ -447,9 +381,9 @@ if active_evaluators:
             model_results[eval_name] = eval_metrics
             
             # Mostrar métricas principales
-            cprint(f"    Valor Estimado: {eval_metrics.get('estimated_value', 0):.4f}", 'green')
-            cprint(f"    Límite Inferior de Confianza: {eval_metrics.get('confidence_lower', 0):.4f}", 'yellow')
-            cprint(f"    Límite Superior de Confianza: {eval_metrics.get('confidence_upper', 0):.4f}", 'yellow')
+            coloured(f"    Valor Estimado: {eval_metrics.get('estimated_value', 0):.4f}", 'green')
+            coloured(f"    Límite Inferior de Confianza: {eval_metrics.get('confidence_lower', 0):.4f}", 'yellow')
+            coloured(f"    Límite Superior de Confianza: {eval_metrics.get('confidence_upper', 0):.4f}", 'yellow')
         
         offline_results[model_name] = model_results
         
@@ -459,7 +393,7 @@ if active_evaluators:
     
     # Evaluar ensamble si existe
     if ensemble_prediction is not None:
-        cprint("\nEvaluando ensamble...", 'blue')
+        coloured("\nEvaluando ensamble...", 'blue')
         ensemble_offline_results = {}
         
         # Crear un wrapper temporal para el ensamble
@@ -490,10 +424,10 @@ if active_evaluators:
         with open(os.path.join(RESULTS_SAVE_DIR, f"{CONST_ENSEMBLE}_offline_eval.json"), 'w') as f:
             json.dump(ensemble_offline_results, f, indent=2)
 else:
-    cprint("No hay evaluadores offline activos", 'yellow', 'bold')
+    coloured("No hay evaluadores offline activos", 'yellow', 'bold')
 
 # Visualización de resultados
-cprint("\n==== VISUALIZACIÓN DE RESULTADOS ====", 'cyan', 'bold')
+coloured("\n==== VISUALIZACIÓN DE RESULTADOS ====", 'cyan', 'bold')
 
 # 1. Visualizar historial de entrenamiento para cada modelo
 for model_name, history in histories.items():
@@ -634,11 +568,11 @@ if 'offline_results' in locals() and offline_results:
         plt.close()
 
 # Generación de Reporte
-cprint("\n==== GENERACIÓN DE REPORTE ====", 'cyan', 'bold')
+coloured("\n==== GENERACIÓN DE REPORTE ====", 'cyan', 'bold')
 
 
 # Finalización del proceso
 
-cprint("\n==== PROCESO COMPLETADO ====", 'cyan', 'bold')
-cprint(f"Resultados guardados en: {RESULTS_SAVE_DIR}", 'green')
-cprint(f"Visualizaciones guardadas en: {FIGURES_DIR}", 'green')
+coloured("\n==== PROCESO COMPLETADO ====", 'cyan', 'bold')
+coloured(f"Resultados guardados en: {RESULTS_SAVE_DIR}", 'green')
+coloured(f"Visualizaciones guardadas en: {FIGURES_DIR}", 'green')

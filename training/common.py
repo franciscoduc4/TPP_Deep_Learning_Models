@@ -241,6 +241,38 @@ def optimize_ensemble_weights_clinical(predictions: Dict[str, np.ndarray],
     
     return optimized_weights, ensemble_pred
 
+def _apply_cgm_padding(cgm_diff: np.ndarray, x_cgm: np.ndarray) -> Optional[np.ndarray]:
+    """Aplica padding a las diferencias CGM según dimensionalidad."""
+    if cgm_diff.ndim == 3:
+        return np.pad(cgm_diff, ((0, 0), (1, 0), (0, 0)), mode='constant', constant_values=0)
+    elif cgm_diff.ndim == 2:
+        padded = np.pad(cgm_diff, ((0, 0), (1, 0)), mode='constant', constant_values=0)
+        if x_cgm.ndim == 3 and x_cgm.shape[2] == 1 and padded.ndim == 2:
+            padded = padded[:, :, np.newaxis]
+        return padded
+    else:
+        print_warning(f"Forma inesperada de cgm_diff: {cgm_diff.shape}. No se aplicará padding de diferencias.")
+        return None
+
+def _validate_and_fix_shape(cgm_diff_padded: np.ndarray, x_cgm: np.ndarray) -> Optional[np.ndarray]:
+    """Valida y corrige la forma del array de diferencias CGM."""
+    if cgm_diff_padded.shape == x_cgm.shape:
+        return cgm_diff_padded
+    
+    print_warning(f"Discrepancia de formas después del padding: Original {x_cgm.shape}, Diff Padded {cgm_diff_padded.shape}. Se intentará ajustar o se devolverá original.")
+    
+    if (cgm_diff_padded.ndim == x_cgm.ndim and 
+        cgm_diff_padded.shape[0] == x_cgm.shape[0] and 
+        cgm_diff_padded.shape[1] == x_cgm.shape[1]):
+        try:
+            return cgm_diff_padded.reshape(x_cgm.shape)
+        except ValueError:
+            print_error("No se pudo ajustar la forma de cgm_diff_padded. Devolviendo características CGM originales.")
+            return None
+    else:
+        print_error("No se pudo ajustar la forma de cgm_diff_padded debido a dimensiones incompatibles. Devolviendo características CGM originales.")
+        return None
+
 def enhance_features(x_cgm: np.ndarray, x_other: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Mejora las características de entrada añadiendo derivadas y estadísticas.
@@ -257,34 +289,31 @@ def enhance_features(x_cgm: np.ndarray, x_other: np.ndarray) -> Tuple[np.ndarray
     Tuple[np.ndarray, np.ndarray]
         Tupla con (cgm_features_mejoradas, other_features_mejoradas)
     """
+    if x_cgm.shape[1] <= 1:
+        print_warning("No hay suficientes pasos de tiempo en x_cgm para calcular diferencias. Retornando características originales.")
+        return x_cgm, x_other
+
     # Calcular diferencia entre puntos de tiempo consecutivos (derivada)
     cgm_diff = np.diff(x_cgm, axis=1)
     
-    # Verificar la forma de cgm_diff antes de aplicar padding
-    print(f"Forma de cgm_diff: {cgm_diff.shape}")
-    
     # Aplicar padding según la dimensionalidad real
-    if cgm_diff.ndim == 3:
-        cgm_diff = np.pad(cgm_diff, ((0, 0), (1, 0), (0, 0)), mode='edge')
-    else:
-        cgm_diff = np.pad(cgm_diff, ((0, 0), (1, 0)), mode='edge')
-    
-    # Añadir estadísticas móviles
-    window = 5
-    rolling_mean = np.apply_along_axis(
-        lambda x: np.convolve(x, np.ones(window)/window, mode='same'),
-        1, x_cgm.squeeze()
-    )
-    
-    # Concatenar características mejoradas
-    x_cgm_enhanced = np.concatenate([
-        x_cgm,
-        cgm_diff,
-        rolling_mean[..., np.newaxis]
-    ], axis=-1)
-    
-    return x_cgm_enhanced, x_other
+    cgm_diff_padded = _apply_cgm_padding(cgm_diff, x_cgm)
+    if cgm_diff_padded is None:
+        return x_cgm, x_other
 
+    # Validar y corregir forma si es necesario
+    cgm_diff_padded = _validate_and_fix_shape(cgm_diff_padded, x_cgm)
+    if cgm_diff_padded is None:
+        return x_cgm, x_other
+
+    # Concatenar características originales con la derivada
+    try:
+        cgm_enhanced = np.concatenate((x_cgm, cgm_diff_padded), axis=2)
+    except ValueError as e:
+        print_error(f"Error al concatenar características CGM: {e}. Formas: x_cgm={x_cgm.shape}, cgm_diff_padded={cgm_diff_padded.shape}. Devolviendo originales.")
+        return x_cgm, x_other
+
+    return cgm_enhanced, x_other
 
 def get_model_type(model_name: str) -> str:
     """

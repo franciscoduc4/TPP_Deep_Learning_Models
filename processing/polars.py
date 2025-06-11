@@ -12,11 +12,10 @@ from datetime import timedelta, datetime
 from tqdm import tqdm
 import matplotlib
 
-from custom.printer import print_debug, print_info
+from custom.printer import print_debug, print_error, print_info, print_warning
 matplotlib.use('Agg')
 import xml.etree.ElementTree as ET
 import glob
-import logging
 from zoneinfo import ZoneInfo
 
 # Constantes para evitar repetición de strings
@@ -31,12 +30,133 @@ OHIO_DATA_DIRS: list[str] = [
 ]
 OUTPUT_DIR: str = 'new_ohio/processed_data'
 PLOTS_DIR: str = 'new_ohio/processed_data/plots'
+MGDL_UNIT: str = "mg/dl"
 
 from constants.constants import CONST_DEFAULT_SEED, DATE_FORMAT, TIMESTAMP_COL, SUBJECT_ID_COL, GLUCOSE_COL, BOLUS_COL, MEAL_COL, BASAL_COL, TEMP_BASAL_COL
 from config.params import CONFIG_PROCESSING, USE_EXCEL_DATA
 
-# Configuración de logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def _verify_excel_file(subject_path: str) -> bool:
+    """
+    Verifica si un archivo Excel existe, es accesible y no está vacío.
+    
+    Parámetros:
+    -----------
+    subject_path : str
+        Ruta al archivo Excel del sujeto.
+        
+    Retorna:
+    --------
+    bool
+        True si el archivo es válido, False en caso contrario.
+    """
+    # Verificar si el archivo existe y es accesible
+    if not os.path.exists(subject_path) or not os.access(subject_path, os.R_OK):
+        print_error(f"Archivo no existe o no es accesible: {subject_path}")
+        return False
+        
+    # Verificar el tamaño del archivo
+    file_size = os.path.getsize(subject_path)
+    if file_size == 0:
+        print_error(f"Archivo vacío: {subject_path}")
+        return False
+    
+    return True
+
+def _load_cgm_sheet(subject_path: str) -> Optional[pl.DataFrame]:
+    """
+    Carga la hoja CGM de un archivo Excel.
+    
+    Parámetros:
+    -----------
+    subject_path : str
+        Ruta al archivo Excel del sujeto.
+        
+    Retorna:
+    --------
+    Optional[pl.DataFrame]
+        DataFrame con datos CGM o None si hubo error.
+    """
+    try:
+        cgm_df = pl.read_excel(subject_path, sheet_name="CGM")
+        if cgm_df.is_empty():
+            print_warning(f"Hoja CGM vacía en {os.path.basename(subject_path)}")
+            return None
+        
+        # Verificar columnas requeridas
+        if "date" not in cgm_df.columns or MGDL_UNIT not in cgm_df.columns:
+            missing_cols = []
+            if "date" not in cgm_df.columns: missing_cols.append("date")
+            if MGDL_UNIT not in cgm_df.columns: missing_cols.append(MGDL_UNIT)
+            print_warning(f"Faltan columnas en hoja CGM de {os.path.basename(subject_path)}: {missing_cols}")
+            print_warning(f"Columnas disponibles: {cgm_df.columns}")
+            return None
+        
+        # Procesamiento de CGM
+        cgm_df = cgm_df.with_columns(
+            pl.col("date").cast(pl.Datetime(time_unit="us")).alias(TIMESTAMP_COL)
+        )
+        return cgm_df.sort(TIMESTAMP_COL).rename({MGDL_UNIT: GLUCOSE_COL})
+    except Exception as e:
+        print_error(f"Error cargando hoja CGM de {os.path.basename(subject_path)}: {e}")
+        return None
+
+def _load_bolus_sheet(subject_path: str) -> Optional[pl.DataFrame]:
+    """
+    Carga la hoja Bolus de un archivo Excel.
+    
+    Parámetros:
+    -----------
+    subject_path : str
+        Ruta al archivo Excel del sujeto.
+        
+    Retorna:
+    --------
+    Optional[pl.DataFrame]
+        DataFrame con datos Bolus o None si hubo error.
+    """
+    try:
+        bolus_df = pl.read_excel(subject_path, sheet_name="Bolus")
+        if bolus_df.is_empty():
+            print_warning(f"Hoja Bolus vacía en {os.path.basename(subject_path)}")
+            return None
+        
+        # Verificar columnas requeridas
+        if "date" not in bolus_df.columns:
+            print_warning(f"Falta columna 'date' en hoja Bolus de {os.path.basename(subject_path)}")
+            print_warning(f"Columnas disponibles: {bolus_df.columns}")
+            return None
+        
+        # Procesamiento de Bolus
+        return bolus_df.with_columns(
+            pl.col("date").cast(pl.Datetime(time_unit="us")).alias(TIMESTAMP_COL)
+        )
+    except Exception as e:
+        print_error(f"Error cargando hoja Bolus de {os.path.basename(subject_path)}: {e}")
+        return None
+
+def _load_basal_sheet(subject_path: str) -> Optional[pl.DataFrame]:
+    """
+    Carga la hoja Basal de un archivo Excel.
+    
+    Parámetros:
+    -----------
+    subject_path : str
+        Ruta al archivo Excel del sujeto.
+        
+    Retorna:
+    --------
+    Optional[pl.DataFrame]
+        DataFrame con datos Basal o None si hubo error.
+    """
+    try:
+        basal_df = pl.read_excel(subject_path, sheet_name="Basal")
+        if not basal_df.is_empty() and "date" in basal_df.columns:
+            return basal_df.with_columns(
+                pl.col("date").cast(pl.Datetime(time_unit="us")).alias(TIMESTAMP_COL)
+            )
+        return None
+    except Exception:
+        return None
 
 def load_excel_data(subject_path: str) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame], Optional[pl.DataFrame]]:
     """
@@ -53,88 +173,208 @@ def load_excel_data(subject_path: str) -> tuple[Optional[pl.DataFrame], Optional
         Tupla con (cgm_df, bolus_df, basal_df), donde cada elemento es un DataFrame
         o None si hubo error en la carga.
     """
-    cgm_df, bolus_df, basal_df = None, None, None
-    
     try:
-        # Verificar si el archivo existe y es accesible
-        if not os.path.exists(subject_path) or not os.access(subject_path, os.R_OK):
-            logging.error(f"Archivo no existe o no es accesible: {subject_path}")
+        # Verificar archivo
+        if not _verify_excel_file(subject_path):
             return None, None, None
-            
-        # Verificar el tamaño del archivo
-        file_size = os.path.getsize(subject_path)
-        if file_size == 0:
-            logging.error(f"Archivo vacío: {subject_path}")
-            return None, None, None
-            
-        # Intenta cargar la hoja CGM
-        try:
-            cgm_df = pl.read_excel(subject_path, sheet_name="CGM")
-            if cgm_df.is_empty():
-                logging.warning(f"Hoja CGM vacía en {os.path.basename(subject_path)}")
-                cgm_df = None
-            else:
-                # Verificar columnas requeridas
-                if "date" not in cgm_df.columns or "mg/dl" not in cgm_df.columns:
-                    missing_cols = []
-                    if "date" not in cgm_df.columns: missing_cols.append("date")
-                    if "mg/dl" not in cgm_df.columns: missing_cols.append("mg/dl")
-                    logging.warning(f"Faltan columnas en hoja CGM de {os.path.basename(subject_path)}: {missing_cols}")
-                    logging.warning(f"Columnas disponibles: {cgm_df.columns}")
-                    cgm_df = None
-                else:
-                    # Procesamiento de CGM
-                    cgm_df = cgm_df.with_columns(
-                        pl.col("date").cast(pl.Datetime(time_unit="us")).alias(TIMESTAMP_COL)
-                    )
-                    cgm_df = cgm_df.sort(TIMESTAMP_COL).rename({"mg/dl": GLUCOSE_COL})
-        except Exception as e:
-            logging.error(f"Error cargando hoja CGM de {os.path.basename(subject_path)}: {e}")
-            cgm_df = None
-            
-        # Intenta cargar la hoja Bolus
-        try:
-            bolus_df = pl.read_excel(subject_path, sheet_name="Bolus")
-            if bolus_df.is_empty():
-                logging.warning(f"Hoja Bolus vacía en {os.path.basename(subject_path)}")
-                bolus_df = None
-            else:
-                # Verificar columnas requeridas
-                if "date" not in bolus_df.columns:
-                    logging.warning(f"Falta columna 'date' en hoja Bolus de {os.path.basename(subject_path)}")
-                    logging.warning(f"Columnas disponibles: {bolus_df.columns}")
-                    bolus_df = None
-                else:
-                    # Procesamiento de Bolus
-                    bolus_df = bolus_df.with_columns(
-                        pl.col("date").cast(pl.Datetime(time_unit="us")).alias(TIMESTAMP_COL)
-                    )
-        except Exception as e:
-            logging.error(f"Error cargando hoja Bolus de {os.path.basename(subject_path)}: {e}")
-            bolus_df = None
-            
-        # Intenta cargar la hoja Basal (opcional)
-        try:
-            basal_df = pl.read_excel(subject_path, sheet_name="Basal")
-            if not basal_df.is_empty() and "date" in basal_df.columns:
-                basal_df = basal_df.with_columns(
-                    pl.col("date").cast(pl.Datetime(time_unit="us")).alias(TIMESTAMP_COL)
-                )
-            else:
-                basal_df = None
-        except Exception:
-            basal_df = None
-            
+        
+        # Cargar hojas
+        cgm_df = _load_cgm_sheet(subject_path)
+        bolus_df = _load_bolus_sheet(subject_path)
+        basal_df = _load_basal_sheet(subject_path)
+        
         # Verificar si se pudo cargar al menos una de las hojas principales
         if cgm_df is None and bolus_df is None:
-            logging.error(f"No se pudo cargar ninguna hoja útil de {os.path.basename(subject_path)}")
+            print_error(f"No se pudo cargar ninguna hoja útil de {os.path.basename(subject_path)}")
             return None, None, None
-            
-        return cgm_df, bolus_df, basal_df
         
+        return cgm_df, bolus_df, basal_df
+    
     except Exception as e:
-        logging.error(f"Error general al cargar {os.path.basename(subject_path)}: {e}")
+        print_error(f"Error general al cargar {os.path.basename(subject_path)}: {e}")
         return None, None, None
+
+def _get_expected_subjects_by_year(data_dir: str) -> tuple[str, list[str]]:
+    """
+    Determina el año y obtiene la lista de sujetos esperados.
+    
+    Parámetros:
+    -----------
+    data_dir : str
+        Directorio con archivos XML.
+        
+    Retorna:
+    --------
+    tuple[str, list[str]]
+        Tupla con (año, lista_de_sujetos_esperados)
+    """
+    expected_subjects = {
+        '2018': ['559-ws-training', '563-ws-training', '570-ws-training', '575-ws-training', '588-ws-training', '591-ws-training'],
+        '2020': ['540-ws-training', '544-ws-training', '552-ws-training', '567-ws-training', '584-ws-training', '596-ws-training']
+    }
+    
+    if '2018' in data_dir:
+        year = '2018'
+    elif '2020' in data_dir:
+        year = '2020'
+    else:
+        year = None
+    if year is None:
+        raise ValueError(f"No se pudo determinar el año del directorio: {data_dir}")
+    
+    suffix = '-ws-training' if 'train' in data_dir else '-ws-testing'
+    expected_subjects[year] = [s.replace('-ws-training', suffix).replace('-ws-testing', suffix) for s in expected_subjects[year]]
+    
+    return year, expected_subjects[year]
+
+def _validate_xml_files(data_dir: str, expected_subjects: list[str], year: str) -> list[str]:
+    """
+    Valida la existencia de archivos XML y reporta sujetos faltantes.
+    
+    Parámetros:
+    -----------
+    data_dir : str
+        Directorio con archivos XML.
+    expected_subjects : list[str]
+        Lista de sujetos esperados.
+    year : str
+        Año de los datos.
+        
+    Retorna:
+    --------
+    list[str]
+        Lista de archivos XML encontrados.
+    """
+    xml_files = glob.glob(os.path.join(data_dir, "*.xml"))
+    found_subjects = [os.path.basename(f).split('.')[0] for f in xml_files]
+    missing_subjects = [s for s in expected_subjects if s not in found_subjects]
+    
+    if missing_subjects:
+        print_error(f"Faltan datos para sujetos del año {year}: {missing_subjects}")
+        if not found_subjects:
+            raise ValueError(f"No se encontraron archivos XML en {data_dir}")
+    
+    return xml_files
+
+def _process_xml_records(data_type_elem, subject_id: str, year: str) -> list[dict]:
+    """
+    Procesa los registros de un tipo de dato específico desde un elemento XML.
+    
+    Parámetros:
+    -----------
+    data_type_elem : ET.Element
+        Elemento XML que contiene los registros.
+    subject_id : str
+        ID del sujeto.
+    year : str
+        Año de los datos.
+        
+    Retorna:
+    --------
+    list[dict]
+        Lista de registros procesados.
+    """
+    records = []
+    for event in data_type_elem:
+        record_dict = dict(event.attrib)
+        record_dict[SUBJECT_ID_COL] = extract_numeric_id(subject_id)
+        record_dict['Year'] = year
+        records.append(record_dict)
+    return records
+
+def _process_single_xml_file(xml_file: str, year: str, expected_types: list[str]) -> tuple[dict[str, pl.DataFrame], dict[str, dict[str, int]]]:
+    """
+    Procesa un único archivo XML y extrae todos los tipos de datos.
+    
+    Parámetros:
+    -----------
+    xml_file : str
+        Ruta al archivo XML.
+    year : str
+        Año de los datos.
+    expected_types : list[str]
+        Lista de tipos de datos esperados.
+        
+    Retorna:
+    --------
+    tuple[dict[str, pl.DataFrame], dict[str, dict[str, int]]]
+        Tupla con (diccionario_de_dataframes, estadísticas_del_sujeto)
+    """
+    subject_id = os.path.basename(xml_file).split('.')[0]
+    print_info(f"Procesando SubjectID: {subject_id} (Año {year})")
+    
+    data_dict = {}
+    subject_stats = defaultdict(int)
+    
+    try:
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        
+        for data_type_elem in root:
+            data_type = data_type_elem.tag
+            if data_type == 'patient' or data_type not in expected_types:
+                continue
+            
+            records = _process_xml_records(data_type_elem, subject_id, year)
+            
+            if records:
+                df = pl.DataFrame(records)
+                if 'value' in df.columns:
+                    df = df.with_columns(pl.col('value').cast(pl.Float64))
+                data_dict[data_type] = df
+                print_info(f"SubjectID {subject_id}: {data_type}={len(records)} registros")
+                subject_stats[data_type] = len(records)
+                
+    except Exception as e:
+        print_error(f"Error procesando {xml_file}: {e}")
+    
+    return data_dict, {subject_id: subject_stats}
+
+def _consolidate_data_dicts(all_data_dicts: list[dict[str, pl.DataFrame]]) -> dict[str, pl.DataFrame]:
+    """
+    Consolida múltiples diccionarios de DataFrames en uno solo.
+    
+    Parámetros:
+    -----------
+    all_data_dicts : list[dict[str, pl.DataFrame]]
+        Lista de diccionarios de DataFrames.
+        
+    Retorna:
+    --------
+    dict[str, pl.DataFrame]
+        Diccionario consolidado con todos los DataFrames concatenados.
+    """
+    consolidated = {}
+    
+    for data_dict in all_data_dicts:
+        for data_type, df in data_dict.items():
+            if data_type in consolidated:
+                consolidated[data_type] = pl.concat([consolidated[data_type], df])
+            else:
+                consolidated[data_type] = df
+    
+    return consolidated
+
+def _print_final_statistics(subject_stats: dict, expected_subjects: list[str], expected_types: list[str], year: str):
+    """
+    Imprime estadísticas finales del procesamiento.
+    
+    Parámetros:
+    -----------
+    subject_stats : dict
+        Estadísticas por sujeto.
+    expected_subjects : list[str]
+        Lista de sujetos esperados.
+    expected_types : list[str]
+        Lista de tipos de datos esperados.
+    year : str
+        Año de los datos.
+    """
+    print_info(f"\nEstadísticas por sujeto (Año {year}):")
+    for subject_id in sorted(subject_stats.keys()):
+        stats = subject_stats[subject_id]
+        stat_str = ", ".join([f"{k}={v}" for k, v in stats.items()])
+        print_info(f"SubjectID {subject_id}: {stat_str}")
 
 def load_xml_data(data_dir: str) -> dict[str, pl.DataFrame]:
     """
@@ -150,69 +390,217 @@ def load_xml_data(data_dir: str) -> dict[str, pl.DataFrame]:
     dict[str, pl.DataFrame]
         Diccionario con DataFrames por tipo de dato (glucose_level, bolus, meal, basal, temp_basal, etc.).
     """
-    logging.info(f"Cargando datos desde {data_dir}")
-    expected_subjects = {
-        '2018': ['559-ws-training', '563-ws-training', '570-ws-training', '575-ws-training', '588-ws-training', '591-ws-training'],
-        '2020': ['540-ws-training', '544-ws-training', '552-ws-training', '567-ws-training', '584-ws-training', '596-ws-training']
-    }
-    year = '2018' if '2018' in data_dir else '2020' if '2020' in data_dir else None
-    if year is None:
-        raise ValueError(f"No se pudo determinar el año del directorio: {data_dir}")
-    suffix = '-ws-training' if 'train' in data_dir else '-ws-testing'
-    expected_subjects[year] = [s.replace('-ws-training', suffix).replace('-ws-testing', suffix) for s in expected_subjects[year]]
-    xml_files = glob.glob(os.path.join(data_dir, "*.xml"))
-    found_subjects = [os.path.basename(f).split('.')[0] for f in xml_files]
-    missing_subjects = [s for s in expected_subjects[year] if s not in found_subjects]
-    if missing_subjects:
-        logging.error(f"Faltan datos para sujetos del año {year}: {missing_subjects}")
-        if not found_subjects:
-            raise ValueError(f"No se encontraron archivos XML en {data_dir}")
-    data_dict: dict[str, pl.DataFrame] = {}
-    subject_stats = defaultdict(lambda: defaultdict(int))
+    print_info(f"Cargando datos desde {data_dir}")
+    
+    # Determinar año y sujetos esperados
+    year, expected_subjects = _get_expected_subjects_by_year(data_dir)
+    
+    # Validar archivos XML
+    xml_files = _validate_xml_files(data_dir, expected_subjects, year)
+    
+    # Definir tipos de datos esperados
     expected_types = [
         'glucose_level', 'bolus', 'meal', 'basal', 'temp_basal', 'exercise', 'basis_steps', 'hypo_event',
         'finger_stick', 'sleep', 'work', 'stressors', 'illness', 'basis_heart_rate', 'basis_gsr',
         'basis_skin_temperature', 'basis_air_temperature', 'basis_sleep', 'acceleration'
     ]
+    
+    # Procesar todos los archivos XML
+    all_data_dicts = []
+    all_subject_stats = {}
+    
     for xml_file in xml_files:
-        subject_id = os.path.basename(xml_file).split('.')[0]
-        logging.info(f"Procesando SubjectID: {subject_id} (Año {year})")
-        try:
-            tree = ET.parse(xml_file)
-            root = tree.getroot()
-            for data_type_elem in root:
-                data_type = data_type_elem.tag
-                if data_type == 'patient':
-                    continue
-                if data_type not in expected_types:
-                    continue
-                records = []
-                for event in data_type_elem:
-                    record_dict = dict(event.attrib)
-                    record_dict[SUBJECT_ID_COL] = extract_numeric_id(subject_id)
-                    record_dict['Year'] = year
-                    records.append(record_dict)
-                if records:
-                    df = pl.DataFrame(records)
-                    if 'value' in df.columns:
-                        df = df.with_columns(pl.col('value').cast(pl.Float64))
-                    data_dict[data_type] = pl.concat([data_dict.get(data_type, pl.DataFrame()), df])
-                    logging.info(f"SubjectID {subject_id}: {data_type}={len(records)} registros")
-                    subject_stats[subject_id][data_type] += len(records)
-        except Exception as e:
-            logging.error(f"Error procesando {xml_file}: {e}")
-            continue
-    logging.info(f"\nEstadísticas por sujeto (Año {year}):")
-    for subject_id in sorted(subject_stats.keys()):
-        stats = subject_stats[subject_id]
-        stat_str = ", ".join([f"{k}={v}" for k, v in stats.items()])
-        logging.info(f"SubjectID {subject_id}: {stat_str}")
+        file_data_dict, file_subject_stats = _process_single_xml_file(xml_file, year, expected_types)
+        all_data_dicts.append(file_data_dict)
+        all_subject_stats.update(file_subject_stats)
+    
+    # Consolidar todos los DataFrames
+    data_dict = _consolidate_data_dicts(all_data_dicts)
+    
+    # Imprimir estadísticas finales
+    _print_final_statistics(all_subject_stats, expected_subjects, expected_types, year)
+    
+    # Verificar tipos de datos faltantes
     missing_types = [t for t in expected_types if t not in data_dict]
     if missing_types:
-        logging.warning(f"Faltan tipos de datos: {missing_types}")
-    if len(subject_stats) != len(expected_subjects[year]):
-        logging.error(f"Se encontraron datos para {len(subject_stats)}/{len(expected_subjects[year])} sujetos")
+        print_warning(f"Faltan tipos de datos: {missing_types}")
+    
+    # Verificar número de sujetos procesados
+    if len(all_subject_stats) != len(expected_subjects):
+        print_error(f"Se encontraron datos para {len(all_subject_stats)}/{len(expected_subjects)} sujetos")
+    
     return data_dict
+
+def _process_bolus_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de bolus."""
+    if "bolus" not in data:
+        return
+    
+    bolus = data["bolus"].clone()
+    if "dose" in bolus.columns:
+        bolus = bolus.rename({"dose": BOLUS_COL})
+        bolus = bolus.with_columns(pl.col(BOLUS_COL).cast(pl.Float64))
+    if "ts_begin" in bolus.columns:
+        bolus = bolus.with_columns(
+            pl.col("ts_begin")
+            .str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT)
+            .alias(TIMESTAMP_COL)
+        )
+    valid_bolus = bolus.filter(pl.col(BOLUS_COL).is_not_null() & (pl.col(BOLUS_COL) > 0))
+    processed["bolus"] = valid_bolus
+    print_info(f"Eventos bolus válidos: {valid_bolus.height}")
+
+def _process_meal_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de comida."""
+    if "meal" not in data:
+        return
+    
+    meal = data["meal"].clone()
+    if "carbs" in meal.columns:
+        meal = meal.rename({"carbs": MEAL_COL})
+        meal = meal.with_columns(pl.col(MEAL_COL).cast(pl.Float64))
+    if "ts" in meal.columns:
+        meal = meal.with_columns(
+            pl.col("ts")
+            .str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT)
+            .alias(TIMESTAMP_COL)
+        )
+    valid_meal = meal.filter(pl.col(MEAL_COL).is_not_null() & (pl.col(MEAL_COL) > 0))
+    processed["meal"] = valid_meal
+    print_info(f"Eventos meal válidos: {valid_meal.height}")
+
+def _process_basal_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de insulina basal."""
+    if "basal" not in data:
+        return
+    
+    basal = data["basal"].clone()
+    basal = basal.rename({"value": BASAL_COL}).with_columns(
+        pl.col(BASAL_COL).cast(pl.Float64),
+        pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
+    )
+    processed["basal"] = basal.filter(pl.col(BASAL_COL).is_not_null())
+    print_info(f"Eventos basal válidos: {processed['basal'].height}")
+
+def _process_temp_basal_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de insulina basal temporal."""
+    if "temp_basal" not in data:
+        return
+    
+    temp_basal = data["temp_basal"].clone()
+    temp_basal = temp_basal.rename({"value": TEMP_BASAL_COL}).with_columns(
+        pl.col(TEMP_BASAL_COL).cast(pl.Float64),
+        pl.col("ts_begin").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
+    )
+    processed["temp_basal"] = temp_basal.filter(pl.col(TEMP_BASAL_COL).is_not_null())
+    print_info(f"Eventos temp_basal válidos: {processed['temp_basal'].height}")
+
+def _process_exercise_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de ejercicio."""
+    if "exercise" not in data:
+        return
+    
+    exercise = data["exercise"].clone()
+    exercise = exercise.with_columns(
+        pl.col("intensity").cast(pl.Float64),
+        pl.col("duration").cast(pl.Float64),
+        pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
+    )
+    processed["exercise"] = exercise.filter(pl.col("intensity").is_not_null())
+    print_info(f"Eventos exercise válidos: {processed['exercise'].height}")
+
+def _process_steps_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de pasos."""
+    if "basis_steps" not in data:
+        return
+    
+    steps = data["basis_steps"].clone()
+    steps = steps.rename({"value": "steps"}).with_columns(
+        pl.col("steps").cast(pl.Float64),
+        pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
+    )
+    processed["basis_steps"] = steps.filter(pl.col("steps").is_not_null())
+    print_info(f"Eventos steps válidos: {processed['basis_steps'].height}")
+
+def _process_event_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de eventos simples (hypo_event, stressors, illness)."""
+    simple_events = ["hypo_event", "stressors", "illness"]
+    
+    for event_type in simple_events:
+        if event_type not in data:
+            continue
+        
+        event_df = data[event_type].clone()
+        if "ts" in event_df.columns:
+            event_df = event_df.with_columns(
+                pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
+            )
+        processed[event_type] = event_df
+        print_info(f"Eventos {event_type} válidos: {processed[event_type].height}")
+
+def _process_finger_stick_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de medición digital de glucosa."""
+    if "finger_stick" not in data:
+        return
+    
+    finger_stick = data["finger_stick"].clone()
+    finger_stick = finger_stick.rename({"value": "finger_stick_bg"}).with_columns(
+        pl.col("finger_stick_bg").cast(pl.Float64),
+        pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
+    )
+    processed["finger_stick"] = finger_stick.filter(pl.col("finger_stick_bg").is_not_null())
+    print_info(f"Eventos finger_stick válidos: {processed['finger_stick'].height}")
+
+def _process_sleep_work_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de sueño y trabajo que pueden tener timestamps begin/end."""
+    data_types = ["sleep", "work", "basis_sleep"]
+    
+    for data_type in data_types:
+        if data_type not in data:
+            continue
+        
+        df = data[data_type].clone()
+        
+        # Determinar columna de calidad/intensidad
+        quality_col = "quality" if data_type in ["sleep", "basis_sleep"] else "intensity"
+        
+        if "ts_begin" in df.columns and "ts_end" in df.columns:
+            # Para datos con begin/end, usar ts_begin como Timestamp principal
+            df = df.with_columns([
+                pl.col(quality_col).cast(pl.Float64),
+                pl.col("ts_begin").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL),
+                pl.col("ts_end").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias("Timestamp_end")
+            ])
+        elif "ts" in df.columns:
+            df = df.with_columns([
+                pl.col(quality_col).cast(pl.Float64),
+                pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
+            ])
+        
+        processed[data_type] = df.filter(pl.col(quality_col).is_not_null())
+        print_info(f"Eventos {data_type} válidos: {processed[data_type].height}")
+
+def _process_sensor_data(data: dict[str, pl.DataFrame], processed: dict[str, pl.DataFrame]) -> None:
+    """Procesa datos de sensores (heart rate, GSR, temperatura, aceleración)."""
+    sensor_mappings = {
+        "basis_heart_rate": "heart_rate",
+        "basis_gsr": "gsr",
+        "basis_skin_temperature": "skin_temperature",
+        "basis_air_temperature": "air_temperature",
+        "acceleration": "acceleration"
+    }
+    
+    for sensor_type, new_col_name in sensor_mappings.items():
+        if sensor_type not in data:
+            continue
+        
+        sensor_df = data[sensor_type].clone()
+        sensor_df = sensor_df.rename({"value": new_col_name}).with_columns(
+            pl.col(new_col_name).cast(pl.Float64),
+            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
+        )
+        processed[sensor_type] = sensor_df.filter(pl.col(new_col_name).is_not_null())
+        print_info(f"Eventos {sensor_type} válidos: {processed[sensor_type].height}")
 
 def preprocess_xml_bolus_meal(data: dict[str, pl.DataFrame]) -> dict[str, pl.DataFrame]:
     """
@@ -229,225 +617,24 @@ def preprocess_xml_bolus_meal(data: dict[str, pl.DataFrame]) -> dict[str, pl.Dat
         Diccionario con DataFrames preprocesados.
     """
     processed: dict[str, pl.DataFrame] = {}
-    # Bolus
-    if "bolus" in data:
-        bolus = data["bolus"].clone()
-        if "dose" in bolus.columns:
-            bolus = bolus.rename({"dose": BOLUS_COL})
-            bolus = bolus.with_columns(pl.col(BOLUS_COL).cast(pl.Float64))
-        if "ts_begin" in bolus.columns:
-            bolus = bolus.with_columns(
-                pl.col("ts_begin")
-                .str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT)
-                .alias(TIMESTAMP_COL)
-            )
-        valid_bolus = bolus.filter(pl.col(BOLUS_COL).is_not_null() & (pl.col(BOLUS_COL) > 0))
-        processed["bolus"] = valid_bolus
-        logging.info(f"Eventos bolus válidos: {valid_bolus.height}")
-
-    # Meal
-    if "meal" in data:
-        meal = data["meal"].clone()
-        if "carbs" in meal.columns:
-            meal = meal.rename({"carbs": MEAL_COL})
-            meal = meal.with_columns(pl.col(MEAL_COL).cast(pl.Float64))
-        if "ts" in meal.columns:
-            meal = meal.with_columns(
-                pl.col("ts")
-                .str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT)
-                .alias(TIMESTAMP_COL)
-            )
-        valid_meal = meal.filter(pl.col(MEAL_COL).is_not_null() & (pl.col(MEAL_COL) > 0))
-        processed["meal"] = valid_meal
-        logging.info(f"Eventos meal válidos: {valid_meal.height}")
-
-    # Basal
-    if "basal" in data:
-        basal = data["basal"].clone()
-        basal = basal.rename({"value": BASAL_COL}).with_columns(
-            pl.col(BASAL_COL).cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["basal"] = basal.filter(pl.col(BASAL_COL).is_not_null())
-        logging.info(f"Eventos basal válidos: {processed['basal'].height}")
-
-    # Temp Basal
-    if "temp_basal" in data:
-        temp_basal = data["temp_basal"].clone()
-        temp_basal = temp_basal.rename({"value": TEMP_BASAL_COL}).with_columns(
-            pl.col(TEMP_BASAL_COL).cast(pl.Float64),
-            pl.col("ts_begin").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["temp_basal"] = temp_basal.filter(pl.col(TEMP_BASAL_COL).is_not_null())
-        logging.info(f"Eventos temp_basal válidos: {processed['temp_basal'].height}")
-
-    # Exercise
-    if "exercise" in data:
-        exercise = data["exercise"].clone()
-        exercise = exercise.with_columns(
-            pl.col("intensity").cast(pl.Float64),
-            pl.col("duration").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["exercise"] = exercise.filter(pl.col("intensity").is_not_null())
-        logging.info(f"Eventos exercise válidos: {processed['exercise'].height}")
-
-    # Steps
-    if "basis_steps" in data:
-        steps = data["basis_steps"].clone()
-        steps = steps.rename({"value": "steps"}).with_columns(
-            pl.col("steps").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["basis_steps"] = steps.filter(pl.col("steps").is_not_null())
-        logging.info(f"Eventos steps válidos: {processed['basis_steps'].height}")
-
-    # Hypo Event
-    if "hypo_event" in data:
-        hypo = data["hypo_event"].clone()
-        if "ts" in hypo.columns:
-            hypo = hypo.with_columns(
-                pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-            )
-        processed["hypo_event"] = hypo
-        logging.info(f"Eventos hypo_event válidos: {processed['hypo_event'].height}")
-
-    # Finger Stick
-    if "finger_stick" in data:
-        finger_stick = data["finger_stick"].clone()
-        finger_stick = finger_stick.rename({"value": "finger_stick_bg"}).with_columns(
-            pl.col("finger_stick_bg").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["finger_stick"] = finger_stick.filter(pl.col("finger_stick_bg").is_not_null())
-        logging.info(f"Eventos finger_stick válidos: {processed['finger_stick'].height}")
-
-    # Sleep
-    if "sleep" in data:
-        sleep = data["sleep"].clone()
-        if "ts_begin" in sleep.columns and "ts_end" in sleep.columns:
-            sleep = sleep.with_columns(
-                pl.col("quality").cast(pl.Float64),
-                pl.col("ts_begin").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias("Timestamp_begin"),
-                pl.col("ts_end").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias("Timestamp_end")
-            )
-        elif "ts" in sleep.columns:
-            sleep = sleep.with_columns(
-                pl.col("quality").cast(pl.Float64),
-                pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-            )
-        processed["sleep"] = sleep.filter(pl.col("quality").is_not_null())
-        logging.info(f"Eventos sleep válidos: {processed['sleep'].height}")
-
-    # Work
-    if "work" in data:
-        work = data["work"].clone()
-        if "ts_begin" in work.columns and "ts_end" in work.columns:
-            work = work.with_columns(
-                pl.col("intensity").cast(pl.Float64),
-                pl.col("ts_begin").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias("Timestamp_begin"),
-                pl.col("ts_end").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias("Timestamp_end")
-            )
-        elif "ts" in work.columns:
-            work = work.with_columns(
-                pl.col("intensity").cast(pl.Float64),
-                pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-            )
-        processed["work"] = work.filter(pl.col("intensity").is_not_null())
-        logging.info(f"Eventos work válidos: {processed['work'].height}")
-
-    # Stressors
-    if "stressors" in data:
-        stressors = data["stressors"].clone()
-        if "ts" in stressors.columns:
-            stressors = stressors.with_columns(
-                pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-            )
-        processed["stressors"] = stressors
-        logging.info(f"Eventos stressors válidos: {processed['stressors'].height}")
-
-    # Illness
-    if "illness" in data:
-        illness = data["illness"].clone()
-        if "ts" in illness.columns:
-            illness = illness.with_columns(
-                pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-            )
-        processed["illness"] = illness
-        logging.info(f"Eventos illness válidos: {processed['illness'].height}")
-
-    # Basis Heart Rate
-    if "basis_heart_rate" in data:
-        heart_rate = data["basis_heart_rate"].clone()
-        heart_rate = heart_rate.rename({"value": "heart_rate"}).with_columns(
-            pl.col("heart_rate").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["basis_heart_rate"] = heart_rate.filter(pl.col("heart_rate").is_not_null())
-        logging.info(f"Eventos heart_rate válidos: {processed['basis_heart_rate'].height}")
-
-    # Basis GSR
-    if "basis_gsr" in data:
-        gsr = data["basis_gsr"].clone()
-        gsr = gsr.rename({"value": "gsr"}).with_columns(
-            pl.col("gsr").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["basis_gsr"] = gsr.filter(pl.col("gsr").is_not_null())
-        logging.info(f"Eventos gsr válidos: {processed['basis_gsr'].height}")
-
-    # Basis Skin Temperature
-    if "basis_skin_temperature" in data:
-        skin_temp = data["basis_skin_temperature"].clone()
-        skin_temp = skin_temp.rename({"value": "skin_temperature"}).with_columns(
-            pl.col("skin_temperature").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["basis_skin_temperature"] = skin_temp.filter(pl.col("skin_temperature").is_not_null())
-        logging.info(f"Eventos skin_temperature válidos: {processed['basis_skin_temperature'].height}")
-
-    # Basis Air Temperature
-    if "basis_air_temperature" in data:
-        air_temp = data["basis_air_temperature"].clone()
-        air_temp = air_temp.rename({"value": "air_temperature"}).with_columns(
-            pl.col("air_temperature").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["basis_air_temperature"] = air_temp.filter(pl.col("air_temperature").is_not_null())
-        logging.info(f"Eventos air_temperature válidos: {processed['basis_air_temperature'].height}")
-
-    # Basis Sleep
-    if "basis_sleep" in data:
-        basis_sleep = data["basis_sleep"].clone()
-        if "ts_begin" in basis_sleep.columns and "ts_end" in basis_sleep.columns:
-            basis_sleep = basis_sleep.with_columns(
-                pl.col("quality").cast(pl.Float64),
-                pl.col("ts_begin").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias("Timestamp_begin"),
-                pl.col("ts_end").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias("Timestamp_end")
-            )
-        elif "ts" in basis_sleep.columns:
-            basis_sleep = basis_sleep.with_columns(
-                pl.col("quality").cast(pl.Float64),
-                pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-            )
-        processed["basis_sleep"] = basis_sleep.filter(pl.col("quality").is_not_null())
-        logging.info(f"Eventos basis_sleep válidos: {processed['basis_sleep'].height}")
-
-    # Acceleration
-    if "acceleration" in data:
-        accel = data["acceleration"].clone()
-        accel = accel.rename({"value": "acceleration"}).with_columns(
-            pl.col("acceleration").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime(time_unit="us"), DATE_FORMAT).alias(TIMESTAMP_COL)
-        )
-        processed["acceleration"] = accel.filter(pl.col("acceleration").is_not_null())
-        logging.info(f"Eventos acceleration válidos: {processed['acceleration'].height}")
-
+    
+    # Procesar cada tipo de datos usando funciones especializadas
+    _process_bolus_data(data, processed)
+    _process_meal_data(data, processed)
+    _process_basal_data(data, processed)
+    _process_temp_basal_data(data, processed)
+    _process_exercise_data(data, processed)
+    _process_steps_data(data, processed)
+    _process_event_data(data, processed)
+    _process_finger_stick_data(data, processed)
+    _process_sleep_work_data(data, processed)
+    _process_sensor_data(data, processed)
+    
     return processed
 
 def align_events_to_cgm(cgm_df: pl.DataFrame, event_df: pl.DataFrame, event_time_col: str = TIMESTAMP_COL, tolerance_minutes: int = 5) -> pl.DataFrame:
     """
-    Alinea eventos (bolus, meal, etc.) con el timestamp de CGM más cercano dentro de una tolerancia, con mejor logging.
+    Alinea eventos (bolus, meal, etc.) con el timestamp de CGM más cercano dentro de una tolerancia, con mejor print_
 
     Parámetros:
     -----------
@@ -517,10 +704,10 @@ def align_events_to_cgm(cgm_df: pl.DataFrame, event_df: pl.DataFrame, event_time
     lost_events = total_events - aligned_events
     
     if lost_events > 0:
-        logging.warning(f"Eventos descartados por estar fuera de tolerancia: {lost_events}")
-        logging.warning(f"Eventos sin CGM correspondiente: {lost_events}")
+        print_warning(f"Eventos descartados por estar fuera de tolerancia: {lost_events}")
+        print_warning(f"Eventos sin CGM correspondiente: {lost_events}")
     
-    logging.info(f"Eventos alineados: {aligned_events}/{total_events} ({aligned_events/total_events*100:.1f}%)")
+    print_info(f"Eventos alineados: {aligned_events}/{total_events} ({aligned_events/total_events*100:.1f}%)")
     
     return aligned_df
 
@@ -546,59 +733,454 @@ def preprocess_cgm(cgm: pl.DataFrame) -> pl.DataFrame:
         )
     return cgm
 
-def join_signals(cgm_df: pl.DataFrame, 
-                bolus_df: pl.DataFrame, 
-                meal_df: pl.DataFrame,
-                physiological_df: Optional[pl.DataFrame] = None) -> pl.DataFrame:
-    """Une las diferentes señales temporales usando join_asof"""
+def _join_contextual_data(joined_df: pl.DataFrame, processed_data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+    """
+    Une datos contextuales (sleep, work, exercise) al DataFrame principal.
+
+    Parámetros:
+    -----------
+    joined_df : pl.DataFrame
+        DataFrame principal con datos ya unidos.
+    processed_data : Dict[str, pl.DataFrame]
+        Diccionario con DataFrames procesados.
+
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con datos contextuales unidos.
+    """
+    # Definir mapeo de datos contextuales y sus columnas de interés
+    contextual_mappings = {
+        'sleep': {
+            'value_cols': ['quality'],
+            'rename_map': {'quality': 'sleep_quality'},
+            'description': 'datos de sueño'
+        },
+        'work': {
+            'value_cols': ['intensity'],
+            'rename_map': {'intensity': 'work_intensity'},
+            'description': 'datos de trabajo'
+        },
+        'exercise': {
+            'value_cols': ['intensity', 'duration'],
+            'rename_map': {'intensity': 'exercise_intensity', 'duration': 'exercise_duration'},
+            'description': 'datos de ejercicio'
+        }
+    }
     
-    def standardize_timestamp_column(df: pl.DataFrame) -> pl.DataFrame:
-        """Estandariza el nombre de la columna de timestamp y su tipo de datos"""
-        if 'Timestamp' in df.columns:
-            df = df
-        elif 'ts' in df.columns:
+    for data_type, config in contextual_mappings.items():
+        if data_type in processed_data and not processed_data[data_type].is_empty():
+            contextual_df = processed_data[data_type].clone()
+            
+            # Estandarizar el DataFrame contextual
+            try:
+                contextual_df = _standardize_contextual_dataframe(contextual_df, data_type)
+            except Exception as e:
+                print_warning(f"Error estandarizando DataFrame {data_type}: {e}")
+                continue
+            
+            # Verificar que las columnas de valor existen
+            available_cols = [col for col in config['value_cols'] if col in contextual_df.columns]
+            if not available_cols:
+                print_warning(f"No se encontraron columnas de valor para {data_type}: {config['value_cols']}")
+                continue
+            
+            # Preparar DataFrame para join
+            contextual_df_for_join = _prepare_contextual_df_for_join(
+                contextual_df, available_cols, config['rename_map']
+            )
+            
+            # Realizar join asof
+            joined_df = _perform_contextual_join_asof(
+                joined_df, 
+                contextual_df_for_join, 
+                data_type.capitalize()
+            )
+            
+            print_info(f"Unión exitosa con {config['description']}: {len(available_cols)} columnas añadidas")
+    
+    return joined_df
+
+def _standardize_contextual_dataframe(contextual_df: pl.DataFrame, data_type: str) -> pl.DataFrame:
+    """
+    Estandariza un DataFrame contextual para prepararlo para join.
+
+    Parámetros:
+    -----------
+    contextual_df : pl.DataFrame
+        DataFrame contextual original.
+    data_type : str
+        Tipo de datos contextuales.
+
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame contextual estandarizado.
+    """
+    # Verificar y estandarizar columna de timestamp
+    timestamp_candidates = ['Timestamp', 'ts', 'ts_begin', 'Time']
+    timestamp_col = None
+    
+    for candidate in timestamp_candidates:
+        if candidate in contextual_df.columns:
+            timestamp_col = candidate
+            break
+    
+    if timestamp_col is None:
+        raise ValueError(f"No se encontró columna de timestamp en DataFrame {data_type}")
+    
+    # Renombrar a Timestamp si es necesario
+    if timestamp_col != 'Timestamp':
+        contextual_df = contextual_df.rename({timestamp_col: 'Timestamp'})
+    
+    # Asegurar que Timestamp es datetime
+    if contextual_df['Timestamp'].dtype not in [pl.Datetime, pl.Datetime(time_unit="us"), pl.Datetime(time_unit="ms")]:
+        try:
+            contextual_df = contextual_df.with_columns(
+                pl.col('Timestamp').cast(pl.Datetime(time_unit="us"))
+            )
+        except Exception as e:
+            print_error(f"No se pudo convertir Timestamp a datetime en {data_type}: {e}")
+            raise
+    
+    # Verificar que SubjectID existe
+    if 'SubjectID' not in contextual_df.columns:
+        raise ValueError(f"Columna 'SubjectID' no encontrada en DataFrame {data_type}")
+    
+    return contextual_df.sort(['SubjectID', 'Timestamp'])
+
+
+def _prepare_contextual_df_for_join(
+    contextual_df: pl.DataFrame, 
+    value_cols: List[str], 
+    rename_map: Dict[str, str]
+) -> pl.DataFrame:
+    """
+    Prepara un DataFrame contextual para join renombrando columnas apropiadamente.
+
+    Parámetros:
+    -----------
+    contextual_df : pl.DataFrame
+        DataFrame contextual original.
+    value_cols : List[str]
+        Lista de columnas de valor disponibles.
+    rename_map : Dict[str, str]
+        Mapeo de nombres de columnas originales a nuevos nombres.
+
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame preparado para join.
+    """
+    # Seleccionar columnas necesarias para el join
+    required_cols = ['Timestamp', 'SubjectID'] + value_cols
+    available_cols = [col for col in required_cols if col in contextual_df.columns]
+    
+    prepared_df = contextual_df.select(available_cols)
+    
+    # Renombrar columnas según el mapeo
+    rename_expressions = []
+    for old_name, new_name in rename_map.items():
+        if old_name in prepared_df.columns:
+            rename_expressions.append(pl.col(old_name).alias(new_name))
+    
+    # Mantener columnas que no necesitan renombre
+    keep_cols = ['Timestamp', 'SubjectID']
+    for col in keep_cols:
+        if col in prepared_df.columns:
+            rename_expressions.append(pl.col(col))
+    
+    if rename_expressions:
+        prepared_df = prepared_df.select(rename_expressions)
+    
+    return prepared_df
+
+
+def _perform_contextual_join_asof(
+    base_df: pl.DataFrame,
+    contextual_df: pl.DataFrame,
+    data_type_name: str
+) -> pl.DataFrame:
+    """
+    Realiza un join_asof seguro con datos contextuales.
+
+    Parámetros:
+    -----------
+    base_df : pl.DataFrame
+        DataFrame base para el join.
+    contextual_df : pl.DataFrame
+        DataFrame contextual a unir.
+    data_type_name : str
+        Nombre descriptivo del tipo de datos.
+
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame resultante del join.
+    """
+    if contextual_df.is_empty():
+        print_warning(f"DataFrame {data_type_name} está vacío, saltando join")
+        return base_df
+    
+    try:
+        # Realizar join_asof
+        joined_df = base_df.join_asof(
+            contextual_df,
+            on='Timestamp',
+            by='SubjectID',
+            tolerance='15m'  # Tolerancia mayor para datos contextuales
+        )
+        
+        print_debug(f"Join exitoso con {data_type_name}: {joined_df.shape}")
+        return joined_df
+        
+    except Exception as e:
+        print_error(f"Error en join_asof con {data_type_name}: {e}")
+        # En caso de error, devolver el DataFrame base sin modificar
+        return base_df
+
+
+def _create_contextual_event_indicators(joined_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Crea indicadores binarios para eventos contextuales.
+
+    Parámetros:
+    -----------
+    joined_df : pl.DataFrame
+        DataFrame con datos unidos.
+
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con indicadores de eventos añadidos.
+    """
+    # Definir umbrales para crear indicadores binarios
+    event_thresholds = {
+        'sleep_quality': {'threshold': 0, 'indicator_name': 'sleep_event'},
+        'work_intensity': {'threshold': 0, 'indicator_name': 'work_event'},
+        'exercise_intensity': {'threshold': 0, 'indicator_name': 'exercise_event'}
+    }
+    
+    expressions = []
+    
+    for col, config in event_thresholds.items():
+        if col in joined_df.columns:
+            # Crear indicador binario (1 si valor > umbral, 0 si no)
+            indicator_expr = (
+                pl.col(col).is_not_null() & (pl.col(col) > config['threshold'])
+            ).cast(pl.Float64).alias(config['indicator_name'])
+            
+            expressions.append(indicator_expr)
+    
+    if expressions:
+        joined_df = joined_df.with_columns(expressions)
+    
+    return joined_df
+
+def _standardize_timestamp_column(df: pl.DataFrame, df_name: str) -> pl.DataFrame:
+    """
+    Estandariza el nombre de la columna de timestamp y su tipo de datos de forma segura,
+    evitando duplicados.
+    
+    Parámetros:
+    -----------
+    df : pl.DataFrame
+        DataFrame a estandarizar.
+    df_name : str
+        Nombre descriptivo del DataFrame para logging.
+        
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con columna Timestamp estandarizada sin duplicados.
+    """
+    # Verificar si ya tiene 'Timestamp' y eliminar duplicados si existen
+    timestamp_cols = [col for col in df.columns if 'Timestamp' in col]
+    
+    if len(timestamp_cols) > 1:
+        print_warning(f"Múltiples columnas Timestamp en {df_name}: {timestamp_cols}")
+        # Mantener solo 'Timestamp' principal, eliminar otras
+        cols_to_drop = [col for col in timestamp_cols if col != 'Timestamp']
+        if cols_to_drop:
+            df = df.drop(cols_to_drop)
+    
+    # Si no tiene 'Timestamp', buscar alternativas
+    if 'Timestamp' not in df.columns:
+        if 'ts' in df.columns:
             df = df.rename({'ts': 'Timestamp'})
+        elif 'ts_begin' in df.columns:
+            df = df.rename({'ts_begin': 'Timestamp'})
         elif 'Time' in df.columns:
             df = df.rename({'Time': 'Timestamp'})
         else:
-            raise ValueError(f"No se encontró columna de timestamp en DataFrame. Columnas disponibles: {df.columns}")
-        
-        # Asegurar que Timestamp es datetime
-        if df['Timestamp'].dtype != pl.Datetime:
-            try:
-                # Intentar diferentes formatos de fecha
-                formats = [
-                    "%Y-%m-%d %H:%M:%S",
-                    "%d-%m-%Y %H:%M:%S",
-                    "%m-%d-%Y %H:%M:%S",
-                    "%Y/%m/%d %H:%M:%S",
-                    "%d/%m/%Y %H:%M:%S"
-                ]
-                
-                for fmt in formats:
-                    try:
-                        df = df.with_columns(
-                            pl.col('Timestamp').str.strptime(pl.Datetime, fmt)
-                        )
-                        break
-                    except Exception:
-                        continue
-                else:
-                    raise ValueError("No se pudo convertir Timestamp a datetime con ningún formato conocido")
-                    
-            except Exception as e:
-                logging.error(f"No se pudo convertir Timestamp a datetime: {e}")
-                raise
-        
-        return df
+            raise ValueError(f"No se encontró columna de timestamp válida en DataFrame {df_name}. Columnas disponibles: {df.columns}")
     
+    # Asegurar que Timestamp es datetime
+    if df['Timestamp'].dtype != pl.Datetime(time_unit="us"):
+        df = _convert_timestamp_to_datetime(df)
+    
+    return df
+
+def _convert_timestamp_to_datetime(df: pl.DataFrame) -> pl.DataFrame:
+    """Convierte la columna Timestamp a datetime probando diferentes formatos"""
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+        "%m-%d-%Y %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S"
+    ]
+    
+    for fmt in formats:
+        try:
+            return df.with_columns(
+                pl.col('Timestamp').str.strptime(pl.Datetime, fmt)
+            )
+        except Exception:
+            continue
+    
+    raise ValueError("No se pudo convertir Timestamp a datetime con ningún formato conocido")
+
+def _validate_critical_columns(cgm_df: pl.DataFrame, bolus_df: pl.DataFrame) -> None:
+    """Valida que existan las columnas críticas necesarias"""
+    if 'value' not in cgm_df.columns:
+        raise ValueError("Columna 'value' no encontrada en cgm_df")
+    if 'bolus' not in bolus_df.columns:
+        raise ValueError("Columna 'bolus' no encontrada en bolus_df")
+
+def _join_bolus_data(cgm_df: pl.DataFrame, bolus_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Une datos de CGM con datos de bolus de forma segura evitando duplicados de columnas.
+    
+    Parámetros:
+    -----------
+    cgm_df : pl.DataFrame
+        DataFrame CGM.
+    bolus_df : pl.DataFrame
+        DataFrame bolus.
+        
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con datos unidos sin duplicados de columnas.
+    """
+    # Verificar columnas comunes antes del join (excluyendo las de join)
+    common_cols = set(cgm_df.columns) & set(bolus_df.columns)
+    join_cols = {'Timestamp', 'SubjectID'}
+    conflicting_cols = common_cols - join_cols
+    
+    if conflicting_cols:
+        print_debug(f"Columnas en conflicto CGM-Bolus: {conflicting_cols}")
+        # Eliminar columnas conflictivas del DataFrame de bolus
+        bolus_for_join = bolus_df.drop(list(conflicting_cols))
+    else:
+        bolus_for_join = bolus_df
+    
+    joined_df = cgm_df.join_asof(
+        bolus_for_join,
+        on='Timestamp',
+        by='SubjectID',
+        tolerance='5m'
+    )
+    
+    # Verificar que las columnas críticas se mantuvieron
+    if 'value' not in joined_df.columns:
+        raise ValueError("Columna 'value' perdida después de join con bolus")
+    if 'bolus' not in joined_df.columns:
+        raise ValueError("Columna 'bolus' perdida después de join con bolus")
+    
+    return joined_df
+
+def _join_meal_data(joined_df: pl.DataFrame, meal_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Une datos de comidas al DataFrame ya unido de forma segura.
+    
+    Parámetros:
+    -----------
+    joined_df : pl.DataFrame
+        DataFrame con datos ya unidos.
+    meal_df : pl.DataFrame
+        DataFrame meal.
+        
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con datos de meal unidos sin duplicados.
+    """
+    # Verificar columnas comunes antes del join (excluyendo las de join)
+    common_cols = set(joined_df.columns) & set(meal_df.columns)
+    join_cols = {'Timestamp', 'SubjectID'}
+    conflicting_cols = common_cols - join_cols
+    
+    if conflicting_cols:
+        print_debug(f"Columnas en conflicto Joined-Meal: {conflicting_cols}")
+        # Eliminar columnas conflictivas del DataFrame de meal
+        meal_for_join = meal_df.drop(list(conflicting_cols))
+    else:
+        meal_for_join = meal_df
+    
+    joined_df = joined_df.join_asof(
+        meal_for_join,
+        on='Timestamp',
+        by='SubjectID',
+        tolerance='5m'
+    )
+    
+    # Verificar que las columnas críticas se mantuvieron
+    if 'value' not in joined_df.columns:
+        raise ValueError("Columna 'value' perdida después de join con meal")
+    if 'bolus' not in joined_df.columns:
+        raise ValueError("Columna 'bolus' perdida después de join con bolus")
+    
+    return joined_df
+
+def _join_physiological_data(joined_df: pl.DataFrame, physiological_df: pl.DataFrame) -> pl.DataFrame:
+    """Une datos fisiológicos al DataFrame ya unido"""
+    # Filtrar valores nulos antes de unir
+    physiological_df = physiological_df.filter(pl.col('value').is_not_null())
+    
+    # Renombrar columna value a physiological_value antes de unir
+    physiological_df = physiological_df.rename({'value': 'physiological_value'})
+    
+    joined_df = joined_df.join_asof(
+        physiological_df,
+        on='Timestamp',
+        by='SubjectID',
+        tolerance='5m',
+        suffix='_physio'
+    )
+    
+    return joined_df
+
+def _prepare_dataframes_for_join(cgm_df: pl.DataFrame, bolus_df: pl.DataFrame, 
+                                     meal_df: pl.DataFrame, physiological_df: Optional[pl.DataFrame]) -> tuple:
+    """
+    Prepara todos los DataFrames estandarizando timestamps y ordenando de forma segura,
+    eliminando duplicados de columnas Timestamp.
+    
+    Parámetros:
+    -----------
+    cgm_df : pl.DataFrame
+        DataFrame CGM.
+    bolus_df : pl.DataFrame
+        DataFrame bolus.
+    meal_df : pl.DataFrame
+        DataFrame meal.
+    physiological_df : Optional[pl.DataFrame]
+        DataFrame fisiológico opcional.
+        
+    Retorna:
+    --------
+    tuple
+        Tupla con DataFrames preparados sin duplicados de Timestamp.
+    """
     # Estandarizar nombres de columnas de timestamp y tipos de datos
-    cgm_df = standardize_timestamp_column(cgm_df)
-    bolus_df = standardize_timestamp_column(bolus_df)
-    meal_df = standardize_timestamp_column(meal_df)
+    cgm_df = _standardize_timestamp_column(cgm_df, "CGM")
+    bolus_df = _standardize_timestamp_column(bolus_df, "Bolus")
+    meal_df = _standardize_timestamp_column(meal_df, "Meal")
     
     if physiological_df is not None:
-        physiological_df = standardize_timestamp_column(physiological_df)
+        physiological_df = _standardize_timestamp_column(physiological_df, "Physiological")
     
     # Asegurar que los DataFrames estén ordenados por timestamp y SubjectID
     cgm_df = cgm_df.sort(['SubjectID', 'Timestamp'])
@@ -608,91 +1190,84 @@ def join_signals(cgm_df: pl.DataFrame,
     if physiological_df is not None:
         physiological_df = physiological_df.sort(['SubjectID', 'Timestamp'])
     
-    # Unir bolus y meal primero
+    return cgm_df, bolus_df, meal_df, physiological_df
+
+def join_signals(cgm_df: pl.DataFrame, 
+                bolus_df: pl.DataFrame, 
+                meal_df: pl.DataFrame,
+                physiological_df: Optional[pl.DataFrame] = None,
+                processed_data: Optional[Dict[str, pl.DataFrame]] = None) -> pl.DataFrame:
+    """
+    Une las diferentes señales temporales usando join_asof de forma segura, incluyendo 
+    datos de sueño, trabajo y ejercicio, evitando duplicados de columnas Timestamp.
+
+    Parámetros:
+    -----------
+    cgm_df : pl.DataFrame
+        DataFrame con datos CGM.
+    bolus_df : pl.DataFrame
+        DataFrame con datos de bolus.
+    meal_df : pl.DataFrame
+        DataFrame con datos de comidas.
+    physiological_df : Optional[pl.DataFrame], opcional
+        DataFrame con datos fisiológicos (default: None).
+    processed_data : Optional[Dict[str, pl.DataFrame]], opcional
+        Diccionario con DataFrames procesados que incluye sleep, work, exercise (default: None).
+
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con todas las señales unidas.
+    """
     try:
-        # Asegurar que la columna value existe en cgm_df
-        if 'value' not in cgm_df.columns:
-            logging.error("Columna 'value' no encontrada en cgm_df")
-            raise ValueError("Columna 'value' no encontrada en cgm_df")
-            
-        # Asegurar que la columna bolus existe en bolus_df
-        if 'bolus' not in bolus_df.columns:
-            logging.error("Columna 'bolus' no encontrada en bolus_df")
-            raise ValueError("Columna 'bolus' no encontrada en bolus_df")
+        print_debug(f"Iniciando join_signals - CGM: {cgm_df.shape}, Bolus: {bolus_df.shape}, Meal: {meal_df.shape}")
         
-        # Unir con bolus sin sufijo para preservar el nombre de la columna
-        joined_df = cgm_df.join_asof(
-            bolus_df,
-            on='Timestamp',
-            by='SubjectID',
-            tolerance='5m'
+        # Preparar DataFrames eliminando duplicados de Timestamp
+        cgm_df, bolus_df, meal_df, physiological_df = _prepare_dataframes_for_join(
+            cgm_df, bolus_df, meal_df, physiological_df
         )
         
-        # Verificar que las columnas críticas están presentes
-        if 'value' not in joined_df.columns:
-            logging.error("Columna 'value' perdida después de join con bolus")
-            raise ValueError("Columna 'value' perdida después de join con bolus")
-        if 'bolus' not in joined_df.columns:
-            logging.error("Columna 'bolus' perdida después de join con bolus")
-            raise ValueError("Columna 'bolus' perdida después de join con bolus")
+        # Validar columnas críticas
+        _validate_critical_columns(cgm_df, bolus_df)
         
-        # Unir con meal usando sufijo específico
-        joined_df = joined_df.join_asof(
-            meal_df,
-            on='Timestamp',
-            by='SubjectID',
-            tolerance='5m',
-            suffix='_meal'
-        )
+        # Unir datos paso a paso usando funciones seguras
+        joined_df = _join_bolus_data(cgm_df, bolus_df)
+        print_debug(f"Después de join bolus: {joined_df.shape}, columnas: {len(joined_df.columns)}")
         
-        # Verificar nuevamente las columnas críticas
-        if 'value' not in joined_df.columns:
-            logging.error("Columna 'value' perdida después de join con meal")
-            raise ValueError("Columna 'value' perdida después de join con meal")
-        if 'bolus' not in joined_df.columns:
-            logging.error("Columna 'bolus' perdida después de join con meal")
-            raise ValueError("Columna 'bolus' perdida después de join con meal")
+        joined_df = _join_meal_data(joined_df, meal_df)
+        print_debug(f"Después de join meal: {joined_df.shape}, columnas: {len(joined_df.columns)}")
         
         # Unir datos fisiológicos si existen
         if physiological_df is not None:
-            # Filtrar valores nulos antes de unir
-            physiological_df = physiological_df.filter(pl.col('value').is_not_null())
-            
-            # Renombrar columna value a physiological_value antes de unir
-            physiological_df = physiological_df.rename({'value': 'physiological_value'})
-            
-            # Unir datos fisiológicos usando sufijo específico
-            joined_df = joined_df.join_asof(
-                physiological_df,
-                on='Timestamp',
-                by='SubjectID',
-                tolerance='5m',
-                suffix='_physio'
-            )
-            
-            # Calcular porcentaje de valores no nulos
-            if 'physiological_value' in joined_df.columns:
-                non_null_percentage = (joined_df['physiological_value'].is_not_null().sum() / len(joined_df)) * 100
-                # logging.info(f"Señal physiological_value: {non_null_percentage:.1f}% valores no nulos")
+            joined_df = _join_physiological_data(joined_df, physiological_df)
+            print_debug(f"Después de join physiological: {joined_df.shape}")
         
-        # Verificar columnas críticas una última vez
-        if 'value' not in joined_df.columns:
-            logging.error("Columna 'value' perdida después de join con physiological")
-            raise ValueError("Columna 'value' perdida después de join con physiological")
-        if 'bolus' not in joined_df.columns:
-            logging.error("Columna 'bolus' perdida después de join con physiological")
-            raise ValueError("Columna 'bolus' perdida después de join con physiological")
+        # Unir con datos contextuales si están disponibles
+        if processed_data is not None:
+            joined_df = _join_contextual_data(joined_df, processed_data)
+            print_debug(f"Después de join contextual: {joined_df.shape}")
         
-        # Registrar forma final y columnas presentes
-        # logging.info(f"Forma de datos unidos: {joined_df.shape}")
-        # logging.info(f"Columnas presentes: {joined_df.columns}")
+        # Verificación final de columnas críticas
+        if 'value' not in joined_df.columns or 'bolus' not in joined_df.columns:
+            raise ValueError("Columnas críticas perdidas durante el proceso de join")
         
+        # Verificación final de duplicados de Timestamp
+        timestamp_cols = [col for col in joined_df.columns if 'Timestamp' in col]
+        if len(timestamp_cols) > 1:
+            print_warning(f"Múltiples columnas Timestamp detectadas al final: {timestamp_cols}")
+            # Mantener solo la principal
+            cols_to_drop = [col for col in timestamp_cols if col != 'Timestamp']
+            joined_df = joined_df.drop(cols_to_drop)
+        
+        print_debug(f"Join signals completado exitosamente: {joined_df.shape}")
         return joined_df
         
     except Exception as e:
-        logging.error(f"Error en join_signals: {e}")
-        raise
-
+        print_error(f"Error en join_signals: {e}")
+        print_error(f"CGM columnas: {cgm_df.columns}")
+        print_error(f"Bolus columnas: {bolus_df.columns}")
+        print_error(f"Meal columnas: {meal_df.columns}")
+    
 def ensure_timestamp_datetime(df: pl.DataFrame, col: str = TIMESTAMP_COL) -> pl.DataFrame:
     """
     Convierte la columna de timestamp a pl.Datetime, tolerando diferentes formatos.
@@ -1009,6 +1584,105 @@ def compute_enhanced_meal_context(bolus_time: datetime, meal_df: pl.DataFrame,
         'meal_timing_score': timing_score
     }
 
+def _get_default_risk_indicators() -> Dict[str, float]:
+    """Retorna indicadores de riesgo por defecto cuando no hay datos de glucosa."""
+    return {
+        'hypo_risk': 0.0,
+        'hyper_risk': 0.0,
+        'variability_risk': 0.0,
+        'sleep_hypo_risk': 0.0,
+        'activity_hypo_risk': 0.0,
+        'stress_hyper_risk': 0.0,
+        'overall_risk': 0.0
+    }
+
+def _calculate_basic_glucose_risks(glucose_values: List[float]) -> tuple[float, float, float]:
+    """Calcula riesgos básicos de hipoglucemia, hiperglucemia y variabilidad."""
+    hypo_threshold = CONFIG_PROCESSING.get('hypo_threshold', 70)
+    hyper_threshold = CONFIG_PROCESSING.get('hyper_threshold', 180)
+    
+    hypo_count = sum(1 for g in glucose_values if g < hypo_threshold)
+    hyper_count = sum(1 for g in glucose_values if g > hyper_threshold)
+    
+    hypo_risk = hypo_count / len(glucose_values)
+    hyper_risk = hyper_count / len(glucose_values)
+    
+    # Calcular riesgo de variabilidad
+    if len(glucose_values) > 1:
+        glucose_std = np.std(glucose_values)
+        variability_risk = min(1.0, glucose_std / 50.0)
+    else:
+        variability_risk = 0.0
+    
+    return hypo_risk, hyper_risk, variability_risk
+
+def _calculate_contextual_risk(event_name: str, physiological_data: Dict[str, List[float]], 
+                              glucose_values: List[float], threshold: float, 
+                              is_hypo_risk: bool = True) -> float:
+    """Calcula riesgo contextual para un tipo específico de evento."""
+    if event_name not in physiological_data:
+        return 0.0
+    
+    event_indices = [i for i, event in enumerate(physiological_data[event_name]) 
+                    if event > 0 and i < len(glucose_values)]
+    
+    if not event_indices:
+        return 0.0
+    
+    event_glucose = [glucose_values[i] for i in event_indices]
+    
+    if is_hypo_risk:
+        risk_count = sum(1 for g in event_glucose if g < threshold)
+    else:
+        risk_count = sum(1 for g in event_glucose if g > threshold)
+    
+    return risk_count / len(event_glucose)
+
+def _calculate_physiological_risks(physiological_data: Optional[Dict[str, List[float]]], 
+                                  glucose_values: List[float]) -> tuple[float, float, float]:
+    """Calcula riesgos fisiológicos específicos."""
+    if physiological_data is None:
+        return 0.0, 0.0, 0.0
+    
+    hypo_threshold = CONFIG_PROCESSING.get('hypo_threshold', 70)
+    hyper_threshold = CONFIG_PROCESSING.get('hyper_threshold', 180)
+    
+    sleep_hypo_risk = _calculate_contextual_risk(
+        'sleep_event', physiological_data, glucose_values, hypo_threshold, True
+    )
+    
+    activity_hypo_risk = _calculate_contextual_risk(
+        'work_event', physiological_data, glucose_values, hypo_threshold, True
+    )
+    
+    stress_hyper_risk = _calculate_contextual_risk(
+        'stressors_event', physiological_data, glucose_values, hyper_threshold, False
+    )
+    
+    return sleep_hypo_risk, activity_hypo_risk, stress_hyper_risk
+
+def _calculate_overall_risk(hypo_risk: float, hyper_risk: float, variability_risk: float,
+                           sleep_hypo_risk: float, activity_hypo_risk: float, 
+                           stress_hyper_risk: float) -> float:
+    """Calcula el riesgo general ponderado."""
+    risk_weights = CONFIG_PROCESSING.get('risk_weights', {
+        'hypo': 0.3,
+        'hyper': 0.3,
+        'variability': 0.2,
+        'sleep_hypo': 0.1,
+        'activity_hypo': 0.05,
+        'stress_hyper': 0.05
+    })
+    
+    return (
+        risk_weights['hypo'] * hypo_risk +
+        risk_weights['hyper'] * hyper_risk +
+        risk_weights['variability'] * variability_risk +
+        risk_weights['sleep_hypo'] * sleep_hypo_risk +
+        risk_weights['activity_hypo'] * activity_hypo_risk +
+        risk_weights['stress_hyper'] * stress_hyper_risk
+    )
+
 def compute_clinical_risk_indicators(glucose_values: List[float], 
                                    physiological_data: Optional[Dict[str, List[float]]] = None,
                                    time_values: Optional[List[datetime]] = None) -> Dict[str, float]:
@@ -1030,86 +1704,20 @@ def compute_clinical_risk_indicators(glucose_values: List[float],
         Diccionario con indicadores de riesgo clínico
     """
     if not glucose_values:
-        return {
-            'hypo_risk': 0.0,
-            'hyper_risk': 0.0,
-            'variability_risk': 0.0,
-            'sleep_hypo_risk': 0.0,
-            'activity_hypo_risk': 0.0,
-            'stress_hyper_risk': 0.0,
-            'overall_risk': 0.0
-        }
-    
-    # Obtener umbrales con valores por defecto si no están en CONFIG
-    hypo_threshold = CONFIG_PROCESSING.get('hypo_threshold', 70)
-    hyper_threshold = CONFIG_PROCESSING.get('hyper_threshold', 180)
+        return _get_default_risk_indicators()
     
     # Calcular riesgos básicos
-    hypo_count = sum(1 for g in glucose_values if g < hypo_threshold)
-    hyper_count = sum(1 for g in glucose_values if g > hyper_threshold)
+    hypo_risk, hyper_risk, variability_risk = _calculate_basic_glucose_risks(glucose_values)
     
-    hypo_risk = hypo_count / len(glucose_values)
-    hyper_risk = hyper_count / len(glucose_values)
+    # Calcular riesgos fisiológicos
+    sleep_hypo_risk, activity_hypo_risk, stress_hyper_risk = _calculate_physiological_risks(
+        physiological_data, glucose_values
+    )
     
-    # Calcular riesgo de variabilidad
-    if len(glucose_values) > 1:
-        glucose_std = np.std(glucose_values)
-        variability_risk = min(1.0, glucose_std / 50.0)  # Normalizar a [0,1]
-    else:
-        variability_risk = 0.0
-    
-    # Inicializar riesgos específicos
-    sleep_hypo_risk = 0.0
-    activity_hypo_risk = 0.0
-    stress_hyper_risk = 0.0
-    
-    # Ajustar riesgos basados en señales fisiológicas si están disponibles
-    if physiological_data is not None and time_values is not None:
-        # Riesgo de hipoglucemia durante el sueño
-        if 'sleep_event' in physiological_data:
-            sleep_indices = [i for i, sleep in enumerate(physiological_data['sleep_event']) 
-                           if sleep > 0 and i < len(glucose_values)]
-            if sleep_indices:
-                sleep_glucose = [glucose_values[i] for i in sleep_indices]
-                sleep_hypo_count = sum(1 for g in sleep_glucose if g < hypo_threshold)
-                sleep_hypo_risk = sleep_hypo_count / len(sleep_glucose)
-        
-        # Riesgo de hipoglucemia durante actividad
-        if 'work_event' in physiological_data:
-            activity_indices = [i for i, work in enumerate(physiological_data['work_event']) 
-                              if work > 0 and i < len(glucose_values)]
-            if activity_indices:
-                activity_glucose = [glucose_values[i] for i in activity_indices]
-                activity_hypo_count = sum(1 for g in activity_glucose if g < hypo_threshold)
-                activity_hypo_risk = activity_hypo_count / len(activity_glucose)
-        
-        # Riesgo de hiperglucemia durante estrés
-        if 'stressors_event' in physiological_data:
-            stress_indices = [i for i, stress in enumerate(physiological_data['stressors_event']) 
-                            if stress > 0 and i < len(glucose_values)]
-            if stress_indices:
-                stress_glucose = [glucose_values[i] for i in stress_indices]
-                stress_hyper_count = sum(1 for g in stress_glucose if g > hyper_threshold)
-                stress_hyper_risk = stress_hyper_count / len(stress_glucose)
-    
-    # Obtener pesos de riesgo con valores por defecto
-    risk_weights = CONFIG_PROCESSING.get('risk_weights', {
-        'hypo': 0.3,
-        'hyper': 0.3,
-        'variability': 0.2,
-        'sleep_hypo': 0.1,
-        'activity_hypo': 0.05,
-        'stress_hyper': 0.05
-    })
-    
-    # Calcular riesgo general ponderado
-    overall_risk = (
-        risk_weights['hypo'] * hypo_risk +
-        risk_weights['hyper'] * hyper_risk +
-        risk_weights['variability'] * variability_risk +
-        risk_weights['sleep_hypo'] * sleep_hypo_risk +
-        risk_weights['activity_hypo'] * activity_hypo_risk +
-        risk_weights['stress_hyper'] * stress_hyper_risk
+    # Calcular riesgo general
+    overall_risk = _calculate_overall_risk(
+        hypo_risk, hyper_risk, variability_risk,
+        sleep_hypo_risk, activity_hypo_risk, stress_hyper_risk
     )
     
     return {
@@ -1122,60 +1730,116 @@ def compute_clinical_risk_indicators(glucose_values: List[float],
         'overall_risk': overall_risk
     }
 
+def _extract_basic_glucose_stats(cgm_window: list) -> dict:
+    """Extrae estadísticas básicas de la ventana CGM."""
+    if not cgm_window:
+        return {
+            "glucose_last": 120.0,
+            "glucose_mean": 120.0,
+            "glucose_std": 0.0,
+            "glucose_min": 120.0,
+            "glucose_max": 120.0,
+        }
+    
+    return {
+        "glucose_last": cgm_window[-1],
+        "glucose_mean": float(np.mean(cgm_window)),
+        "glucose_std": float(np.std(cgm_window)),
+        "glucose_min": float(np.min(cgm_window)),
+        "glucose_max": float(np.max(cgm_window)),
+    }
+
+def _extract_exercise_features(row: dict) -> dict:
+    """Extrae características relacionadas con ejercicio."""
+    return {
+        "exercise_intensity": row.get("exercise_intensity", 0.0),
+        "exercise_duration": row.get("exercise_duration", 0.0),
+        "exercise_in_window": row.get("exercise_in_window", 0.0),
+        "steps_in_window": row.get("steps_in_window", 0.0),
+    }
+
+def _extract_hypo_features(row: dict) -> dict:
+    """Extrae características de eventos hipoglucémicos."""
+    return {
+        "hypo_event_in_window": row.get("hypo_event_in_window", 0.0)
+    }
+
+def _extract_basal_features(row: dict) -> dict:
+    """Extrae características de insulina basal."""
+    return {
+        "effective_basal_rate": row.get("effective_basal_rate", 0.0),
+        "temp_basal_active": row.get("temp_basal_active", 0.0)
+    }
+
+def _extract_glucose_patterns_24h(row: dict, extended_cgm_df: pl.DataFrame) -> dict:
+    """Extrae patrones de glucosa de 24 horas."""
+    if extended_cgm_df is None:
+        return {}
+    
+    subject_id = row[SUBJECT_ID_COL]
+    ts = row[TIMESTAMP_COL]
+    window_start = ts - timedelta(hours=24)
+    
+    extended_window = extended_cgm_df.filter(
+        (pl.col(SUBJECT_ID_COL) == subject_id) &
+        (pl.col(TIMESTAMP_COL) >= window_start) &
+        (pl.col(TIMESTAMP_COL) <= ts)
+    ).sort(TIMESTAMP_COL)
+    
+    if extended_window.height >= 288:  # 24 horas a 5 min
+        return compute_glucose_patterns_24h(extended_window[GLUCOSE_COL].to_list())
+    else:
+        return compute_glucose_patterns_24h([])
+
+def _apply_transformations(enhanced_df: pl.DataFrame) -> pl.DataFrame:
+    """Aplica transformaciones logarítmicas y normalización."""
+    # Normalización y log1p
+    log_cols = [BOLUS_COL, MEAL_COL, "effective_basal_rate", "exercise_intensity", "exercise_duration", "steps_in_window"]
+    for col in log_cols:
+        if col in enhanced_df.columns:
+            enhanced_df = enhanced_df.with_columns(
+                pl.col(col).log1p().alias(f"{col}_log1p")
+            )
+    
+    # Normalizar features binarios
+    binary_cols = ["exercise_in_window", "hypo_event_in_window", "temp_basal_active", "has_meal", "significant_meal"]
+    for col in binary_cols:
+        if col in enhanced_df.columns:
+            enhanced_df = enhanced_df.with_columns(
+                pl.col(col).cast(pl.Float64)
+            )
+    
+    return enhanced_df
+
 def extract_features(df: pl.DataFrame, meal_df: pl.DataFrame, extended_cgm_df: pl.DataFrame = None) -> pl.DataFrame:
     """
     Extrae características mejoradas para DRL, incluyendo contexto de basal, ejercicio, pasos, hipo_event.
     """
-    logging.info("Extrayendo características mejoradas para DRL...")
+    print_info("Extrayendo características mejoradas para DRL...")
     enhanced_rows = []
+    
     for row in df.iter_rows(named=True):
         # Features base
         cgm_window = row.get("cgm_window", [])
-        basic_stats = {
-            "glucose_last": cgm_window[-1] if cgm_window else 120.0,
-            "glucose_mean": float(np.mean(cgm_window)) if cgm_window else 120.0,
-            "glucose_std": float(np.std(cgm_window)) if cgm_window else 0.0,
-            "glucose_min": float(np.min(cgm_window)) if cgm_window else 120.0,
-            "glucose_max": float(np.max(cgm_window)) if cgm_window else 120.0,
-        }
+        basic_stats = _extract_basic_glucose_stats(cgm_window)
+        
         # Contexto de tiempo
         time_features = encode_time_cyclical(row[TIMESTAMP_COL])
+        
         # Contexto de comidas
         meal_context = compute_enhanced_meal_context(row[TIMESTAMP_COL], meal_df)
+        
         # Riesgo clínico
         iob = row.get("insulin_on_board", 0.0)
         risk_indicators = compute_clinical_risk_indicators(cgm_window, iob)
-        # Contexto de ejercicio y pasos
-        exercise_features = {
-            "exercise_intensity": row.get("exercise_intensity", 0.0),
-            "exercise_duration": row.get("exercise_duration", 0.0),
-            "exercise_in_window": row.get("exercise_in_window", 0.0),
-            "steps_in_window": row.get("steps_in_window", 0.0),
-        }
-        # Hipo-evento
-        hypo_features = {
-            "hypo_event_in_window": row.get("hypo_event_in_window", 0.0)
-        }
-        # Basal
-        basal_features = {
-            "effective_basal_rate": row.get("effective_basal_rate", 0.0),
-            "temp_basal_active": row.get("temp_basal_active", 0.0)
-        }
-        # Patrones de glucosa de 24h si hay datos extendidos
-        glucose_patterns = {}
-        if extended_cgm_df is not None:
-            subject_id = row[SUBJECT_ID_COL]
-            ts = row[TIMESTAMP_COL]
-            window_start = ts - timedelta(hours=24)
-            extended_window = extended_cgm_df.filter(
-                (pl.col(SUBJECT_ID_COL) == subject_id) &
-                (pl.col(TIMESTAMP_COL) >= window_start) &
-                (pl.col(TIMESTAMP_COL) <= ts)
-            ).sort(TIMESTAMP_COL)
-            if extended_window.height >= 288:  # 24 horas a 5 min
-                glucose_patterns = compute_glucose_patterns_24h(extended_window[GLUCOSE_COL].to_list())
-            else:
-                glucose_patterns = compute_glucose_patterns_24h([])
+        
+        # Características específicas
+        exercise_features = _extract_exercise_features(row)
+        hypo_features = _extract_hypo_features(row)
+        basal_features = _extract_basal_features(row)
+        
+        # Patrones de glucosa de 24h
+        glucose_patterns = _extract_glucose_patterns_24h(row, extended_cgm_df)
         
         enhanced_row = {
             **row,
@@ -1189,27 +1853,18 @@ def extract_features(df: pl.DataFrame, meal_df: pl.DataFrame, extended_cgm_df: p
             **glucose_patterns
         }
         enhanced_rows.append(enhanced_row)
+    
     enhanced_df = pl.DataFrame(enhanced_rows)
-    # Normalización y log1p
-    for col in [BOLUS_COL, MEAL_COL, "effective_basal_rate", "exercise_intensity", "exercise_duration", "steps_in_window"]:
-        if col in enhanced_df.columns:
-            enhanced_df = enhanced_df.with_columns(
-                pl.col(col).log1p().alias(f"{col}_log1p")
-            )
-    # Normalizar features binarios
-    for col in ["exercise_in_window", "hypo_event_in_window", "temp_basal_active", "has_meal", "significant_meal"]:
-        if col in enhanced_df.columns:
-            enhanced_df = enhanced_df.with_columns(
-                pl.col(col).cast(pl.Float64)
-            )
-    logging.info(f"Características DRL extraídas. Forma: {enhanced_df.shape}")
+    enhanced_df = _apply_transformations(enhanced_df)
+    
+    print_info(f"Características DRL extraídas. Forma: {enhanced_df.shape}")
     return enhanced_df
 
 def transform_features(df: pl.DataFrame) -> pl.DataFrame:
     """
     Aplica transformaciones mejoradas incluyendo transformaciones logarítmicas, normalización y expansión de características.
     """
-    logging.info("Aplicando transformaciones mejoradas...")
+    print_info("Aplicando transformaciones mejoradas...")
     
     # Log1p transformations
     log_transform_cols = [
@@ -1278,10 +1933,10 @@ def transform_features(df: pl.DataFrame) -> pl.DataFrame:
             (pl.col("current_hyper_risk") + (pl.col("glucose_rate_of_change") / 10.0).clip(0, 1)).alias("composite_hyper_risk")
         )
     
-    logging.info(f"Transformaciones mejoradas completadas. Forma final: {df.shape}")
+    print_info(f"Transformaciones mejoradas completadas. Forma final: {df.shape}")
     return df
 
-def extract_features_excel(row: dict, cgm_window: np.ndarray, carb_median: float, iob_median: float, basal_df: pl.DataFrame, idx: int) -> dict:
+def extract_features_excel(row: dict, cgm_window: np.ndarray, carb_median: float, iob_median: float, basal_df: pl.DataFrame, idx: int) -> Optional[dict]:
     """
     Extrae características para una instancia de bolo individual desde datos Excel.
 
@@ -1345,6 +2000,331 @@ def extract_features_excel(row: dict, cgm_window: np.ndarray, carb_median: float
         BOLUS_COL: float(normal)
     }
 
+def _add_single_context_data(df: pl.DataFrame, context_df: pl.DataFrame, 
+                            data_type: str, prepare_func, column_name: str) -> pl.DataFrame:
+    """
+    Agrega un tipo específico de datos de contexto al DataFrame principal.
+    
+    Parámetros:
+    -----------
+    df : pl.DataFrame
+        DataFrame principal.
+    context_df : pl.DataFrame
+        DataFrame con datos de contexto.
+    data_type : str
+        Tipo de datos de contexto (para logging).
+    prepare_func : callable
+        Función para preparar los datos de contexto.
+    column_name : str
+        Nombre de la columna a agregar.
+    
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con datos de contexto agregados.
+    """
+    if context_df.is_empty():
+        print_warning(f"No se encontraron datos de {data_type} en el XML procesado.")
+        return df.with_columns(pl.lit(None).cast(pl.Float64).alias(column_name))
+    
+    try:
+        prepared_data = prepare_func(context_df)
+        
+        if not prepared_data.is_empty():
+            return _join_contextual_data_by_date(
+                df, prepared_data, column_name, f'datos de {data_type}'
+            )
+        else:
+            print_warning(f"No se pudieron preparar datos de {data_type} válidos para join")
+            return df.with_columns(pl.lit(None).cast(pl.Float64).alias(column_name))
+            
+    except Exception as e:
+        print_error(f"Error procesando datos de {data_type}: {e}")
+        return df.with_columns(pl.lit(None).cast(pl.Float64).alias(column_name))
+
+def add_context_data(df: pl.DataFrame, processed_data: dict) -> pl.DataFrame:
+    """
+    Agrega datos de contexto adicionales al DataFrame procesado usando joins por SubjectID y fecha.
+    
+    Parámetros:
+    -----------
+    df : pl.DataFrame
+        DataFrame con datos procesados.
+    processed_data : dict
+        Diccionario con datos procesados del XML.
+    
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con datos de contexto agregados.
+    """
+    print_debug(f"{processed_data.keys()=}")
+    
+    # Asegurar que df tiene columna Timestamp como datetime
+    if 'Timestamp' not in df.columns:
+        print_warning("Columna 'Timestamp' no encontrada en DataFrame principal")
+        return df
+    
+    df = ensure_timestamp_datetime(df, 'Timestamp')
+    
+    # Configuración de tipos de datos de contexto
+    context_configs = [
+        {
+            'key': 'sleep',
+            'data_type': 'sueño',
+            'prepare_func': _prepare_sleep_data_for_join,
+            'column_name': 'sleep_quality'
+        },
+        {
+            'key': 'work',
+            'data_type': 'trabajo',
+            'prepare_func': _prepare_work_data_for_join,
+            'column_name': 'work_intensity'
+        },
+        {
+            'key': 'exercise',
+            'data_type': 'ejercicio',
+            'prepare_func': _prepare_exercise_data_for_join,
+            'column_name': 'exercise_intensity'
+        }
+    ]
+    
+    # Procesar cada tipo de datos de contexto
+    for config in context_configs:
+        context_df = processed_data.get(config['key'], pl.DataFrame())
+        df = _add_single_context_data(
+            df, context_df, config['data_type'], 
+            config['prepare_func'], config['column_name']
+        )
+    
+    return df
+
+def _prepare_sleep_data_for_join(sleep_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Prepara los datos de sueño para join por fecha usando ts_end.
+    
+    Parámetros:
+    -----------
+    sleep_df : pl.DataFrame
+        DataFrame con datos de sueño.
+    
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame preparado para join.
+    """
+    if 'quality' not in sleep_df.columns:
+        print_warning("Columna 'quality' no encontrada en datos de sueño")
+        return pl.DataFrame()
+    
+    # Determinar qué columna de timestamp usar
+    timestamp_col = None
+    if 'Timestamp_end' in sleep_df.columns:
+        timestamp_col = 'Timestamp_end'
+    elif 'ts_end' in sleep_df.columns:
+        timestamp_col = 'ts_end'
+    elif 'Timestamp' in sleep_df.columns:
+        timestamp_col = 'Timestamp'
+    else:
+        print_warning("No se encontró columna de timestamp válida en datos de sueño")
+        return pl.DataFrame()
+    
+    # Preparar DataFrame para join
+    sleep_prepared = sleep_df.clone()
+    
+    # Asegurar que timestamp es datetime
+    sleep_prepared = ensure_timestamp_datetime(sleep_prepared, timestamp_col)
+    
+    # Crear columna de fecha para matching
+    sleep_prepared = sleep_prepared.with_columns([
+        pl.col(timestamp_col).dt.date().alias('join_date'),
+        pl.col('quality').cast(pl.Float64).alias('sleep_quality')
+    ])
+    
+    # Filtrar valores válidos y seleccionar columnas necesarias
+    sleep_prepared = sleep_prepared.filter(
+        pl.col('sleep_quality').is_not_null() & 
+        pl.col('join_date').is_not_null() &
+        pl.col('SubjectID').is_not_null()
+    ).select(['SubjectID', 'join_date', 'sleep_quality'])
+    
+    # Agrupar por SubjectID y fecha para obtener valor promedio si hay múltiples registros
+    sleep_prepared = sleep_prepared.group_by(['SubjectID', 'join_date']).agg(
+        pl.col('sleep_quality').mean().alias('sleep_quality')
+    )
+    
+    return sleep_prepared
+
+def _prepare_work_data_for_join(work_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Prepara los datos de trabajo para join por fecha.
+    
+    Parámetros:
+    -----------
+    work_df : pl.DataFrame
+        DataFrame con datos de trabajo.
+    
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame preparado para join.
+    """
+    if 'intensity' not in work_df.columns:
+        print_warning("Columna 'intensity' no encontrada en datos de trabajo")
+        return pl.DataFrame()
+    
+    # Determinar qué columna de timestamp usar
+    timestamp_col = None
+    if 'Timestamp' in work_df.columns:
+        timestamp_col = 'Timestamp'
+    elif 'ts' in work_df.columns:
+        timestamp_col = 'ts'
+    elif 'Timestamp_begin' in work_df.columns:
+        timestamp_col = 'Timestamp_begin'
+    else:
+        print_warning("No se encontró columna de timestamp válida en datos de trabajo")
+        return pl.DataFrame()
+    
+    # Preparar DataFrame para join
+    work_prepared = work_df.clone()
+    
+    # Asegurar que timestamp es datetime
+    work_prepared = ensure_timestamp_datetime(work_prepared, timestamp_col)
+    
+    # Crear columna de fecha para matching
+    work_prepared = work_prepared.with_columns([
+        pl.col(timestamp_col).dt.date().alias('join_date'),
+        pl.col('intensity').cast(pl.Float64).alias('work_intensity')
+    ])
+    
+    # Filtrar valores válidos y seleccionar columnas necesarias
+    work_prepared = work_prepared.filter(
+        pl.col('work_intensity').is_not_null() & 
+        pl.col('join_date').is_not_null() &
+        pl.col('SubjectID').is_not_null()
+    ).select(['SubjectID', 'join_date', 'work_intensity'])
+    
+    # Agrupar por SubjectID y fecha para obtener valor promedio si hay múltiples registros
+    work_prepared = work_prepared.group_by(['SubjectID', 'join_date']).agg(
+        pl.col('work_intensity').mean().alias('work_intensity')
+    )
+    
+    return work_prepared
+
+def _prepare_exercise_data_for_join(exercise_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Prepara los datos de ejercicio para join por fecha.
+    
+    Parámetros:
+    -----------
+    exercise_df : pl.DataFrame
+        DataFrame con datos de ejercicio.
+    
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame preparado para join.
+    """
+    if 'intensity' not in exercise_df.columns:
+        print_warning("Columna 'intensity' no encontrada en datos de ejercicio")
+        return pl.DataFrame()
+    
+    # Determinar qué columna de timestamp usar
+    timestamp_col = None
+    if 'Timestamp' in exercise_df.columns:
+        timestamp_col = 'Timestamp'
+    elif 'ts' in exercise_df.columns:
+        timestamp_col = 'ts'
+    else:
+        print_warning("No se encontró columna de timestamp válida en datos de ejercicio")
+        return pl.DataFrame()
+    
+    # Preparar DataFrame para join
+    exercise_prepared = exercise_df.clone()
+    
+    # Asegurar que timestamp es datetime
+    exercise_prepared = ensure_timestamp_datetime(exercise_prepared, timestamp_col)
+    
+    # Crear columna de fecha para matching
+    exercise_prepared = exercise_prepared.with_columns([
+        pl.col(timestamp_col).dt.date().alias('join_date'),
+        pl.col('intensity').cast(pl.Float64).alias('exercise_intensity')
+    ])
+    
+    # Filtrar valores válidos y seleccionar columnas necesarias
+    exercise_prepared = exercise_prepared.filter(
+        pl.col('exercise_intensity').is_not_null() & 
+        pl.col('join_date').is_not_null() &
+        pl.col('SubjectID').is_not_null()
+    ).select(['SubjectID', 'join_date', 'exercise_intensity'])
+    
+    # Agrupar por SubjectID y fecha para obtener valor promedio si hay múltiples registros
+    exercise_prepared = exercise_prepared.group_by(['SubjectID', 'join_date']).agg(
+        pl.col('exercise_intensity').mean().alias('exercise_intensity')
+    ).fill_null(0.0)
+    
+    return exercise_prepared
+
+def _join_contextual_data_by_date(
+    df: pl.DataFrame, 
+    contextual_df: pl.DataFrame, 
+    value_column: str,
+    description: str
+) -> pl.DataFrame:
+    """
+    Une datos contextuales al DataFrame principal por SubjectID y fecha.
+    
+    Parámetros:
+    -----------
+    df : pl.DataFrame
+        DataFrame principal.
+    contextual_df : pl.DataFrame
+        DataFrame contextual preparado.
+    value_column : str
+        Nombre de la columna de valor a unir.
+    description : str
+        Descripción del tipo de datos para logging.
+    
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con datos contextuales unidos.
+    """
+    if contextual_df.is_empty():
+        print_warning(f"DataFrame de {description} está vacío")
+        df = df.with_columns(pl.lit(None).cast(pl.Float64).alias(value_column))
+        return df
+    
+    try:
+        # Crear columna de fecha en el DataFrame principal
+        df_with_date = df.with_columns(
+            pl.col('Timestamp').dt.date().alias('join_date')
+        )
+        
+        # Realizar join por SubjectID y fecha
+        joined_df = df_with_date.join(
+            contextual_df,
+            on=['SubjectID', 'join_date'],
+            how='left')
+        
+        # Eliminar columna temporal de fecha
+        joined_df = joined_df.drop('join_date')
+        
+        # Verificar resultado del join
+        non_null_count = joined_df[value_column].is_not_null().sum()
+        total_count = len(joined_df)
+        coverage_percentage = (non_null_count / total_count * 100) if total_count > 0 else 0
+        
+        print_info(f"Join exitoso con {description}: {coverage_percentage:.1f}% cobertura")
+        
+        return joined_df
+        
+    except Exception as e:
+        print_error(f"Error en join con {description}: {e}")
+        # En caso de error, añadir columna con valores nulos
+        df = df.with_columns(pl.lit(None).cast(pl.Float64).alias(value_column))
+        return df
+
 def process_xml_directory(data_dir: str) -> Optional[pl.DataFrame]:
     """
     Procesa un directorio XML completo, extrayendo y transformando características.
@@ -1360,7 +2340,7 @@ def process_xml_directory(data_dir: str) -> Optional[pl.DataFrame]:
         DataFrame procesado o None si hubo un error
     """
     try:
-        logging.info(f"Procesando directorio XML: {data_dir}")
+        print_info(f"Procesando directorio XML: {data_dir}")
         data = load_data(data_dir)
         
         # Preprocesar datos de bolus y meal
@@ -1376,16 +2356,21 @@ def process_xml_directory(data_dir: str) -> Optional[pl.DataFrame]:
         # Unir señales con los parámetros correctos
         df = join_signals(cgm_data, bolus_df, meal_df)
         
+        # Crear indicadores de eventos contextuales
+        df = _create_contextual_event_indicators(df)
+        
         # Extraer características mejoradas
         df = extract_enhanced_features(df, processed_data.get("meal"))
         
         # Transformar características
         df = transform_enhanced_features(df)
         
-        logging.info(f"Procesado exitoso para {data_dir}: {df.shape}")
+        df = add_context_data(df, processed_data)
+        
+        print_info(f"Procesado exitoso para {data_dir}: {df.shape}")
         return df
     except Exception as e:
-        logging.error(f"Error procesando {data_dir}: {str(e)}")
+        print_error(f"Error procesando {data_dir}: {str(e)}")
         return None
 
 def process_excel_subject(subject_path: str, idx: int) -> list[dict]:
@@ -1405,7 +2390,7 @@ def process_excel_subject(subject_path: str, idx: int) -> list[dict]:
         Lista de diccionarios con características procesadas.
     """
     start_time: float = time.time()
-    logging.info(f"Procesando {os.path.basename(subject_path)} (Sujeto {idx+1})...")
+    print_info(f"Procesando {os.path.basename(subject_path)} (Sujeto {idx+1})...")
     
     cgm_df, bolus_df, basal_df = load_excel_data(subject_path)
     if cgm_df is None or bolus_df is None:
@@ -1421,7 +2406,7 @@ def process_excel_subject(subject_path: str, idx: int) -> list[dict]:
             processed_data.append(features)
 
     elapsed_time: float = time.time() - start_time
-    logging.info(f"Procesado {os.path.basename(subject_path)} (Sujeto {idx+1}) en {elapsed_time:.2f} segundos")
+    print_info(f"Procesado {os.path.basename(subject_path)} (Sujeto {idx+1}) en {elapsed_time:.2f} segundos")
     return processed_data
 
 def calculate_stats_for_group(df_final_pd: pl.DataFrame, subjects: list, feature: str = 'bolus') -> tuple:
@@ -1576,108 +2561,427 @@ def load_data(data_dir: str) -> Dict[str, pl.DataFrame]:
     Ahora soporta: glucose_level, bolus, meal, basal, temp_basal, exercise, basis_steps, hypo_event,
     finger_stick, sleep, work, stressors, illness, basis_heart_rate, basis_gsr, basis_skin_temperature,
     basis_air_temperature, basis_sleep, acceleration.
+    
+    Parámetros:
+    -----------
+    data_dir : str
+        Directorio con archivos XML.
+        
+    Retorna:
+    --------
+    Dict[str, pl.DataFrame]
+        Diccionario con DataFrames por tipo de dato.
     """
-    logging.info(f"Cargando datos desde {data_dir}")
+    print_info(f"Cargando datos desde {data_dir}")
+    
+    # Determinar año y sujetos esperados
+    year, expected_subjects = _determine_year_and_subjects(data_dir)
+    
+    # Validar archivos XML
+    xml_files = _validate_xml_files_existence(data_dir, expected_subjects, year)
+    
+    # Procesar archivos XML
+    data_dict, subject_stats = _process_all_xml_files(xml_files, year)
+    
+    # Validar resultados finales
+    _validate_final_results(data_dict, subject_stats, expected_subjects, year)
+    
+    return data_dict
+
+def _determine_year_and_subjects(data_dir: str) -> tuple[str, list[str]]:
+    """
+    Determina el año y los sujetos esperados basándose en el directorio.
+    
+    Parámetros:
+    -----------
+    data_dir : str
+        Directorio con archivos XML.
+        
+    Retorna:
+    --------
+    tuple[str, list[str]]
+        Tupla con (año, lista_de_sujetos_esperados).
+    """
     expected_subjects = {
         '2018': ['559-ws-training', '563-ws-training', '570-ws-training', '575-ws-training', '588-ws-training', '591-ws-training'],
         '2020': ['540-ws-training', '544-ws-training', '552-ws-training', '567-ws-training', '584-ws-training', '596-ws-training']
     }
-    year = '2018' if '2018' in data_dir else '2020' if '2020' in data_dir else None
+    
+    if '2018' in data_dir:
+        year = '2018'
+    elif '2020' in data_dir:
+        year = '2020'
+    else:
+        year = None
+    
     if year is None:
         raise ValueError(f"No se pudo determinar el año del directorio: {data_dir}")
+    
     suffix = '-ws-training' if 'train' in data_dir else '-ws-testing'
-    expected_subjects[year] = [s.replace('-ws-training', suffix).replace('-ws-testing', suffix) for s in expected_subjects[year]]
+    adjusted_subjects = [s.replace('-ws-training', suffix).replace('-ws-testing', suffix) for s in expected_subjects[year]]
+    
+    return year, adjusted_subjects
+
+def _validate_xml_files_existence(data_dir: str, expected_subjects: list[str], year: str) -> list[str]:
+    """
+    Valida la existencia de archivos XML y reporta sujetos faltantes.
+    
+    Parámetros:
+    -----------
+    data_dir : str
+        Directorio con archivos XML.
+    expected_subjects : list[str]
+        Lista de sujetos esperados.
+    year : str
+        Año de los datos.
+        
+    Retorna:
+    --------
+    list[str]
+        Lista de archivos XML encontrados.
+    """
     xml_files = glob.glob(os.path.join(data_dir, "*.xml"))
     found_subjects = [os.path.basename(f).split('.')[0] for f in xml_files]
-    missing_subjects = [s for s in expected_subjects[year] if s not in found_subjects]
+    missing_subjects = [s for s in expected_subjects if s not in found_subjects]
+    
     if missing_subjects:
-        logging.error(f"Faltan datos para sujetos del año {year}: {missing_subjects}")
+        print_error(f"Faltan datos para sujetos del año {year}: {missing_subjects}")
         if not found_subjects:
             raise ValueError(f"No se encontraron archivos XML en {data_dir}")
-    data_dict = {}
-    subject_stats = defaultdict(lambda: defaultdict(int))
-    expected_types = [
+    
+    return xml_files
+
+def _get_expected_data_types() -> list[str]:
+    """
+    Retorna la lista de tipos de datos esperados.
+    
+    Retorna:
+    --------
+    list[str]
+        Lista de tipos de datos esperados.
+    """
+    return [
         'glucose_level', 'bolus', 'meal', 'basal', 'temp_basal', 'exercise', 'basis_steps', 'hypo_event',
         'finger_stick', 'sleep', 'work', 'stressors', 'illness', 'basis_heart_rate', 'basis_gsr',
         'basis_skin_temperature', 'basis_air_temperature', 'basis_sleep', 'acceleration'
     ]
+
+def _process_all_xml_files(xml_files: list[str], year: str) -> tuple[dict[str, pl.DataFrame], dict[str, dict[str, int]]]:
+    """
+    Procesa todos los archivos XML y retorna los datos consolidados.
     
-    # Diccionario para almacenar columnas por tipo de evento y sujeto
-    event_columns_by_subject = defaultdict(lambda: defaultdict(set))
+    Parámetros:
+    -----------
+    xml_files : list[str]
+        Lista de archivos XML a procesar.
+    year : str
+        Año de los datos.
+        
+    Retorna:
+    --------
+    tuple[dict[str, pl.DataFrame], dict[str, dict[str, int]]]
+        Tupla con (diccionario_de_datos, estadísticas_por_sujeto).
+    """
+    data_dict = {}
+    subject_stats = defaultdict(lambda: defaultdict(int))
+    expected_types = _get_expected_data_types()
     
     for xml_file in xml_files:
-        subject_id = os.path.basename(xml_file).split('.')[0]
-        numeric_id = extract_numeric_id(subject_id)
-        logging.info(f"\n{'='*50}")
-        logging.info(f"Procesando SubjectID: {subject_id} (ID numérico: {numeric_id}, Año {year})")
-        logging.info(f"{'='*50}")
+        file_data, file_stats = _process_single_xml_file_data(xml_file, year, expected_types)
         
-        try:
-            tree = ET.parse(xml_file)
-            root = tree.getroot()
-            
-            # Procesar cada tipo de dato
-            for data_type_elem in root:
-                data_type = data_type_elem.tag
-                if data_type == 'patient':
-                    continue
-                if data_type not in expected_types:
-                    continue
-                
-                records = []
-                for event in data_type_elem:
-                    record_dict = dict(event.attrib)
-                    record_dict['SubjectID'] = subject_id
-                    record_dict['Year'] = year
-                    records.append(record_dict)
-                    
-                    # Registrar columnas por tipo de evento
-                    for col in record_dict.keys():
-                        if col not in ['SubjectID', 'Year']:
-                            event_columns_by_subject[subject_id][data_type].add(col)
-                
-                if records:
-                    df = pl.DataFrame(records)
-                    if 'value' in df.columns:
-                        df = df.with_columns(pl.col('value').cast(pl.Float64))
-                    data_dict[data_type] = pl.concat([data_dict.get(data_type, pl.DataFrame()), df])
-                    # logging.info(f"SubjectID {subject_id}: {data_type}={len(records)} registros")
-                    subject_stats[subject_id][data_type] += len(records)
-                    
-                    # Mostrar estadísticas de valores para columnas numéricas
-                    if 'value' in df.columns:
-                        value_stats = df.select(pl.col('value')).describe()
-                        # logging.info(f"Estadísticas de valores para {data_type}:")
-                        # logging.info(f"  Min: {value_stats['value'].min():.2f}")
-                        # logging.info(f"  Max: {value_stats['value'].max():.2f}")
-                        # logging.info(f"  Mean: {value_stats['value'].mean():.2f}")
-                        # logging.info(f"  Std: {value_stats['value'].std():.2f}")
+        # Consolidar datos
+        _consolidate_file_data(data_dict, file_data)
+        subject_stats.update(file_stats)
+    
+    return data_dict, subject_stats
+
+def _process_single_xml_file_data(xml_file: str, year: str, expected_types: list[str]) -> tuple[dict[str, pl.DataFrame], dict[str, dict[str, int]]]:
+    """
+    Procesa un único archivo XML.
+    
+    Parámetros:
+    -----------
+    xml_file : str
+        Ruta al archivo XML.
+    year : str
+        Año de los datos.
+    expected_types : list[str]
+        Tipos de datos esperados.
         
-        except Exception as e:
-            logging.error(f"Error procesando {xml_file}: {e}")
+    Retorna:
+    --------
+    tuple[dict[str, pl.DataFrame], dict[str, dict[str, int]]]
+        Tupla con (datos_del_archivo, estadísticas_del_archivo).
+    """
+    subject_id = os.path.basename(xml_file).split('.')[0]
+    numeric_id = extract_numeric_id(subject_id)
+    
+    print_info(f"\n{'='*50}")
+    print_info(f"Procesando SubjectID: {subject_id} (ID numérico: {numeric_id}, Año {year})")
+    print_info(f"{'='*50}")
+    
+    try:
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        return _extract_data_from_xml_root(root, subject_id, year, expected_types)
+    except Exception as e:
+        print_error(f"Error procesando {xml_file}: {e}")
+        return {}, {}
+
+def _extract_data_from_xml_root(root, subject_id: str, year: str, expected_types: list[str]) -> tuple[dict[str, pl.DataFrame], dict[str, dict[str, int]]]:
+    """
+    Extrae datos del elemento raíz del XML.
+    
+    Parámetros:
+    -----------
+    root : ET.Element
+        Elemento raíz del XML.
+    subject_id : str
+        ID del sujeto.
+    year : str
+        Año de los datos.
+    expected_types : list[str]
+        Tipos de datos esperados.
+        
+    Retorna:
+    --------
+    tuple[dict[str, pl.DataFrame], dict[str, dict[str, int]]]
+        Tupla con (datos_extraídos, estadísticas).
+    """
+    file_data = {}
+    file_stats = defaultdict(int)
+    
+    for data_type_elem in root:
+        data_type = data_type_elem.tag
+        
+        if _should_skip_data_type(data_type, expected_types):
             continue
+            
+        records = _extract_records_from_element(data_type_elem, subject_id, year)
+        
+        if records:
+            df = _create_dataframe_from_records(records)
+            file_data[data_type] = df
+            file_stats[data_type] = len(records)
     
-    # Mostrar columnas por tipo de evento y sujeto
-    # logging.info("\nColumnas por tipo de evento y sujeto:")
-    # for subject_id in sorted(event_columns_by_subject.keys()):
-    #     logging.info(f"\n{'-'*50}")
-    #     logging.info(f"SubjectID: {subject_id}")
-    #     for event_type, columns in sorted(event_columns_by_subject[subject_id].items()):
-    #         logging.info(f"  {event_type}: {sorted(columns)}")
+    return file_data, {subject_id: file_stats}
+
+def _should_skip_data_type(data_type: str, expected_types: list[str]) -> bool:
+    """
+    Determina si se debe omitir un tipo de dato.
     
-    # logging.info(f"\nEstadísticas por sujeto (Año {year}):")
-    # for subject_id in sorted(subject_stats.keys()):
-    #     stats = subject_stats[subject_id]
-    #     stat_str = ", ".join([f"{k}={v}" for k, v in stats.items()])
-    #     logging.info(f"SubjectID {subject_id}: {stat_str}")
+    Parámetros:
+    -----------
+    data_type : str
+        Tipo de dato a evaluar.
+    expected_types : list[str]
+        Tipos de datos esperados.
+        
+    Retorna:
+    --------
+    bool
+        True si se debe omitir, False en caso contrario.
+    """
+    return data_type == 'patient' or data_type not in expected_types
+
+def _extract_records_from_element(data_type_elem, subject_id: str, year: str) -> list[dict]:
+    """
+    Extrae registros de un elemento XML de tipo de dato.
     
+    Parámetros:
+    -----------
+    data_type_elem : ET.Element
+        Elemento XML del tipo de dato.
+    subject_id : str
+        ID del sujeto.
+    year : str
+        Año de los datos.
+        
+    Retorna:
+    --------
+    list[dict]
+        Lista de registros extraídos.
+    """
+    records = []
+    for event in data_type_elem:
+        record_dict = dict(event.attrib)
+        record_dict['SubjectID'] = subject_id
+        record_dict['Year'] = year
+        records.append(record_dict)
+    return records
+
+def _create_dataframe_from_records(records: list[dict]) -> pl.DataFrame:
+    """
+    Crea un DataFrame de Polars a partir de registros.
+    
+    Parámetros:
+    -----------
+    records : list[dict]
+        Lista de registros.
+        
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame creado.
+    """
+    df = pl.DataFrame(records)
+    if 'value' in df.columns:
+        df = df.with_columns(pl.col('value').cast(pl.Float64))
+    return df
+
+def _consolidate_file_data(data_dict: dict[str, pl.DataFrame], file_data: dict[str, pl.DataFrame]) -> None:
+    """
+    Consolida los datos de un archivo en el diccionario principal.
+    
+    Parámetros:
+    -----------
+    data_dict : dict[str, pl.DataFrame]
+        Diccionario principal de datos.
+    file_data : dict[str, pl.DataFrame]
+        Datos del archivo a consolidar.
+    """
+    for data_type, df in file_data.items():
+        if data_type in data_dict:
+            data_dict[data_type] = pl.concat([data_dict[data_type], df])
+        else:
+            data_dict[data_type] = df
+
+def _validate_final_results(data_dict: dict[str, pl.DataFrame], subject_stats: dict, expected_subjects: list[str], year: str) -> None:
+    """
+    Valida los resultados finales del procesamiento.
+    
+    Parámetros:
+    -----------
+    data_dict : dict[str, pl.DataFrame]
+        Diccionario con datos procesados.
+    subject_stats : dict
+        Estadísticas por sujeto.
+    expected_subjects : list[str]
+        Lista de sujetos esperados.
+    year : str
+        Año de los datos.
+    """
+    expected_types = _get_expected_data_types()
     missing_types = [t for t in expected_types if t not in data_dict]
-    if missing_types:
-        logging.warning(f"Faltan tipos de datos: {missing_types}")
-    if len(subject_stats) != len(expected_subjects[year]):
-        logging.error(f"Se encontraron datos para {len(subject_stats)}/{len(expected_subjects[year])} sujetos")
     
-    return data_dict
+    if missing_types:
+        print_warning(f"Faltan tipos de datos: {missing_types}")
+    
+    if len(subject_stats) != len(expected_subjects):
+        print_error(f"Se encontraron datos para {len(subject_stats)}/{len(expected_subjects)} sujetos")
+
+def _process_bolus_legacy(data: pl.DataFrame) -> pl.DataFrame:
+    """Process bolus data specifically."""
+    bolus = data.clone()
+    if "dose" in bolus.columns:
+        bolus = bolus.rename({"dose": "bolus"})
+        bolus = bolus.with_columns(pl.col("bolus").cast(pl.Float64))
+    if "ts_begin" in bolus.columns:
+        bolus = bolus.with_columns(
+            pl.col("ts_begin").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+        )
+    return bolus.filter(pl.col("bolus").is_not_null() & (pl.col("bolus") > 0))
+
+def _process_meal_legacy(data: pl.DataFrame) -> pl.DataFrame:
+    """Process meal data specifically."""
+    meal = data.clone()
+    if "carbs" in meal.columns:
+        meal = meal.rename({"carbs": "meal_carbs"})
+        meal = meal.with_columns(pl.col("meal_carbs").cast(pl.Float64))
+    if "ts" in meal.columns:
+        meal = meal.with_columns(
+            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+        )
+    return meal.filter(pl.col("meal_carbs").is_not_null() & (pl.col("meal_carbs") > 0))
+
+def _process_basal_legacy(data: pl.DataFrame) -> pl.DataFrame:
+    """Process basal data specifically."""
+    basal = data.clone()
+    basal = basal.rename({"value": "basal_rate"}).with_columns(
+        pl.col("basal_rate").cast(pl.Float64),
+        pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+    )
+    return basal.filter(pl.col("basal_rate").is_not_null())
+
+def _process_temp_basal_legacy(data: pl.DataFrame) -> pl.DataFrame:
+    """Process temp basal data specifically."""
+    temp_basal = data.clone()
+    temp_basal = temp_basal.rename({"value": "temp_basal_rate"}).with_columns(
+        pl.col("temp_basal_rate").cast(pl.Float64),
+        pl.col("ts_begin").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+    )
+    return temp_basal.filter(pl.col("temp_basal_rate").is_not_null())
+
+def _process_exercise_legacy(data: pl.DataFrame) -> pl.DataFrame:
+    """Process exercise data specifically."""
+    exercise = data.clone()
+    exercise = exercise.with_columns(
+        pl.col("intensity").cast(pl.Float64),
+        pl.col("duration").cast(pl.Float64),
+        pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+    )
+    return exercise.filter(pl.col("intensity").is_not_null())
+
+def _process_steps_legacy(data: pl.DataFrame) -> pl.DataFrame:
+    """Process steps data specifically."""
+    steps = data.clone()
+    steps = steps.rename({"value": "steps"}).with_columns(
+        pl.col("steps").cast(pl.Float64),
+        pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+    )
+    return steps.filter(pl.col("steps").is_not_null())
+
+def _process_hypo_event_legacy(data: pl.DataFrame) -> pl.DataFrame:
+    """Process hypo event data specifically."""
+    hypo = data.clone()
+    if "ts" in hypo.columns:
+        hypo = hypo.with_columns(
+            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+        )
+    return hypo
+
+def _process_finger_stick_legacy(data: pl.DataFrame) -> pl.DataFrame:
+    """Process finger stick data specifically."""
+    finger_stick = data.clone()
+    finger_stick = finger_stick.rename({"value": "finger_stick_bg"}).with_columns(
+        pl.col("finger_stick_bg").cast(pl.Float64),
+        pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+    )
+    return finger_stick.filter(pl.col("finger_stick_bg").is_not_null())
+
+def _process_sleep_work_legacy(data: pl.DataFrame, quality_col: str) -> pl.DataFrame:
+    """Process sleep or work data with begin/end timestamps."""
+    df = data.clone()
+    if "ts_begin" in df.columns and "ts_end" in df.columns:
+        df = df.with_columns(
+            pl.col(quality_col).cast(pl.Float64),
+            pl.col("ts_begin").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp_begin"),
+            pl.col("ts_end").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp_end")
+        )
+    elif "ts" in df.columns:
+        df = df.with_columns(
+            pl.col(quality_col).cast(pl.Float64),
+            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+        )
+    return df.filter(pl.col(quality_col).is_not_null())
+
+def _process_simple_event_legacy(data: pl.DataFrame) -> pl.DataFrame:
+    """Process simple event data with only timestamp."""
+    df = data.clone()
+    if "ts" in df.columns:
+        df = df.with_columns(
+            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+        )
+    return df
+
+def _process_sensor_data_legacy(data: pl.DataFrame, value_col: str) -> pl.DataFrame:
+    """Process sensor data with value column."""
+    df = data.clone()
+    df = df.rename({"value": value_col}).with_columns(
+        pl.col(value_col).cast(pl.Float64),
+        pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
+    )
+    return df.filter(pl.col(value_col).is_not_null())
 
 def preprocess_bolus_meal(data: Dict[str, pl.DataFrame]) -> Dict[str, pl.DataFrame]:
     """
@@ -1686,216 +2990,63 @@ def preprocess_bolus_meal(data: Dict[str, pl.DataFrame]) -> Dict[str, pl.DataFra
     basis_air_temperature, basis_sleep, acceleration.
     """
     processed = {}
-    # Bolus
-    if "bolus" in data:
-        bolus = data["bolus"].clone()
-        if "dose" in bolus.columns:
-            bolus = bolus.rename({"dose": "bolus"})
-            bolus = bolus.with_columns(pl.col("bolus").cast(pl.Float64))
-        if "ts_begin" in bolus.columns:
-            bolus = bolus.with_columns(
-                pl.col("ts_begin").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-            )
-        valid_bolus = bolus.filter(pl.col("bolus").is_not_null() & (pl.col("bolus") > 0))
-        processed["bolus"] = valid_bolus
-        logging.info(f"Eventos bolus válidos: {valid_bolus.height}")
-
-    # Meal
-    if "meal" in data:
-        meal = data["meal"].clone()
-        if "carbs" in meal.columns:
-            meal = meal.rename({"carbs": "meal_carbs"})
-            meal = meal.with_columns(pl.col("meal_carbs").cast(pl.Float64))
-        if "ts" in meal.columns:
-            meal = meal.with_columns(
-                pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-            )
-        valid_meal = meal.filter(pl.col("meal_carbs").is_not_null() & (pl.col("meal_carbs") > 0))
-        processed["meal"] = valid_meal
-        logging.info(f"Eventos meal válidos: {valid_meal.height}")
-
-    # Basal
-    if "basal" in data:
-        basal = data["basal"].clone()
-        basal = basal.rename({"value": "basal_rate"}).with_columns(
-            pl.col("basal_rate").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["basal"] = basal.filter(pl.col("basal_rate").is_not_null())
-        logging.info(f"Eventos basal válidos: {processed['basal'].height}")
-
-    # Temp Basal
-    if "temp_basal" in data:
-        temp_basal = data["temp_basal"].clone()
-        temp_basal = temp_basal.rename({"value": "temp_basal_rate"}).with_columns(
-            pl.col("temp_basal_rate").cast(pl.Float64),
-            pl.col("ts_begin").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["temp_basal"] = temp_basal.filter(pl.col("temp_basal_rate").is_not_null())
-        logging.info(f"Eventos temp_basal válidos: {processed['temp_basal'].height}")
-
-    # Exercise
-    if "exercise" in data:
-        exercise = data["exercise"].clone()
-        exercise = exercise.with_columns(
-            pl.col("intensity").cast(pl.Float64),
-            pl.col("duration").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["exercise"] = exercise.filter(pl.col("intensity").is_not_null())
-        logging.info(f"Eventos exercise válidos: {processed['exercise'].height}")
-
-    # Steps
-    if "basis_steps" in data:
-        steps = data["basis_steps"].clone()
-        steps = steps.rename({"value": "steps"}).with_columns(
-            pl.col("steps").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["basis_steps"] = steps.filter(pl.col("steps").is_not_null())
-        logging.info(f"Eventos steps válidos: {processed['basis_steps'].height}")
-
-    # Hypo Event
-    if "hypo_event" in data:
-        hypo = data["hypo_event"].clone()
-        if "ts" in hypo.columns:
-            hypo = hypo.with_columns(
-                pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-            )
-        processed["hypo_event"] = hypo
-        logging.info(f"Eventos hypo_event válidos: {processed['hypo_event'].height}")
-
-    # Finger Stick
-    if "finger_stick" in data:
-        finger_stick = data["finger_stick"].clone()
-        finger_stick = finger_stick.rename({"value": "finger_stick_bg"}).with_columns(
-            pl.col("finger_stick_bg").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["finger_stick"] = finger_stick.filter(pl.col("finger_stick_bg").is_not_null())
-        logging.info(f"Eventos finger_stick válidos: {processed['finger_stick'].height}")
-
-    # Sleep
-    if "sleep" in data:
-        sleep = data["sleep"].clone()
-        if "ts_begin" in sleep.columns and "ts_end" in sleep.columns:
-            sleep = sleep.with_columns(
-                pl.col("quality").cast(pl.Float64),
-                pl.col("ts_begin").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp_begin"),
-                pl.col("ts_end").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp_end")
-            )
-        elif "ts" in sleep.columns:
-            sleep = sleep.with_columns(
-                pl.col("quality").cast(pl.Float64),
-                pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-            )
-        processed["sleep"] = sleep.filter(pl.col("quality").is_not_null())
-        logging.info(f"Eventos sleep válidos: {processed['sleep'].height}")
-
-    # Work
-    if "work" in data:
-        work = data["work"].clone()
-        if "ts_begin" in work.columns and "ts_end" in work.columns:
-            work = work.with_columns(
-                pl.col("intensity").cast(pl.Float64),
-                pl.col("ts_begin").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp_begin"),
-                pl.col("ts_end").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp_end")
-            )
-        elif "ts" in work.columns:
-            work = work.with_columns(
-                pl.col("intensity").cast(pl.Float64),
-                pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-            )
-        processed["work"] = work.filter(pl.col("intensity").is_not_null())
-        logging.info(f"Eventos work válidos: {processed['work'].height}")
-
-    # Stressors
-    if "stressors" in data:
-        stressors = data["stressors"].clone()
-        if "ts" in stressors.columns:
-            stressors = stressors.with_columns(
-                pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-            )
-        processed["stressors"] = stressors
-        logging.info(f"Eventos stressors válidos: {processed['stressors'].height}")
-
-    # Illness
-    if "illness" in data:
-        illness = data["illness"].clone()
-        if "ts" in illness.columns:
-            illness = illness.with_columns(
-                pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-            )
-        processed["illness"] = illness
-        logging.info(f"Eventos illness válidos: {processed['illness'].height}")
-
-    # Basis Heart Rate
-    if "basis_heart_rate" in data:
-        heart_rate = data["basis_heart_rate"].clone()
-        heart_rate = heart_rate.rename({"value": "heart_rate"}).with_columns(
-            pl.col("heart_rate").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["basis_heart_rate"] = heart_rate.filter(pl.col("heart_rate").is_not_null())
-        logging.info(f"Eventos heart_rate válidos: {processed['basis_heart_rate'].height}")
-
-    # Basis GSR
-    if "basis_gsr" in data:
-        gsr = data["basis_gsr"].clone()
-        gsr = gsr.rename({"value": "gsr"}).with_columns(
-            pl.col("gsr").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["basis_gsr"] = gsr.filter(pl.col("gsr").is_not_null())
-        logging.info(f"Eventos gsr válidos: {processed['basis_gsr'].height}")
-
-    # Basis Skin Temperature
-    if "basis_skin_temperature" in data:
-        skin_temp = data["basis_skin_temperature"].clone()
-        skin_temp = skin_temp.rename({"value": "skin_temperature"}).with_columns(
-            pl.col("skin_temperature").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["basis_skin_temperature"] = skin_temp.filter(pl.col("skin_temperature").is_not_null())
-        logging.info(f"Eventos skin_temperature válidos: {processed['basis_skin_temperature'].height}")
-
-    # Basis Air Temperature
-    if "basis_air_temperature" in data:
-        air_temp = data["basis_air_temperature"].clone()
-        air_temp = air_temp.rename({"value": "air_temperature"}).with_columns(
-            pl.col("air_temperature").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["basis_air_temperature"] = air_temp.filter(pl.col("air_temperature").is_not_null())
-        logging.info(f"Eventos air_temperature válidos: {processed['basis_air_temperature'].height}")
-
-    # Basis Sleep
-    if "basis_sleep" in data:
-        basis_sleep = data["basis_sleep"].clone()
-        if "ts_begin" in basis_sleep.columns and "ts_end" in basis_sleep.columns:
-            basis_sleep = basis_sleep.with_columns(
-                pl.col("quality").cast(pl.Float64),
-                pl.col("ts_begin").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp_begin"),
-                pl.col("ts_end").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp_end")
-            )
-        elif "ts" in basis_sleep.columns:
-            basis_sleep = basis_sleep.with_columns(
-                pl.col("quality").cast(pl.Float64),
-                pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-            )
-        processed["basis_sleep"] = basis_sleep.filter(pl.col("quality").is_not_null())
-        logging.info(f"Eventos basis_sleep válidos: {processed['basis_sleep'].height}")
-
-    # Acceleration
-    if "acceleration" in data:
-        accel = data["acceleration"].clone()
-        accel = accel.rename({"value": "acceleration"}).with_columns(
-            pl.col("acceleration").cast(pl.Float64),
-            pl.col("ts").str.strptime(pl.Datetime, "%d-%m-%Y %H:%M:%S").alias("Timestamp")
-        )
-        processed["acceleration"] = accel.filter(pl.col("acceleration").is_not_null())
-        logging.info(f"Eventos acceleration válidos: {processed['acceleration'].height}")
-
+    
+    # Define processing mappings
+    simple_processors = {
+        "bolus": _process_bolus_legacy,
+        "meal": _process_meal_legacy,
+        "basal": _process_basal_legacy,
+        "temp_basal": _process_temp_basal_legacy,
+        "exercise": _process_exercise_legacy,
+        "basis_steps": _process_steps_legacy,
+        "hypo_event": _process_hypo_event_legacy,
+        "finger_stick": _process_finger_stick_legacy,
+    }
+    
+    sleep_work_processors = {
+        "sleep": "quality",
+        "work": "intensity",
+        "basis_sleep": "quality",
+    }
+    
+    simple_events = ["stressors", "illness"]
+    
+    sensor_processors = {
+        "basis_heart_rate": "heart_rate",
+        "basis_gsr": "gsr",
+        "basis_skin_temperature": "skin_temperature",
+        "basis_air_temperature": "air_temperature",
+        "acceleration": "acceleration",
+    }
+    
+    # Process using simple processors
+    for data_type, processor in simple_processors.items():
+        if data_type in data:
+            result = processor(data[data_type])
+            processed[data_type] = result
+            print_info(f"Eventos {data_type} válidos: {result.height}")
+    
+    # Process sleep/work data
+    for data_type, quality_col in sleep_work_processors.items():
+        if data_type in data:
+            result = _process_sleep_work_legacy(data[data_type], quality_col)
+            processed[data_type] = result
+            print_info(f"Eventos {data_type} válidos: {result.height}")
+    
+    # Process simple events
+    for data_type in simple_events:
+        if data_type in data:
+            result = _process_simple_event_legacy(data[data_type])
+            processed[data_type] = result
+            print_info(f"Eventos {data_type} válidos: {result.height}")
+    
+    # Process sensor data
+    for data_type, value_col in sensor_processors.items():
+        if data_type in data:
+            result = _process_sensor_data_legacy(data[data_type], value_col)
+            processed[data_type] = result
+            print_info(f"Eventos {data_type} válidos: {result.height}")
+    
     return processed
 
 def extract_numeric_id(subject_id: str) -> int:
@@ -1918,8 +3069,240 @@ def extract_numeric_id(subject_id: str) -> int:
         return int(match.group(1))
     else:
         # Si no hay número, usar un valor predeterminado o lanzar un error
-        logging.warning(f"No se pudo extraer ID numérico de: {subject_id}")
+        print_warning(f"No se pudo extraer ID numérico de: {subject_id}")
         return 9999  # Un valor que no colisione con IDs reales
+
+def _validate_critical_columns_for_extraction(df: pl.DataFrame) -> None:
+    """Valida que existan las columnas críticas necesarias para extracción."""
+    if 'value' not in df.columns:
+        print_error("Columna 'value' no encontrada en el DataFrame de entrada")
+        raise ValueError("Columna 'value' no encontrada en el DataFrame de entrada")
+
+def _preserve_critical_columns(df: pl.DataFrame) -> Dict[str, pl.Series]:
+    """Preserva columnas críticas para restaurar después."""
+    critical_columns = ['value', 'bolus', 'SubjectID', 'Timestamp']
+    return {col: df[col] for col in critical_columns if col in df.columns}
+
+def _get_feature_groups() -> Dict[str, List[str]]:
+    """Define y retorna los grupos de características."""
+    return {
+        'cgm': [
+            'glucose_last', 'glucose_mean', 'glucose_std', 'glucose_min',
+            'glucose_max', 'glucose_range', 'glucose_slope'
+        ],
+        'physiological': [
+            'heart_rate', 'gsr', 'skin_temperature', 'air_temperature',
+            'acceleration'
+        ],
+        'events': [
+            'sleep_event', 'work_event', 'stressors_event',
+            'illness_event', 'basis_sleep_event'
+        ],
+        'meal_context': [
+            'meal_carbs', 'meal_time_diff_minutes', 'meal_time_diff_hours',
+            'has_meal', 'meals_in_window', 'significant_meal',
+            'total_carbs_window', 'largest_meal_carbs', 'meal_timing_score'
+        ]
+    }
+
+def _check_available_features(df: pl.DataFrame, feature_groups: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Verifica qué características están disponibles en el DataFrame."""
+    available_features = {}
+    for group, features in feature_groups.items():
+        available_features[group] = [f for f in features if f in df.columns]
+        print_info(f"{group}: {len(available_features[group])}/{len(features)} características presentes")
+    return available_features
+
+def _extract_cgm_features(df: pl.DataFrame, extended_cgm_df: Optional[pl.DataFrame]) -> pl.DataFrame:
+    """Extrae características CGM del DataFrame."""
+    if 'value' not in df.columns:
+        return df
+    
+    # Asegurarse de que 'value' es una columna numérica, no una lista
+    if df['value'].dtype == pl.List:
+        df = df.with_columns(pl.col('value').list.first().alias('value'))
+    
+    # Calcular características CGM básicas
+    df = df.with_columns([
+        pl.col('value').alias('glucose_last'),
+        pl.col('value').rolling_mean(window_size=5).alias('glucose_mean'),
+        pl.col('value').rolling_std(window_size=5).alias('glucose_std'),
+        pl.col('value').rolling_min(window_size=5).alias('glucose_min'),
+        pl.col('value').rolling_max(window_size=5).alias('glucose_max'),
+        (pl.col('value').rolling_max(window_size=5) - 
+         pl.col('value').rolling_min(window_size=5)).alias('glucose_range'),
+        pl.col('value').diff().alias('glucose_slope')
+    ])
+    
+    # Calcular patrones de 24h
+    df = _add_glucose_patterns_24h(df, extended_cgm_df)
+    
+    return df
+
+def _add_glucose_patterns_24h(df: pl.DataFrame, extended_cgm_df: Optional[pl.DataFrame]) -> pl.DataFrame:
+    """Añade patrones de glucosa de 24 horas al DataFrame."""
+    if extended_cgm_df is not None and not extended_cgm_df.is_empty():
+        patterns_24h = compute_glucose_patterns_24h(
+            extended_cgm_df.get_column('value').to_list()
+        )
+    else:
+        patterns_24h = compute_glucose_patterns_24h(
+            df.get_column('value').to_list()
+        )
+        print_info("Usando datos actuales para calcular patrones de 24h")
+    
+    for key, value in patterns_24h.items():
+        df = df.with_columns(pl.lit(value).alias(key))
+    
+    return df
+
+def _extract_physiological_features(df: pl.DataFrame, available_features: Dict[str, List[str]]) -> pl.DataFrame:
+    """Extrae características fisiológicas del DataFrame."""
+    for signal in available_features.get('physiological', []):
+        if signal in df.columns:
+            # Asegurarse de que la señal es una columna numérica, no una lista
+            if df[signal].dtype == pl.List:
+                df = df.with_columns(pl.col(signal).list.first().alias(signal))
+            
+            # Calcular estadísticas de la señal
+            df = df.with_columns([
+                pl.col(signal).rolling_mean(window_size=5).alias(f'{signal}_mean'),
+                pl.col(signal).rolling_std(window_size=5).alias(f'{signal}_std'),
+                pl.col(signal).rolling_min(window_size=5).alias(f'{signal}_min'),
+                pl.col(signal).rolling_max(window_size=5).alias(f'{signal}_max')
+            ])
+    
+    return df
+
+def _extract_event_features(df: pl.DataFrame, available_features: Dict[str, List[str]]) -> pl.DataFrame:
+    """Extrae características de eventos del DataFrame."""
+    for event in available_features.get('events', []):
+        if event in df.columns:
+            # Asegurarse de que el evento es una columna numérica, no una lista
+            if df[event].dtype == pl.List:
+                df = df.with_columns(pl.col(event).list.first().alias(event))
+            
+            # Calcular estadísticas de eventos
+            df = df.with_columns([
+                pl.col(event).rolling_sum(window_size=5).alias(f'{event}_count'),
+                pl.col(event).rolling_mean(window_size=5).alias(f'{event}_density')
+            ])
+    
+    return df
+
+def _extract_meal_context_features(df: pl.DataFrame, meal_df: Optional[pl.DataFrame]) -> pl.DataFrame:
+    """Extrae características de contexto de comidas."""
+    if meal_df is not None and not meal_df.is_empty() and 'Timestamp' in df.columns:
+        df = _process_meal_data_with_context(df, meal_df)
+    else:
+        df = _add_default_meal_features(df)
+    
+    return df
+
+def _process_meal_data_with_context(df: pl.DataFrame, meal_df: pl.DataFrame) -> pl.DataFrame:
+    """Procesa datos de comidas con contexto temporal."""
+    # Calcular tiempo desde última comida
+    df = df.with_columns([
+        pl.col('Timestamp').diff().dt.total_minutes().alias('time_since_last_meal')
+    ])
+    
+    # Calcular características de comidas en ventana
+    window_hours = 2.0
+    for row in df.iter_rows(named=True):
+        bolus_time = row['Timestamp']
+        meal_context = compute_enhanced_meal_context(
+            bolus_time, meal_df, window_hours=window_hours
+        )
+        
+        # Actualizar características de comidas
+        for key, value in meal_context.items():
+            if key in df.columns:
+                df = df.with_columns(pl.lit(value).alias(key))
+    
+    return df
+
+def _add_default_meal_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Añade características de comidas por defecto."""
+    default_meal_features = {
+        'time_since_last_meal': 0.0,
+        'meal_carbs': 0.0,
+        'meal_time_diff_minutes': 0.0,
+        'meal_time_diff_hours': 0.0,
+        'has_meal': 0.0,
+        'meals_in_window': 0,
+        'significant_meal': 0.0,
+        'total_carbs_window': 0.0,
+        'largest_meal_carbs': 0.0,
+        'meal_timing_score': 0.0
+    }
+    
+    for key, value in default_meal_features.items():
+        if key not in df.columns:
+            df = df.with_columns(pl.lit(value).alias(key))
+    
+    return df
+
+def _add_risk_indicators(df: pl.DataFrame, available_features: Dict[str, List[str]]) -> pl.DataFrame:
+    """Añade indicadores de riesgo clínico."""
+    if 'value' not in df.columns:
+        return df
+    
+    glucose_values = df.get_column('value').to_list()
+    physiological_data = {
+        signal: df.get_column(signal).to_list()
+        for signal in available_features.get('physiological', [])
+        if signal in df.columns
+    }
+    time_values = df.get_column('Timestamp').to_list() if 'Timestamp' in df.columns else None
+    
+    risk_indicators = compute_clinical_risk_indicators(
+        glucose_values, physiological_data, time_values
+    )
+    
+    # Actualizar indicadores de riesgo
+    for key, value in risk_indicators.items():
+        df = df.with_columns(pl.lit(value).alias(key))
+    
+    return df
+
+def _add_time_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Añade características de tiempo cíclicas."""
+    if 'Timestamp' not in df.columns:
+        return df
+    
+    time_features = []
+    for ts in df.get_column('Timestamp'):
+        time_features.append(encode_time_cyclical(ts))
+    
+    # Convertir a DataFrame y unir
+    time_df = pl.DataFrame(time_features)
+    df = df.hstack(time_df)
+    
+    return df
+
+def _restore_critical_columns(df: pl.DataFrame, preserved_columns: Dict[str, pl.Series]) -> pl.DataFrame:
+    """Restaura columnas críticas preservadas."""
+    for col, values in preserved_columns.items():
+        if col not in df.columns:
+            df = df.with_columns(values.alias(col))
+    return df
+
+def _validate_final_features(df: pl.DataFrame, feature_groups: Dict[str, List[str]]) -> None:
+    """Valida las características finales generadas."""
+    # Verificar características generadas
+    for group, features in feature_groups.items():
+        present = [f for f in features if f in df.columns]
+        print_info(f"{group} generadas: {len(present)}/{len(features)}")
+        if len(present) < len(features):
+            missing = set(features) - set(present)
+            print_warning(f"Faltan características de {group}: {missing}")
+    
+    # Verificar columnas críticas al final
+    critical_columns = ['value', 'time_in_range_24h', 'bolus']
+    missing_critical = [col for col in critical_columns if col not in df.columns]
+    if missing_critical:
+        print_error(f"Faltan columnas críticas al final: {missing_critical}")
+        raise ValueError(f"Faltan columnas críticas al final: {missing_critical}")
 
 def extract_enhanced_features(df: pl.DataFrame, meal_df: Optional[pl.DataFrame] = None,
                             extended_cgm_df: Optional[pl.DataFrame] = None) -> pl.DataFrame:
@@ -1941,192 +3324,125 @@ def extract_enhanced_features(df: pl.DataFrame, meal_df: Optional[pl.DataFrame] 
     pl.DataFrame
         DataFrame con características extraídas
     """
-    # Verificar columnas críticas
-    if 'value' not in df.columns:
-        logging.error("Columna 'value' no encontrada en el DataFrame de entrada")
-        raise ValueError("Columna 'value' no encontrada en el DataFrame de entrada")
+    # Validaciones iniciales
+    _validate_critical_columns_for_extraction(df)
+    preserved_columns = _preserve_critical_columns(df)
     
-    # Preservar columnas críticas
-    critical_columns = ['value', 'bolus', 'SubjectID', 'Timestamp']
-    preserved_columns = {col: df[col] for col in critical_columns if col in df.columns}
+    # Configuración de características
+    feature_groups = _get_feature_groups()
+    available_features = _check_available_features(df, feature_groups)
     
-    # Definir grupos de características
-    feature_groups = {
-        'cgm': [
-            'glucose_last', 'glucose_mean', 'glucose_std', 'glucose_min',
-            'glucose_max', 'glucose_range', 'glucose_slope'
-        ],
-        'physiological': [
-            'heart_rate', 'gsr', 'skin_temperature', 'air_temperature',
-            'acceleration'
-        ],
-        'events': [
-            'sleep_event', 'work_event', 'stressors_event',
-            'illness_event', 'basis_sleep_event'
-        ],
-        'meal_context': [
-            'meal_carbs', 'meal_time_diff_minutes', 'meal_time_diff_hours',
-            'has_meal', 'meals_in_window', 'significant_meal',
-            'total_carbs_window', 'largest_meal_carbs', 'meal_timing_score'
-        ]
+    # Extracción de características por tipo
+    df = _extract_cgm_features(df, extended_cgm_df)
+    df = _extract_physiological_features(df, available_features)
+    df = _extract_event_features(df, available_features)
+    df = _extract_meal_context_features(df, meal_df)
+    df = _add_risk_indicators(df, available_features)
+    df = _add_time_features(df)
+    
+    # Finalización
+    df = df.fill_null(0)
+    df = _restore_critical_columns(df, preserved_columns)
+    _validate_final_features(df, feature_groups)
+    
+    return df
+
+def _apply_log_transformations(df: pl.DataFrame) -> pl.DataFrame:
+    """Aplica transformaciones logarítmicas a características sesgadas."""
+    log_transform_cols = [
+        "bolus", "carb_input", "meal_carbs", "insulin_on_board",
+        "total_carbs_window", "largest_meal_carbs"
+    ]
+    
+    for col in log_transform_cols:
+        if col in df.columns:
+            df = df.with_columns(
+                pl.col(col).log1p().alias(f"{col}_log1p")
+            )
+    return df
+
+def _apply_percentage_normalizations(df: pl.DataFrame) -> pl.DataFrame:
+    """Normaliza características porcentuales de 0-100 a 0-1."""
+    percentage_cols = [
+        "hypo_percentage_24h", "hyper_percentage_24h", "time_in_range_24h", "cv_24h"
+    ]
+    
+    for col in percentage_cols:
+        if col in df.columns:
+            df = df.with_columns(
+                (pl.col(col) / 100.0).alias(f"{col}_normalized")
+            )
+    return df
+
+def _apply_time_normalizations(df: pl.DataFrame) -> pl.DataFrame:
+    """Normaliza características de tiempo."""
+    if "meal_time_diff_hours" in df.columns:
+        df = df.with_columns(
+            (pl.col("meal_time_diff_hours") / 24.0).alias("meal_time_diff_normalized")
+        )
+    return df
+
+def _apply_glucose_normalizations(df: pl.DataFrame) -> pl.DataFrame:
+    """Normaliza características relacionadas con glucosa para estabilidad."""
+    glucose_norm_cols = [
+        ("cgm_mean_24h", 200.0),
+        ("cgm_std_24h", 100.0),
+        ("cgm_median_24h", 200.0),
+        ("cgm_range_24h", 300.0),
+        ("mage_24h", 50.0),
+        ("glucose_trend_24h", 10.0)
+    ]
+    
+    for col, norm_factor in glucose_norm_cols:
+        if col in df.columns:
+            df = df.with_columns(
+                (pl.col(col) / norm_factor).alias(f"{col}_normalized")
+            )
+    return df
+
+def _expand_cgm_window(df: pl.DataFrame) -> pl.DataFrame:
+    """Expande la ventana CGM a columnas individuales."""
+    if "cgm_window" not in df.columns:
+        return df
+        
+    window_size = CONFIG_PROCESSING["window_steps"]
+    
+    for i in range(window_size):
+        df = df.with_columns(
+            pl.col("cgm_window").list.get(i, null_on_oob=True)
+            .fill_null(120.0)
+            .alias(f"cgm_{i}")
+        )
+
+    return df.drop("cgm_window")
+
+def _create_risk_composite_scores(df: pl.DataFrame) -> pl.DataFrame:
+    """Crea puntuaciones compuestas de riesgo."""
+    hypo_risk_cols = ["current_hypo_risk", "stability_score", "iob_risk_factor"]
+    if all(col in df.columns for col in hypo_risk_cols):
+        df = df.with_columns(
+            (pl.col("current_hypo_risk") + pl.col("iob_risk_factor") * 0.5).alias("composite_hypo_risk")
+        )
+    
+    hyper_risk_cols = ["current_hyper_risk", "glucose_rate_of_change"]
+    if all(col in df.columns for col in hyper_risk_cols):
+        df = df.with_columns(
+            (pl.col("current_hyper_risk") + (pl.col("glucose_rate_of_change") / 10.0).clip(0, 1)).alias("composite_hyper_risk")
+        )
+    
+    return df
+
+def _add_compatibility_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Añade características derivadas para compatibilidad del modelo."""
+    compatibility_features = {
+        "hour_of_day": "hour_of_day_normalized",
+        "has_meal_binary": "has_meal",
+        "significant_meal_binary": "significant_meal"
     }
     
-    # Verificar columnas disponibles
-    available_features = {}
-    for group, features in feature_groups.items():
-        available_features[group] = [f for f in features if f in df.columns]
-        logging.info(f"{group}: {len(available_features[group])}/{len(features)} características presentes")
-    
-    # Extraer características CGM
-    if 'value' in df.columns:
-        # Asegurarse de que 'value' es una columna numérica, no una lista
-        if df['value'].dtype == pl.List:
-            df = df.with_columns(pl.col('value').list.first().alias('value'))
-        
-        # Calcular características CGM
-        df = df.with_columns([
-            pl.col('value').alias('glucose_last'),
-            pl.col('value').rolling_mean(window_size=5).alias('glucose_mean'),
-            pl.col('value').rolling_std(window_size=5).alias('glucose_std'),
-            pl.col('value').rolling_min(window_size=5).alias('glucose_min'),
-            pl.col('value').rolling_max(window_size=5).alias('glucose_max'),
-            (pl.col('value').rolling_max(window_size=5) - 
-             pl.col('value').rolling_min(window_size=5)).alias('glucose_range'),
-            pl.col('value').diff().alias('glucose_slope')
-        ])
-        
-        # Calcular características de 24h si hay suficientes datos
-        if extended_cgm_df is not None and not extended_cgm_df.is_empty():
-            patterns_24h = compute_glucose_patterns_24h(
-                extended_cgm_df.get_column('value').to_list()
-            )
-            for key, value in patterns_24h.items():
-                df = df.with_columns(pl.lit(value).alias(key))
-        else:
-            # Si no hay datos extendidos, calcular usando los datos actuales
-            patterns_24h = compute_glucose_patterns_24h(
-                df.get_column('value').to_list()
-            )
-            for key, value in patterns_24h.items():
-                df = df.with_columns(pl.lit(value).alias(key))
-            
-            logging.info("Usando datos actuales para calcular patrones de 24h")
-    
-    # Extraer características fisiológicas
-    for signal in available_features.get('physiological', []):
-        if signal in df.columns:
-            # Asegurarse de que la señal es una columna numérica, no una lista
-            if df[signal].dtype == pl.List:
-                df = df.with_columns(pl.col(signal).list.first().alias(signal))
-            
-            # Calcular estadísticas de la señal
-            df = df.with_columns([
-                pl.col(signal).rolling_mean(window_size=5).alias(f'{signal}_mean'),
-                pl.col(signal).rolling_std(window_size=5).alias(f'{signal}_std'),
-                pl.col(signal).rolling_min(window_size=5).alias(f'{signal}_min'),
-                pl.col(signal).rolling_max(window_size=5).alias(f'{signal}_max')
-            ])
-    
-    # Extraer características de eventos
-    for event in available_features.get('events', []):
-        if event in df.columns:
-            # Asegurarse de que el evento es una columna numérica, no una lista
-            if df[event].dtype == pl.List:
-                df = df.with_columns(pl.col(event).list.first().alias(event))
-            
-            # Calcular estadísticas de eventos
-            df = df.with_columns([
-                pl.col(event).rolling_sum(window_size=5).alias(f'{event}_count'),
-                pl.col(event).rolling_mean(window_size=5).alias(f'{event}_density')
-            ])
-    
-    # Extraer características de contexto de comidas
-    if meal_df is not None and not meal_df.is_empty() and 'Timestamp' in df.columns:
-        # Calcular tiempo desde última comida
-        df = df.with_columns([
-            pl.col('Timestamp').diff().dt.total_minutes().alias('time_since_last_meal')
-        ])
-        
-        # Calcular características de comidas en ventana
-        window_hours = 2.0
-        for row in df.iter_rows(named=True):
-            bolus_time = row['Timestamp']
-            meal_context = compute_enhanced_meal_context(
-                bolus_time, meal_df, window_hours=window_hours
-            )
-            
-            # Actualizar características de comidas
-            for key, value in meal_context.items():
-                if key in df.columns:
-                    df = df.with_columns(pl.lit(value).alias(key))
-    else:
-        # Si no hay datos de comidas o Timestamp, inicializar columnas con valores por defecto
-        default_meal_features = {
-            'time_since_last_meal': 0.0,
-            'meal_carbs': 0.0,
-            'meal_time_diff_minutes': 0.0,
-            'meal_time_diff_hours': 0.0,
-            'has_meal': 0.0,
-            'meals_in_window': 0,
-            'significant_meal': 0.0,
-            'total_carbs_window': 0.0,
-            'largest_meal_carbs': 0.0,
-            'meal_timing_score': 0.0
-        }
-        for key, value in default_meal_features.items():
-            if key not in df.columns:
-                df = df.with_columns(pl.lit(value).alias(key))
-    
-    # Calcular indicadores de riesgo clínico
-    if 'value' in df.columns:
-        glucose_values = df.get_column('value').to_list()
-        physiological_data = {
-            signal: df.get_column(signal).to_list()
-            for signal in available_features.get('physiological', [])
-            if signal in df.columns
-        }
-        time_values = df.get_column('Timestamp').to_list() if 'Timestamp' in df.columns else None
-        
-        risk_indicators = compute_clinical_risk_indicators(
-            glucose_values, physiological_data, time_values
-        )
-        
-        # Actualizar indicadores de riesgo
-        for key, value in risk_indicators.items():
-            df = df.with_columns(pl.lit(value).alias(key))
-    
-    # Añadir características de tiempo cíclicas
-    if 'Timestamp' in df.columns:
-        time_features = []
-        for ts in df.get_column('Timestamp'):
-            time_features.append(encode_time_cyclical(ts))
-        
-        # Convertir a DataFrame y unir
-        time_df = pl.DataFrame(time_features)
-        df = df.hstack(time_df)
-    
-    # Rellenar valores nulos
-    df = df.fill_null(0)
-    
-    # Restaurar columnas críticas preservadas
-    for col, values in preserved_columns.items():
-        if col not in df.columns:
-            df = df.with_columns(values.alias(col))
-    
-    # Verificar características generadas
-    for group, features in feature_groups.items():
-        present = [f for f in features if f in df.columns]
-        logging.info(f"{group} generadas: {len(present)}/{len(features)}")
-        if len(present) < len(features):
-            missing = set(features) - set(present)
-            logging.warning(f"Faltan características de {group}: {missing}")
-    
-    # Verificar columnas críticas al final
-    critical_columns = ['value', 'time_in_range_24h', 'bolus']
-    missing_critical = [col for col in critical_columns if col not in df.columns]
-    if missing_critical:
-        logging.error(f"Faltan columnas críticas al final: {missing_critical}")
-        raise ValueError(f"Faltan columnas críticas al final: {missing_critical}")
+    for new_col, source_col in compatibility_features.items():
+        if source_col in df.columns and new_col not in df.columns:
+            df = df.with_columns(pl.col(source_col).alias(new_col))
     
     return df
 
@@ -2146,89 +3462,153 @@ def transform_enhanced_features(df: pl.DataFrame) -> pl.DataFrame:
     pl.DataFrame
         DataFrame con características transformadas
     """
-    logging.info("Aplicando transformaciones mejoradas...")
+    print_info("Aplicando transformaciones mejoradas...")
     
-    # Log1p transformations for skewed features
-    log_transform_cols = [
-        "bolus", "carb_input", "meal_carbs", "insulin_on_board",
-        "total_carbs_window", "largest_meal_carbs"
-    ]
+    # Aplicar todas las transformaciones usando funciones auxiliares
+    df = _apply_log_transformations(df)
+    df = _apply_percentage_normalizations(df)
+    df = _apply_time_normalizations(df)
+    df = _apply_glucose_normalizations(df)
+    df = _expand_cgm_window(df)
+    df = _create_risk_composite_scores(df)
+    df = _add_compatibility_features(df)
     
-    for col in log_transform_cols:
-        if col in df.columns:
-            df = df.with_columns(
-                pl.col(col).log1p().alias(f"{col}_log1p")
-            )
+    print_info(f"Transformaciones mejoradas completadas. Forma final: {df.shape}")
+    
+    return df
 
-    # Normalize percentage features (0-100 to 0-1)
-    percentage_cols = [
-        "hypo_percentage_24h", "hyper_percentage_24h", "time_in_range_24h", "cv_24h"
-    ]
+def _extract_cgm_statistics(cgm_window: list) -> dict:
+    """Extrae estadísticas básicas de la ventana CGM."""
+    if not cgm_window:
+        return {
+            "glucose_last": 120.0,
+            "glucose_mean": 120.0,
+            "glucose_std": 0.0,
+            "glucose_min": 120.0,
+            "glucose_max": 120.0,
+            "glucose_range": 0.0,
+            "glucose_slope": 0.0,
+        }
     
-    for col in percentage_cols:
-        if col in df.columns:
-            df = df.with_columns(
-                (pl.col(col) / 100.0).alias(f"{col}_normalized")
-            )
-    
-    # Normalize time features
-    if "meal_time_diff_hours" in df.columns:
-        df = df.with_columns(
-            (pl.col("meal_time_diff_hours") / 24.0).alias("meal_time_diff_normalized")
-        )
-    
-    # Normalize glucose-related features for stability
-    glucose_norm_cols = [
-        ("cgm_mean_24h", 200.0),
-        ("cgm_std_24h", 100.0),
-        ("cgm_median_24h", 200.0),
-        ("cgm_range_24h", 300.0),
-        ("mage_24h", 50.0),
-        ("glucose_trend_24h", 10.0)
-    ]
-    
-    for col, norm_factor in glucose_norm_cols:
-        if col in df.columns:
-            df = df.with_columns(
-                (pl.col(col) / norm_factor).alias(f"{col}_normalized")
-            )
-    
-    # Expand CGM window to individual columns
-    if "cgm_window" in df.columns:
-        window_size = CONFIG_PROCESSING["window_steps"]
-        
-        for i in range(window_size):
-            df = df.with_columns(
-                pl.col("cgm_window").list.get(i, null_on_oob=True)
-                .fill_null(120.0)
-                .alias(f"cgm_{i}")
-            )
-
-        df = df.drop("cgm_window")
-
-    # Create risk composite scores
-    if all(col in df.columns for col in ["current_hypo_risk", "stability_score", "iob_risk_factor"]):
-        df = df.with_columns(
-            (pl.col("current_hypo_risk") + pl.col("iob_risk_factor") * 0.5).alias("composite_hypo_risk")
-        )
-    
-    if all(col in df.columns for col in ["current_hyper_risk", "glucose_rate_of_change"]):
-        df = df.with_columns(
-            (pl.col("current_hyper_risk") + (pl.col("glucose_rate_of_change") / 10.0).clip(0, 1)).alias("composite_hyper_risk")
-        )
-    
-    # Add derived features for model compatibility
-    compatibility_features = {
-        "hour_of_day": "hour_of_day_normalized",
-        "has_meal_binary": "has_meal",
-        "significant_meal_binary": "significant_meal"
+    return {
+        "glucose_last": cgm_window[-1],
+        "glucose_mean": float(np.mean(cgm_window)),
+        "glucose_std": float(np.std(cgm_window)),
+        "glucose_min": float(np.min(cgm_window)),
+        "glucose_max": float(np.max(cgm_window)),
+        "glucose_range": float(np.max(cgm_window) - np.min(cgm_window)),
+        "glucose_slope": float(cgm_window[-1] - cgm_window[0]) / len(cgm_window) if len(cgm_window) > 1 else 0.0,
     }
+
+def _create_xml_compatibility_features(cgm_stats: dict, row: dict) -> dict:
+    """Crea características para compatibilidad con formato XML."""
+    return {
+        "value": cgm_stats["glucose_last"],
+        "bwz_carb_input": row.get("carb_input", 0.0),
+        "SubjectID": row.get("subject_id", 0),
+    }
+
+def _process_cgm_window_excel(df: pl.DataFrame) -> pl.DataFrame:
+    """Procesa la ventana CGM y extrae características mejoradas."""
+    if "cgm_window" not in df.columns:
+        return df
     
-    for new_col, source_col in compatibility_features.items():
-        if source_col in df.columns and new_col not in df.columns:
-            df = df.with_columns(pl.col(source_col).alias(new_col))
+    enhanced_rows = []
     
-    logging.info(f"Transformaciones mejoradas completadas. Forma final: {df.shape}")
+    for row in df.iter_rows(named=True):
+        cgm_window = row.get("cgm_window", [])
+        if not cgm_window:
+            continue
+        
+        # Extraer estadísticas CGM
+        cgm_stats = _extract_cgm_statistics(cgm_window)
+        
+        # Características de tiempo
+        timestamp = row.get("Timestamp")
+        time_features = encode_time_cyclical(timestamp) if timestamp else {}
+        
+        # Características de compatibilidad XML
+        xml_compat = _create_xml_compatibility_features(cgm_stats, row)
+        
+        # Características de riesgo
+        risk_indicators = compute_clinical_risk_indicators(
+            cgm_window, 
+            physiological_data=None,
+            time_values=None
+        )
+        
+        # Patrones de glucosa de 24h
+        glucose_patterns = compute_glucose_patterns_24h(cgm_window)
+        
+        # Combinar todas las características
+        enhanced_row = {
+            **row,
+            **cgm_stats,
+            **time_features,
+            **xml_compat,
+            **risk_indicators,
+            **glucose_patterns
+        }
+        
+        enhanced_rows.append(enhanced_row)
+    
+    return pl.DataFrame(enhanced_rows) if enhanced_rows else df
+
+def _transform_numeric_columns_excel(df: pl.DataFrame) -> pl.DataFrame:
+    """Transforma columnas numéricas asegurando tipos correctos."""
+    numeric_cols = ["bolus", "carb_input", "insulin_on_board", "insulin_carb_ratio", "insulin_sensitivity_factor"]
+    
+    for col in numeric_cols:
+        if col not in df.columns:
+            continue
+        
+        # Asegurar que es numérica y reemplazar valores extremos
+        df = df.with_columns(
+            pl.when(pl.col(col).cast(pl.Float64) < 0)
+            .then(0.0)
+            .otherwise(pl.col(col).cast(pl.Float64))
+            .alias(col)
+        )
+    
+    return df
+
+def _add_meal_derived_features_excel(df: pl.DataFrame) -> pl.DataFrame:
+    """Agrega características derivadas para comidas."""
+    if "carb_input" not in df.columns:
+        return df
+    
+    return df.with_columns([
+        (pl.col("carb_input") > 0).cast(pl.Float64).alias("has_meal"),
+        (pl.col("carb_input") > 15).cast(pl.Float64).alias("significant_meal")
+    ])
+
+def _add_missing_critical_column(df: pl.DataFrame, col: str) -> pl.DataFrame:
+    """Agrega una columna crítica faltante con valor por defecto."""
+    if col == "value" and "glucose_last" in df.columns:
+        return df.with_columns(pl.col("glucose_last").alias("value"))
+    elif col == "SubjectID" and "subject_id" in df.columns:
+        return df.with_columns(pl.col("subject_id").alias("SubjectID"))
+    elif col == "Timestamp" and "ts" in df.columns:
+        return df.with_columns(pl.col("ts").alias(col))
+    elif col == "bolus":
+        return df.with_columns(pl.lit(0.0).alias(col))
+    elif col == "value":
+        return df.with_columns(pl.lit(120.0).alias(col))
+    else:
+        return df.with_columns(pl.lit(None).alias(col))
+
+def _ensure_critical_columns_excel(df: pl.DataFrame) -> pl.DataFrame:
+    """Verifica y agrega columnas críticas para compatibilidad con XML."""
+    critical_columns = ["value", "bolus", "SubjectID", "Timestamp"]
+    missing_critical = [col for col in critical_columns if col not in df.columns]
+    
+    if not missing_critical:
+        return df
+    
+    print_warning(f"Faltan columnas críticas: {missing_critical}")
+    
+    for col in missing_critical:
+        df = _add_missing_critical_column(df, col)
     
     return df
 
@@ -2246,114 +3626,93 @@ def extract_enhanced_features_excel(df: pl.DataFrame) -> pl.DataFrame:
     pl.DataFrame
         DataFrame con características extraídas
     """
-    logging.info("Extrayendo características mejoradas para datos Excel...")
+    print_info("Extrayendo características mejoradas para datos Excel...")
     
-    # 1. Procesar ventana CGM
-    if "cgm_window" in df.columns:
-        # Extraer estadísticas de la ventana CGM
-        enhanced_rows = []
-        
-        for row in df.iter_rows(named=True):
-            cgm_window = row.get("cgm_window", [])
-            if not cgm_window:
-                continue
-                
-            # Características básicas de CGM
-            cgm_stats = {
-                "glucose_last": cgm_window[-1] if cgm_window else 120.0,
-                "glucose_mean": float(np.mean(cgm_window)) if cgm_window else 120.0,
-                "glucose_std": float(np.std(cgm_window)) if cgm_window else 0.0,
-                "glucose_min": float(np.min(cgm_window)) if cgm_window else 120.0,
-                "glucose_max": float(np.max(cgm_window)) if cgm_window else 120.0,
-                "glucose_range": float(np.max(cgm_window) - np.min(cgm_window)) if cgm_window else 0.0,
-                "glucose_slope": float(cgm_window[-1] - cgm_window[0]) / len(cgm_window) if len(cgm_window) > 1 else 0.0,
-            }
-            
-            # Características de tiempo
-            timestamp = row.get("Timestamp")
-            time_features = encode_time_cyclical(timestamp) if timestamp else {}
-            
-            # Características para compatibilidad con XML
-            xml_compat = {
-                "value": cgm_stats["glucose_last"],  # 'value' en XML corresponde al último valor de glucosa
-                "bwz_carb_input": row.get("carb_input", 0.0),
-                "SubjectID": row.get("subject_id", 0),
-            }
-            
-            # Características de riesgo
-            risk_indicators = compute_clinical_risk_indicators(
-                cgm_window, 
-                physiological_data=None,
-                time_values=None
-            )
-            
-            # Patrones de glucosa de 24h
-            glucose_patterns = compute_glucose_patterns_24h(cgm_window)
-            
-            # Crear fila con todas las características
-            enhanced_row = {
-                **row,
-                **cgm_stats,
-                **time_features,
-                **xml_compat,
-                **risk_indicators,
-                **glucose_patterns
-            }
-            
-            enhanced_rows.append(enhanced_row)
-        
-        # Crear nuevo DataFrame con características mejoradas
-        if enhanced_rows:
-            df = pl.DataFrame(enhanced_rows)
+    # Procesar ventana CGM y extraer características
+    df = _process_cgm_window_excel(df)
     
-    # 2. Transformar columnas numéricas
-    numeric_cols = ["bolus", "carb_input", "insulin_on_board", "insulin_carb_ratio", "insulin_sensitivity_factor"]
-    for col in numeric_cols:
+    # Transformar columnas numéricas
+    df = _transform_numeric_columns_excel(df)
+    
+    # Agregar características derivadas para comidas
+    df = _add_meal_derived_features_excel(df)
+    
+    # Verificar y agregar columnas críticas
+    df = _ensure_critical_columns_excel(df)
+    
+    print_info(f"Extracción de características Excel completada. Forma: {df.shape}")
+    return df
+
+def _apply_log_transforms_excel(df: pl.DataFrame) -> pl.DataFrame:
+    """Aplica transformaciones logarítmicas a características sesgadas."""
+    log_transform_cols = [
+        "bolus", "carb_input", "insulin_on_board", "insulin_carb_ratio"
+    ]
+    
+    for col in log_transform_cols:
         if col in df.columns:
-            # Asegurar que es numérica
-            df = df.with_columns(pl.col(col).cast(pl.Float64))
-            
-            # Reemplazar valores extremos
             df = df.with_columns(
-                pl.when(pl.col(col) < 0).then(0.0)
-                .otherwise(pl.col(col))
-                .alias(col)
+                pl.col(col).log1p().alias(f"{col}_log1p")
             )
+    return df
+
+def _apply_percentage_normalizations_excel(df: pl.DataFrame) -> pl.DataFrame:
+    """Normaliza características porcentuales."""
+    if "cgm_window" not in df.columns:
+        return df
+        
+    percentage_cols = [
+        "hypo_percentage_24h", "hyper_percentage_24h", "time_in_range_24h", "cv_24h"
+    ]
     
-    # 3. Agregar features derivadas para comidas
-    if "carb_input" in df.columns:
+    for col in percentage_cols:
+        if col in df.columns:
+            df = df.with_columns(
+                (pl.col(col) / 100.0).alias(f"{col}_normalized")
+            )
+    return df
+
+def _expand_cgm_window_excel(df: pl.DataFrame) -> pl.DataFrame:
+    """Expande la ventana CGM a columnas individuales."""
+    if "cgm_window" not in df.columns:
+        return df
+        
+    window_size = min(CONFIG_PROCESSING["window_steps"], 24)
+    
+    for i in range(window_size):
         df = df.with_columns(
-            # Has meal binario (1 si hay carbohidratos, 0 si no)
-            (pl.col("carb_input") > 0).cast(pl.Float64).alias("has_meal"),
-            
-            # Comida significativa (1 si es más de 15g, 0 si no)
-            (pl.col("carb_input") > 15).cast(pl.Float64).alias("significant_meal")
+            pl.col("cgm_window").list.get(i, null_on_oob=True)
+            .fill_null(120.0)
+            .alias(f"cgm_{i}")
         )
     
-    # 4. Verificar columnas críticas para compatibilidad con XML
-    critical_columns = ["value", "bolus", "SubjectID", "Timestamp"]
-    missing_critical = [col for col in critical_columns if col not in df.columns]
-    if missing_critical:
-        logging.warning(f"Faltan columnas críticas: {missing_critical}")
+    return df.drop("cgm_window")
+
+def _create_cyclical_features_excel(df: pl.DataFrame) -> pl.DataFrame:
+    """Crea características cíclicas para hora del día."""
+    if "hour_of_day" not in df.columns or "hour_sin" in df.columns:
+        return df
         
-        # Agregar columnas faltantes con valores por defecto
-        for col in missing_critical:
-            if col == "value" and "glucose_last" in df.columns:
-                df = df.with_columns(pl.col("glucose_last").alias("value"))
-            elif col == "SubjectID" and "subject_id" in df.columns:
-                df = df.with_columns(pl.col("subject_id").alias("SubjectID"))
-            else:
-                # Usar valor por defecto según el tipo de columna
-                if col == "bolus":
-                    df = df.with_columns(pl.lit(0.0).alias(col))
-                elif col == "value":
-                    df = df.with_columns(pl.lit(120.0).alias(col))
-                elif col == "Timestamp" and "ts" in df.columns:
-                    df = df.with_columns(pl.col("ts").alias(col))
-                else:
-                    df = df.with_columns(pl.lit(None).alias(col))
+    hour_radians = 2 * np.pi * (df["hour_of_day"] / 24.0)
+    df = df.with_columns([
+        pl.Series(name="hour_sin", values=np.sin(hour_radians.to_numpy())),
+        pl.Series(name="hour_cos", values=np.cos(hour_radians.to_numpy()))
+    ])
+    return df
+
+def _apply_compatibility_mappings_excel(df: pl.DataFrame) -> pl.DataFrame:
+    """Aplica mapeos de compatibilidad con formato XML."""
+    compatibility_mappings = {
+        "carb_input": "bwz_carb_input",
+        "bg_input": "glucose_last",
+        "hour_of_day": "hour_of_day_normalized",
+        "has_meal": "has_meal_binary",
+        "significant_meal": "significant_meal_binary"
+    }
     
-    logging.info(f"Extracción de características Excel completada. Forma: {df.shape}")
+    for excel_col, xml_col in compatibility_mappings.items():
+        if excel_col in df.columns and xml_col not in df.columns:
+            df = df.with_columns(pl.col(excel_col).alias(xml_col))
     return df
 
 def transform_enhanced_features_excel(df: pl.DataFrame) -> pl.DataFrame:
@@ -2371,70 +3730,16 @@ def transform_enhanced_features_excel(df: pl.DataFrame) -> pl.DataFrame:
     pl.DataFrame
         DataFrame con características transformadas
     """
-    logging.info("Transformando características de datos Excel...")
+    print_info("Transformando características de datos Excel...")
     
-    # 1. Transformaciones logarítmicas para características sesgadas
-    log_transform_cols = [
-        "bolus", "carb_input", "insulin_on_board", "insulin_carb_ratio"
-    ]
+    # Aplicar transformaciones usando funciones auxiliares
+    df = _apply_log_transforms_excel(df)
+    df = _apply_percentage_normalizations_excel(df)
+    df = _expand_cgm_window_excel(df)
+    df = _create_cyclical_features_excel(df)
+    df = _apply_compatibility_mappings_excel(df)
     
-    for col in log_transform_cols:
-        if col in df.columns:
-            df = df.with_columns(
-                # Usar log1p para manejar valores cero
-                pl.col(col).log1p().alias(f"{col}_log1p")
-            )
-    
-    # 2. Normalizar características porcentuales
-    if "cgm_window" in df.columns:
-        percentage_cols = [
-            "hypo_percentage_24h", "hyper_percentage_24h", "time_in_range_24h", "cv_24h"
-        ]
-        
-        for col in percentage_cols:
-            if col in df.columns:
-                df = df.with_columns(
-                    (pl.col(col) / 100.0).alias(f"{col}_normalized")
-                )
-    
-    # 3. Expandir la ventana CGM a columnas individuales
-    if "cgm_window" in df.columns:
-        window_size = min(CONFIG_PROCESSING["window_steps"], 24)  # Usar hasta 24 puntos
-        
-        for i in range(window_size):
-            df = df.with_columns(
-                pl.col("cgm_window").list.get(i, null_on_oob=True)
-                .fill_null(120.0)  # Valor por defecto para missing
-                .alias(f"cgm_{i}")
-            )
-        
-        # Eliminar columna de lista original para ahorrar espacio
-        df = df.drop("cgm_window")
-    
-    # 4. Crear variables dummy para características categóricas
-    if "hour_of_day" in df.columns:
-        # Características cíclicas para hora del día (si no existen ya)
-        if "hour_sin" not in df.columns:
-            hour_radians = 2 * np.pi * (df["hour_of_day"] / 24.0)
-            df = df.with_columns([
-                pl.Series(name="hour_sin", values=np.sin(hour_radians.to_numpy())),
-                pl.Series(name="hour_cos", values=np.cos(hour_radians.to_numpy()))
-            ])
-    
-    # 5. Asegurar compatibilidad de nombres con formato XML
-    compatibility_mappings = {
-        "carb_input": "bwz_carb_input",
-        "bg_input": "glucose_last",
-        "hour_of_day": "hour_of_day_normalized",
-        "has_meal": "has_meal_binary",
-        "significant_meal": "significant_meal_binary"
-    }
-    
-    for excel_col, xml_col in compatibility_mappings.items():
-        if excel_col in df.columns and xml_col not in df.columns:
-            df = df.with_columns(pl.col(excel_col).alias(xml_col))
-    
-    logging.info(f"Transformación de características Excel completada. Forma: {df.shape}")
+    print_info(f"Transformación de características Excel completada. Forma: {df.shape}")
     return df
 
 def unify_datetime_precision(df: pl.DataFrame) -> pl.DataFrame:
@@ -2466,6 +3771,137 @@ def unify_datetime_precision(df: pl.DataFrame) -> pl.DataFrame:
     
     return df
 
+def _determine_preferred_type(current_type: pl.DataType, new_type: pl.DataType) -> pl.DataType:
+    """
+    Determina el tipo preferido entre dos tipos de datos.
+    
+    Parámetros:
+    -----------
+    current_type : pl.DataType
+        Tipo actual
+    new_type : pl.DataType
+        Nuevo tipo a considerar
+        
+    Retorna:
+    --------
+    pl.DataType
+        Tipo preferido
+    """
+    current_str = str(current_type)
+    new_str = str(new_type)
+    
+    # Preferir tipos numéricos sobre string
+    if current_str == "Utf8" and (new_str == "Float64" or new_str == "Int32"):
+        return new_type
+    
+    # Preferir Float64 sobre Int32 para columnas numéricas
+    if current_str == "Int32" and new_str == "Float64":
+        return new_type
+    
+    # Para columnas de fecha, usar siempre microsegundos
+    if "Datetime" in current_str and "Datetime" in new_str:
+        return pl.Datetime(time_unit="us")
+    
+    return current_type
+
+def _collect_column_types(data_frames: list[pl.DataFrame]) -> dict[str, pl.DataType]:
+    """
+    Recopila los tipos de columnas de todos los DataFrames.
+    
+    Parámetros:
+    -----------
+    data_frames : list[pl.DataFrame]
+        Lista de DataFrames
+        
+    Retorna:
+    --------
+    dict[str, pl.DataType]
+        Diccionario con tipos preferidos por columna
+    """
+    column_types = {}
+    
+    for df in data_frames:
+        for col in df.columns:
+            col_type = df[col].dtype
+            
+            # Saltar si la columna es de tipo Null
+            if str(col_type) == "Null":
+                continue
+            
+            if col not in column_types:
+                column_types[col] = col_type
+            else:
+                column_types[col] = _determine_preferred_type(column_types[col], col_type)
+    
+    return column_types
+
+def _create_fallback_expression(col: str, target_type: pl.DataType) -> pl.Expr:
+    """
+    Crea una expresión de respaldo cuando falla la conversión normal.
+    
+    Parámetros:
+    -----------
+    col : str
+        Nombre de la columna
+    target_type : pl.DataType
+        Tipo objetivo
+        
+    Retorna:
+    --------
+    pl.Expr
+        Expresión de polars para la conversión de respaldo
+    """
+    target_str = str(target_type)
+    
+    if target_str == "Utf8":
+        return pl.col(col).cast(pl.Utf8).alias(col)
+    elif target_str == "Float64":
+        return pl.lit(None).cast(pl.Float64).alias(col)
+    elif target_str == "Int32":
+        return pl.lit(None).cast(pl.Int32).alias(col)
+    elif "Datetime" in target_str:
+        return pl.lit(None).cast(pl.Datetime(time_unit="us")).alias(col)
+    else:
+        return pl.col(col).alias(col)
+
+def _convert_dataframe_columns(df: pl.DataFrame, column_types: dict[str, pl.DataType]) -> pl.DataFrame:
+    """
+    Convierte las columnas de un DataFrame a los tipos especificados.
+    
+    Parámetros:
+    -----------
+    df : pl.DataFrame
+        DataFrame a convertir
+    column_types : dict[str, pl.DataType]
+        Diccionario con tipos objetivo por columna
+        
+    Retorna:
+    --------
+    pl.DataFrame
+        DataFrame con columnas convertidas
+    """
+    exprs = []
+    
+    for col in df.columns:
+        if col not in column_types:
+            continue
+            
+        target_type = column_types[col]
+        
+        # Solo convertir si el tipo actual es diferente
+        if str(df[col].dtype) != str(target_type):
+            try:
+                exprs.append(pl.col(col).cast(target_type).alias(col))
+            except Exception as e:
+                print_warning(f"Error al convertir columna {col}: {e}")
+                exprs.append(_create_fallback_expression(col, target_type))
+    
+    # Aplicar conversiones si es necesario
+    if exprs:
+        df = df.with_columns(exprs)
+    
+    return df
+
 def unify_column_types(data_frames: list[pl.DataFrame]) -> list[pl.DataFrame]:
     """
     Unifica los tipos de datos entre DataFrames para evitar conflictos en la concatenación.
@@ -2483,64 +3919,146 @@ def unify_column_types(data_frames: list[pl.DataFrame]) -> list[pl.DataFrame]:
     if not data_frames:
         return data_frames
     
+    print_info("Unificando tipos de columnas para concatenación...")
+    
     # Determinar el tipo más apropiado para cada columna
-    column_types = {}
+    column_types = _collect_column_types(data_frames)
     
-    # Primera pasada: identificar todas las columnas y sus tipos
+    # Convertir todos los DataFrames para usar tipos consistentes
+    converted_frames = []
     for df in data_frames:
-        for col in df.columns:
-            col_type = df[col].dtype
-            
-            # Saltar si la columna es de tipo Null
-            if str(col_type) == "Null":
-                continue
-            
-            # Inicializar o actualizar la preferencia de tipo de columna
-            if col not in column_types:
-                column_types[col] = col_type
-            else:
-                current_type = column_types[col]
-                
-                # Preferir tipos numéricos sobre string
-                if str(current_type) == "Utf8" and (str(col_type) == "Float64" or str(col_type) == "Int32"):
-                    column_types[col] = col_type
-                # Preferir Float64 sobre Int32 para columnas numéricas
-                elif str(current_type) == "Int32" and str(col_type) == "Float64":
-                    column_types[col] = col_type
-                # Para columnas de fecha, usar siempre microsegundos
-                elif "Datetime" in str(current_type) and "Datetime" in str(col_type):
-                    column_types[col] = pl.Datetime(time_unit="us")
+        converted_df = _convert_dataframe_columns(df, column_types)
+        converted_frames.append(converted_df)
     
-    logging.info("Unificando tipos de columnas para concatenación...")
+    return converted_frames
+
+def _process_xml_data() -> tuple[list[pl.DataFrame], set]:
+    """Procesa datos XML y retorna DataFrames con columnas encontradas."""
+    print_info(f"Iniciando procesamiento paralelo de {len(OHIO_DATA_DIRS)} directorios XML...")
+    xml_data_frames_results = Parallel(n_jobs=-1)(
+        delayed(process_xml_directory)(data_dir)
+        for data_dir in OHIO_DATA_DIRS
+    )
+
+    xml_data_frames = [df for df in xml_data_frames_results if df is not None]
+    all_columns = set()
     
-    # Segunda pasada: actualizar todos los DataFrames para usar tipos consistentes
-    for i, df in enumerate(data_frames):
-        exprs = []
+    for df in xml_data_frames:
         for col in df.columns:
-            if col in column_types:
-                target_type = column_types[col]
-                # Solo convertir si el tipo actual es diferente
-                if str(df[col].dtype) != str(target_type):
-                    try:
-                        exprs.append(pl.col(col).cast(target_type).alias(col))
-                    except Exception as e:
-                        # Si la conversión falla, intentar método alternativo
-                        logging.warning(f"Error al convertir columna {col}: {e}")
-                        if str(target_type) == "Utf8":
-                            exprs.append(pl.col(col).cast(pl.Utf8).alias(col))
-                        elif str(target_type) == "Float64":
-                            exprs.append(pl.lit(None).cast(pl.Float64).alias(col))
-                        elif str(target_type) == "Int32":
-                            exprs.append(pl.lit(None).cast(pl.Int32).alias(col))
-                        elif "Datetime" in str(target_type):
-                            exprs.append(pl.lit(None).cast(pl.Datetime(time_unit="us")).alias(col))
+            all_columns.add(col)
+
+    print_info(f"Procesamiento XML completado. Obtenidos {len(xml_data_frames)} DataFrames válidos.")
+    return xml_data_frames, all_columns
+
+def _normalize_subject_ids(xml_data_frames: list[pl.DataFrame]) -> list[pl.DataFrame]:
+    """Normaliza SubjectIDs a valores numéricos."""
+    for i, df in enumerate(xml_data_frames):
+        if "SubjectID" in df.columns and df["SubjectID"].dtype != pl.Int64:
+            xml_data_frames[i] = df.with_columns(
+                pl.col("SubjectID").map_elements(
+                    lambda x: extract_numeric_id(str(x)) if x is not None else None
+                ).cast(pl.Int64)
+            )
+    return xml_data_frames
+
+def _process_excel_data() -> tuple[list[pl.DataFrame], set]:
+    """Procesa datos Excel y retorna DataFrames con columnas encontradas."""
+    excel_data_frames = []
+    all_columns = set()
+    
+    if not USE_EXCEL_DATA:
+        return excel_data_frames, all_columns
         
-        # Aplicar conversiones si es necesario
-        if exprs:
-            df = df.with_columns(exprs)
-            data_frames[i] = df
+    subject_files = [f for f in os.listdir(DATA_PATH_SUBJECTS) 
+                    if f.startswith("Subject") and f.endswith(".xlsx")]
     
-    return data_frames
+    print_info(f"\nArchivos de sujetos encontrados ({len(subject_files)}):")
+    for f in subject_files:
+        print_info(f)
+
+    excel_data = Parallel(n_jobs=-1)(
+        delayed(process_excel_subject)(os.path.join(DATA_PATH_SUBJECTS, f), idx)
+        for idx, f in enumerate(subject_files)
+    )
+    
+    excel_data = [item for sublist in excel_data for item in sublist if item is not None]
+
+    if excel_data:
+        df_excel = pl.DataFrame(excel_data)
+        df_excel = _apply_column_mappings(df_excel)
+        df_excel = extract_enhanced_features_excel(df_excel)
+        df_excel = transform_enhanced_features_excel(df_excel)
+        
+        for col in df_excel.columns:
+            all_columns.add(col)
+        
+        excel_data_frames.append(df_excel)
+        print_info(f"DataFrame Excel procesado: {df_excel.shape}")
+    else:
+        print_warning("No se pudieron procesar datos Excel")
+    
+    return excel_data_frames, all_columns
+
+def _apply_column_mappings(df_excel: pl.DataFrame) -> pl.DataFrame:
+    """Aplica mapeos de columnas entre Excel y XML."""
+    column_mappings = {
+        "subject_id": "SubjectID",
+        "cgm_window": "cgm_window",
+        "carb_input": "bwz_carb_input",
+        "bg_input": "glucose_last",
+        "bolus": "bolus"
+    }
+    
+    for excel_col, xml_col in column_mappings.items():
+        if excel_col in df_excel.columns and xml_col not in df_excel.columns:
+            df_excel = df_excel.rename({excel_col: xml_col})
+    
+    return df_excel
+
+def _get_column_type_for_missing(col: str) -> pl.DataType:
+    """Determina el tipo de dato apropiado para una columna faltante."""
+    if col in ['meals_in_window', 'hypo_episodes_24h', 'hyper_episodes_24h']:
+        return pl.Int32
+    elif any(prefix in col for prefix in ['glucose_', 'time_', 'meal_', 'risk_', 'percentage']):
+        return pl.Float64
+    else:
+        return pl.Utf8
+
+def _harmonize_dataframes(all_data_frames: list[pl.DataFrame], all_columns: set) -> list[pl.DataFrame]:
+    """Armoniza DataFrames para que tengan las mismas columnas y tipos."""
+    print_info(f"Armonizando {len(all_data_frames)} DataFrames con {len(all_columns)} columnas...")
+
+    column_types = {}
+    for df in all_data_frames:
+        for col in df.columns:
+            column_types[col] = df[col].dtype
+
+    for i, df in enumerate(all_data_frames):
+        missing_cols = all_columns - set(df.columns)
+        
+        if missing_cols:
+            print_info(f"Añadiendo {len(missing_cols)} columnas faltantes al DataFrame {i+1}")
+            for col in missing_cols:
+                if col in column_types:
+                    df = df.with_columns(pl.lit(None).cast(column_types[col]).alias(col))
+                else:
+                    col_type = _get_column_type_for_missing(col)
+                    df = df.with_columns(pl.lit(None).cast(col_type).alias(col))
+        
+        all_data_frames[i] = df
+    
+    return all_data_frames
+
+def _finalize_dataframes(all_data_frames: list[pl.DataFrame], all_columns: set) -> list[pl.DataFrame]:
+    """Finaliza DataFrames con orden de columnas y tipos unificados."""
+    ordered_columns = sorted(all_columns)
+    
+    for i, df in enumerate(all_data_frames):
+        df = df.select(ordered_columns)
+        df = unify_datetime_precision(df)
+        all_data_frames[i] = df
+
+    return unify_column_types(all_data_frames)
 
 def preprocess_data() -> pl.DataFrame:
     """
@@ -2552,155 +4070,33 @@ def preprocess_data() -> pl.DataFrame:
     pl.DataFrame
         DataFrame con datos preprocesados.
     """
-    logging.info("Procesando datos priorizando XML sobre Excel...")
+    print_info("Procesando datos priorizando XML sobre Excel...")
     
-    # Procesar datos XML usando pl_ohio_only.py
-    xml_data_frames = []
-    column_mapping = {}  # Para mapear nombres de columnas entre fuentes
-    all_columns = set()  # Para rastrear todas las columnas de todos los DataFrames
+    # 1. Procesar datos XML
+    xml_data_frames, xml_columns = _process_xml_data()
+    xml_data_frames = _normalize_subject_ids(xml_data_frames)
     
-    # 1. Procesar datos XML en paralelo (Ohio dataset)
-    logging.info(f"Iniciando procesamiento paralelo de {len(OHIO_DATA_DIRS)} directorios XML...")
-    xml_data_frames_results = Parallel(n_jobs=-1)(
-        delayed(process_xml_directory)(data_dir)
-        for data_dir in OHIO_DATA_DIRS
-    )
-
-    # Filtrar resultados None y extraer columnas
-    xml_data_frames = [df for df in xml_data_frames_results if df is not None]
-    for df in xml_data_frames:
-        for col in df.columns:
-            all_columns.add(col)
-
-    logging.info(f"Procesamiento XML completado. Obtenidos {len(xml_data_frames)} DataFrames válidos.")
+    # 2. Procesar datos Excel
+    excel_data_frames, excel_columns = _process_excel_data()
     
-    # Setear SubjectIDs a numericos
-    for i, df in enumerate(xml_data_frames):
-        if "SubjectID" in df.columns:
-            # Asegurar que SubjectID es numérico
-            if df["SubjectID"].dtype != pl.Int64:
-                xml_data_frames[i] = df.with_columns(
-                    pl.col("SubjectID").map_elements(
-                        lambda x: extract_numeric_id(str(x)) if x is not None else None
-                    ).cast(pl.Int64)
-                )
-        
-    # 2. Procesar datos Excel desde la carpeta de sujetos
-    excel_data_frames = []  # Lista para almacenar DataFrames procesados
-    if USE_EXCEL_DATA:
-        subject_files: list[str] = [f for f in os.listdir(DATA_PATH_SUBJECTS) if f.startswith("Subject") and f.endswith(".xlsx")]
-        logging.info(f"\nArchivos de sujetos encontrados ({len(subject_files)}):")
-        for f in subject_files:
-            logging.info(f)
-
-        # Procesar datos Excel en paralelo usando joblib
-        excel_data: list[dict] = Parallel(n_jobs=-1)(
-            delayed(process_excel_subject)(os.path.join(DATA_PATH_SUBJECTS, f), idx)
-            for idx, f in enumerate(subject_files)
-        )
-        # Aplanar la lista de resultados
-        excel_data = [item for sublist in excel_data for item in sublist if item is not None]
-
-        if excel_data:
-            # Convertir a DataFrame
-            df_excel: pl.DataFrame = pl.DataFrame(excel_data)
-            
-            # Realizar mapeo de columnas si es necesario
-            column_mappings = {
-                "subject_id": "SubjectID",      # Mapear ID del sujeto
-                "cgm_window": "cgm_window",     # Mantener ventana CGM
-                "carb_input": "bwz_carb_input", # Mapear carbohidratos
-                "bg_input": "glucose_last",     # Mapear entrada de glucosa
-                "bolus": "bolus"                # Mantener nombre de bolus
-            }
-            
-            # Aplicar mapeos de columnas necesarios
-            for excel_col, xml_col in column_mappings.items():
-                if excel_col in df_excel.columns and xml_col not in df_excel.columns:
-                    df_excel = df_excel.rename({excel_col: xml_col})
-            
-            # Aplicar las mismas transformaciones de características que a los datos XML
-            print_debug(f"Columnas df_excel: {df_excel.columns}")
-            df_excel = extract_enhanced_features_excel(df_excel)
-            df_excel = transform_enhanced_features_excel(df_excel)
-            
-            # Guardar nombres de columnas
-            for col in df_excel.columns:
-                all_columns.add(col)
-            
-            # Añadir a la lista de DataFrames
-            excel_data_frames.append(df_excel)
-            logging.info(f"DataFrame Excel procesado: {df_excel.shape}")
-        else:
-            excel_data_frames = []
-            logging.warning("No se pudieron procesar datos Excel")
-    
-    # 3. Unificar todos los DataFrames
-    print_debug(f"All columns: {all_columns}") 
+    # 3. Combinar y unificar
     all_data_frames = xml_data_frames + excel_data_frames
+    all_columns = xml_columns | excel_columns
     
     if not all_data_frames:
         raise ValueError("No se pudieron procesar datos de ninguna fuente")
     
     print_info(f"Total de DataFrames procesados: {len(all_data_frames)}")
     
-    # 4. Asegurar que todos los DataFrames tengan las mismas columnas antes de concatenar
-    logging.info(f"Armonizando {len(all_data_frames)} DataFrames con {len(all_columns)} columnas...")
-
-    # Primero determinar el tipo de cada columna a partir de los DataFrames existentes
-    column_types = {}
-    for df in all_data_frames:
-        for col in df.columns:
-            column_types[col] = df[col].dtype
-
-    for i, df in enumerate(all_data_frames):
-        # Identificar columnas faltantes en este DataFrame
-        missing_cols = all_columns - set(df.columns)
-        
-        # Añadir columnas faltantes con valores nulos y tipo correcto
-        if missing_cols:
-            logging.info(f"Añadiendo {len(missing_cols)} columnas faltantes al DataFrame {i+1}")
-            for col in missing_cols:
-                # Si conocemos el tipo, crear columna con ese tipo específico
-                if col in column_types:
-                    df = df.with_columns(
-                        pl.lit(None).cast(column_types[col]).alias(col)
-                    )
-                else:
-                    # Tipo por defecto para columnas donde no conocemos el tipo
-                    # Integer para columnas que podrían ser numéricas (excepto algunas específicas)
-                    if col in ['meals_in_window', 'hypo_episodes_24h', 'hyper_episodes_24h']:
-                        df = df.with_columns(
-                            pl.lit(None).cast(pl.Int32).alias(col)
-                        )
-                    # Float para columnas que probablemente sean numéricas con valores decimales
-                    elif any(prefix in col for prefix in ['glucose_', 'time_', 'meal_', 'risk_', 'percentage']):
-                        df = df.with_columns(
-                            pl.lit(None).cast(pl.Float64).alias(col)
-                        )
-                    else:
-                        df = df.with_columns(pl.lit(None).alias(col))
-        
-        # Actualizar el DataFrame en la lista
-        all_data_frames[i] = df
+    # 4. Armonizar y finalizar DataFrames
+    all_data_frames = _harmonize_dataframes(all_data_frames, all_columns)
+    all_data_frames = _finalize_dataframes(all_data_frames, all_columns)
     
-    # 5. Asegurar el mismo orden de columnas y precisión en todos los DataFrames
-    ordered_columns = sorted(all_columns)
-    for i, df in enumerate(all_data_frames):
-        # Primero seleccionar las columnas en el mismo orden
-        df = df.select(ordered_columns)
-        # Luego unificar la precisión de las columnas datetime
-        df = unify_datetime_precision(df)
-        all_data_frames[i] = df
-
-    # 6. Unificar tipos de columnas antes de concatenar
-    all_data_frames = unify_column_types(all_data_frames)
-
-    # 6. Concatenar todos los DataFrames
-    logging.info(f"Concatenando {len(all_data_frames)} DataFrames...")
+    # 5. Concatenar y retornar
+    print_info(f"Concatenando {len(all_data_frames)} DataFrames...")
     final_df = pl.concat(all_data_frames)
     
-    logging.info(f"Procesamiento completado. Forma final: {final_df.shape}")
+    print_info(f"Procesamiento completado. Forma final: {final_df.shape}")
     return final_df
 
 def calculate_stats_for_group(df: pl.DataFrame, subjects: list, feature: str = 'bolus') -> tuple:
@@ -2882,7 +4278,7 @@ def split_data(df_final: pl.DataFrame) -> tuple:
         - mean_std_cgm, mean_std_other, mean_std_y: diccionarios con medias y desviaciones estándar
     """
     start_time = time.time()
-    logging.info("Iniciando división de datos...")
+    print_info("Iniciando división de datos...")
     
     # Estadísticas por sujeto
     subject_stats = df_final.group_by("subject_id").agg([
@@ -2896,7 +4292,7 @@ def split_data(df_final: pl.DataFrame) -> tuple:
     train_size = int(0.8 * n_subjects)
     val_size = int(0.1 * n_subjects)
     test_size = n_subjects - train_size - val_size
-    logging.info(f"Total de sujetos: {n_subjects}, Train: {train_size}, Val: {val_size}, Test: {test_size}")
+    print_info(f"Total de sujetos: {n_subjects}, Train: {train_size}, Val: {val_size}, Test: {test_size}")
 
     # Iniciar con sujeto específico para pruebas si está disponible
     test_subjects = [49] if 49 in sorted_subjects else []
@@ -2907,7 +4303,7 @@ def split_data(df_final: pl.DataFrame) -> tuple:
     # Aleatorizar la lista restante
     rng = np.random.default_rng(seed=CONST_DEFAULT_SEED)
     rng.shuffle(remaining_subjects)
-    logging.info("Sujetos aleatorizados para asignación.")
+    print_info("Sujetos aleatorizados para asignación.")
 
     # Distribuir sujetos entre los grupos
     for subject in tqdm(remaining_subjects, desc="Asignando sujetos a grupos"):
@@ -2925,7 +4321,7 @@ def split_data(df_final: pl.DataFrame) -> tuple:
     for set_name, df_set in [("Train", df_train), ("Val", df_val), ("Test", df_test)]:
         y_mean = df_set['bolus'].mean()
         y_std = df_set['bolus'].std()
-        logging.info(f"Post-split {set_name} y: mean = {y_mean}, std = {y_std}")
+        print_info(f"Post-split {set_name} y: mean = {y_mean}, std = {y_std}")
 
     # Definir columnas para diferentes grupos de características
     cgm_columns = [f'cgm_{i}' for i in range(24)]
@@ -2968,13 +4364,13 @@ def split_data(df_final: pl.DataFrame) -> tuple:
     x_subject_test = df_test['subject_id'].to_numpy()
     
     # Imprimir resumen
-    logging.info(f"Entrenamiento CGM: {x_cgm_train.shape}, Validación CGM: {x_cgm_val.shape}, Prueba CGM: {x_cgm_test.shape}")
-    logging.info(f"Entrenamiento Otros: {x_other_train.shape}, Validación Otros: {x_other_val.shape}, Prueba Otros: {x_other_test.shape}")
-    logging.info(f"Entrenamiento Subject: {x_subject_train.shape}, Validación Subject: {x_subject_val.shape}, Prueba Subject: {x_subject_test.shape}")
-    logging.info(f"Sujetos de prueba: {test_subjects}")
+    print_info(f"Entrenamiento CGM: {x_cgm_train.shape}, Validación CGM: {x_cgm_val.shape}, Prueba CGM: {x_cgm_test.shape}")
+    print_info(f"Entrenamiento Otros: {x_other_train.shape}, Validación Otros: {x_other_val.shape}, Prueba Otros: {x_other_test.shape}")
+    print_info(f"Entrenamiento Subject: {x_subject_train.shape}, Validación Subject: {x_subject_val.shape}, Prueba Subject: {x_subject_test.shape}")
+    print_info(f"Sujetos de prueba: {test_subjects}")
 
     elapsed_time = time.time() - start_time
-    logging.info(f"División de datos completa en {elapsed_time:.2f} segundos")
+    print_info(f"División de datos completa en {elapsed_time:.2f} segundos")
     
     return (x_cgm_train, x_cgm_val, x_cgm_test,
             x_other_train, x_other_val, x_other_test,

@@ -1,6 +1,9 @@
 import numpy as np
 from typing import Tuple, List, Dict, Any, Optional
 
+from constants.constants import SEVERE_HYPERGLYCEMIA_THRESHOLD, SEVERE_HYPOGLYCEMIA_THRESHOLD
+from training.utils import compute_reward
+
 class GlucoseSimulator:
     """
     Simulador de dinámica de glucosa para validar dosis de insulina.
@@ -78,44 +81,9 @@ class GlucoseSimulator:
             t = time_points[i]
             dt = time_points[i] - time_points[i-1]  # Diferencia de tiempo en horas
             
-            # Efecto de insulina activa (IOB)
-            insulin_effect = 0
-            for dose, dose_time in zip(insulin_doses, timestamps):
-                if t > dose_time:
-                    # Modelo de acción de insulina: efecto máximo a las 2 horas, luego decae
-                    time_since_dose = t - dose_time
-                    if time_since_dose < self.insulin_duration_hours:
-                        if time_since_dose < 2:
-                            # Fase creciente (0-2 horas)
-                            effect_fraction = time_since_dose / 2
-                        else:
-                            # Fase decreciente (2-4 horas)
-                            effect_fraction = 1 - (time_since_dose - 2) / (self.insulin_duration_hours - 2)
-                        
-                        # Efecto de la insulina en mg/dL
-                        effect = dose * self.insulin_sensitivity * effect_fraction * dt
-                        insulin_effect += effect
-            
-            # Efecto de carbohidratos activos (COB)
-            carb_effect = 0
-            for carbs, carb_time in zip(carb_intakes, timestamps):
-                if t > carb_time:
-                    # Modelo de absorción de carbohidratos: efecto máximo a la hora, dura 3 horas
-                    time_since_intake = t - carb_time
-                    if time_since_intake < 3:
-                        if time_since_intake < 1:
-                            # Fase creciente (0-1 hora)
-                            effect_fraction = time_since_intake
-                        else:
-                            # Fase decreciente (1-3 horas)
-                            effect_fraction = 1 - (time_since_intake - 1) / 2
-                        
-                        # Conversión carbohidratos a glucosa (mg/dL)
-                        # Aproximadamente 1g de carbohidratos eleva 5 mg/dL para un adulto promedio
-                        effect = carbs * 5 * effect_fraction * dt
-                        carb_effect += effect
-            
-            # Efecto de producción de glucosa basal
+            # Calcular efectos de insulina, carbohidratos y basal
+            insulin_effect = self._calculate_insulin_effect(insulin_doses, timestamps, t, dt)
+            carb_effect = self._calculate_carb_effect(carb_intakes, timestamps, t, dt)
             basal_effect = self.basal_glucose_impact * dt
             
             # Actualizar nivel de glucosa
@@ -125,3 +93,105 @@ class GlucoseSimulator:
             glucose_trajectory[i] = max(40, glucose_trajectory[i])
         
         return glucose_trajectory
+
+    def _calculate_insulin_effect(self, insulin_doses: List[float], timestamps: List[float], 
+                                  current_time: float, dt: float) -> float:
+        """Calcula el efecto de insulina activa (IOB) en el tiempo actual."""
+        insulin_effect = 0
+        for dose, dose_time in zip(insulin_doses, timestamps):
+            if current_time > dose_time:
+                time_since_dose = current_time - dose_time
+                if time_since_dose < self.insulin_duration_hours:
+                    effect_fraction = self._get_insulin_effect_fraction(time_since_dose)
+                    effect = dose * self.insulin_sensitivity * effect_fraction * dt
+                    insulin_effect += effect
+        return insulin_effect
+
+    def _get_insulin_effect_fraction(self, time_since_dose: float) -> float:
+        """Calcula la fracción de efecto de insulina basada en el tiempo transcurrido."""
+        if time_since_dose < 2:
+            # Fase creciente (0-2 horas)
+            return time_since_dose / 2
+        else:
+            # Fase decreciente (2-4 horas)
+            return 1 - (time_since_dose - 2) / (self.insulin_duration_hours - 2)
+
+    def _calculate_carb_effect(self, carb_intakes: List[float], timestamps: List[float], 
+                               current_time: float, dt: float) -> float:
+        """Calcula el efecto de carbohidratos activos (COB) en el tiempo actual."""
+        carb_effect = 0
+        for carbs, carb_time in zip(carb_intakes, timestamps):
+            if current_time > carb_time:
+                time_since_intake = current_time - carb_time
+                if time_since_intake < 3:
+                    effect_fraction = self._get_carb_effect_fraction(time_since_intake)
+                    # Conversión carbohidratos a glucosa (mg/dL)
+                    # Aproximadamente 1g de carbohidratos eleva 5 mg/dL para un adulto promedio
+                    effect = carbs * 5 * effect_fraction * dt
+                    carb_effect += effect
+        return carb_effect
+
+    def _get_carb_effect_fraction(self, time_since_intake: float) -> float:
+        """Calcula la fracción de efecto de carbohidratos basada en el tiempo transcurrido."""
+        if time_since_intake < 1:
+            # Fase creciente (0-1 hora)
+            return time_since_intake
+        else:
+            # Fase decreciente (1-3 horas)
+            return 1 - (time_since_intake - 1) / 2
+    
+    def step(self, 
+             action_insulin: float, 
+             current_glucose: float, 
+             carb_intake: float) -> Tuple[float, float, bool, Dict[str, Any]]:
+        """
+        Simula un paso de tiempo (5 minutos) en el entorno de glucosa.
+
+        Parámetros:
+        -----------
+        action_insulin : float
+            Dosis de insulina administrada en este paso (unidades).
+        current_glucose : float
+            Nivel de glucosa actual (mg/dL).
+        carb_intake : float
+            Ingesta de carbohidratos en este paso (gramos).
+
+        Retorna:
+        --------
+        Tuple[float, float, bool, Dict[str, Any]]
+            (siguiente_glucosa, recompensa, finalizado, info)
+        """
+        dt = 5 / 60  # Paso de tiempo de 5 minutos en horas
+
+        # Efecto de la insulina administrada en este paso
+        # Usando la lógica de la fase creciente de predict_glucose_trajectory:
+        # effect_fraction = time_since_dose / 2 (donde time_since_dose = dt)
+        # insulin_effect_calc = action_insulin * self.insulin_sensitivity * effect_fraction * dt
+        insulin_effect_calc = action_insulin * self.insulin_sensitivity * (dt / 2.0) * dt
+
+        # Efecto de los carbohidratos ingeridos en este paso
+        # Usando la lógica de la fase creciente de predict_glucose_trajectory:
+        # effect_fraction = time_since_intake / 1 (donde time_since_intake = dt, pico a 1h)
+        # carb_effect_calc = carb_intake * 5 * effect_fraction * dt (5 es factor de conversión g a mg/dL)
+        carb_effect_calc = carb_intake * 5 * (dt / 1.0) * dt
+        
+        # Efecto de producción de glucosa basal
+        basal_effect_calc = self.basal_glucose_impact * dt
+        
+        # Calcular siguiente nivel de glucosa
+        next_glucose = current_glucose + carb_effect_calc - insulin_effect_calc + basal_effect_calc
+        
+        # Limitar valores mínimos y máximos fisiológicos
+        next_glucose = max(20.0, min(next_glucose, 600.0)) # Rango fisiológico amplio
+
+        # Calcular recompensa
+        reward = compute_reward(next_glucose)
+        
+        # Determinar si el episodio ha terminado
+        # Termina si la glucosa alcanza niveles extremadamente peligrosos
+        done = bool(next_glucose <= SEVERE_HYPOGLYCEMIA_THRESHOLD - 10 or \
+                    next_glucose >= SEVERE_HYPERGLYCEMIA_THRESHOLD + 100) # Umbrales más amplios para 'done'
+        
+        info: Dict[str, Any] = {}
+        
+        return next_glucose, reward, done, info

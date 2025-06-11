@@ -1,3 +1,5 @@
+import inspect
+import os
 class ForegroundColours:
     BLACK = "\033[30m"
     RED = "\033[31m"
@@ -103,7 +105,7 @@ def cprint(text, colour=None, background=None, style=None):
         style (str or list): Estilo del texto. Opciones: 'bold', 'underline', 'reversed'.
     """
     print(coloured(text, colour=colour, background=background, style=style))
-    
+
 def print_error(text):
     """
     Imprime un mensaje de error en rojo.
@@ -111,7 +113,13 @@ def print_error(text):
     Args:
         text (str): Mensaje de error a imprimir.
     """
-    print(coloured("ERROR", colour='white', background='red', style='bold') + " " + coloured(text, colour='red', style='bold'))
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back
+    filename = os.path.basename(caller_frame.f_code.co_filename)
+    line_number = caller_frame.f_lineno
+    file_line_name = f"{filename}:{line_number}"
+    final_msg = f" | [{file_line_name}] {text}"
+    print(coloured("ERROR", colour='white', background='red', style='bold') + " " + coloured(final_msg, colour='red', style='bold'))
 
 def print_warning(text):
     """
@@ -120,7 +128,13 @@ def print_warning(text):
     Args:
         text (str): Mensaje de advertencia a imprimir.
     """
-    print(coloured("WARNING", colour='black', background='yellow', style='bold') + " " + coloured(text, colour='yellow', style='bold'))
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back
+    filename = os.path.basename(caller_frame.f_code.co_filename)
+    line_number = caller_frame.f_lineno
+    file_line_name = f"{filename}:{line_number}"
+    final_msg = f" | [{file_line_name}] {text}"
+    print(coloured("WARNING", colour='black', background='yellow', style='bold') + " " + coloured(final_msg, colour='yellow', style='bold'))
 
 def print_critical(text):
     """
@@ -129,7 +143,13 @@ def print_critical(text):
     Args:
         text (str): Mensaje crítico a imprimir.
     """
-    print(coloured("CRITICAL", colour='white', background='red', style='bold') + " " + coloured(text, colour='red', style='bold'))
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back
+    filename = os.path.basename(caller_frame.f_code.co_filename)
+    line_number = caller_frame.f_lineno
+    file_line_name = f"{filename}:{line_number}"
+    final_msg = f" | [{file_line_name}] {text}"
+    print(coloured("CRITICAL", colour='white', background='red', style='bold') + " " + coloured(final_msg, colour='red', style='bold'))
 
 def print_success(text):
     """
@@ -138,7 +158,13 @@ def print_success(text):
     Args:
         text (str): Mensaje de éxito a imprimir.
     """
-    print(coloured("SUCCESS", colour='white', background='green', style='bold') + " " + coloured(text, colour='green', style='bold'))
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back
+    filename = os.path.basename(caller_frame.f_code.co_filename)
+    line_number = caller_frame.f_lineno
+    file_line_name = f"{filename}:{line_number}"
+    final_msg = f" | [{file_line_name}] {text}"
+    print(coloured("SUCCESS", colour='white', background='green', style='bold') + " " + coloured(final_msg, colour='green', style='bold'))
 
 def print_info(text):
     """
@@ -147,7 +173,13 @@ def print_info(text):
     Args:
         text (str): Mensaje informativo a imprimir.
     """
-    print(coloured("INFO", colour='yellow', background='blue', style='bold') + " " + coloured(text, colour='blue', style='bold'))
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back
+    filename = os.path.basename(caller_frame.f_code.co_filename)
+    line_number = caller_frame.f_lineno
+    file_line_name = f"{filename}:{line_number}"
+    final_msg = f" | [{file_line_name}] {text}"
+    print(coloured("INFO", colour='yellow', background='blue', style='bold') + " " + coloured(final_msg, colour='blue', style='bold'))
     
 def print_debug(text):
     """
@@ -156,7 +188,14 @@ def print_debug(text):
     Args:
         text (str): Mensaje de depuración a imprimir.
     """
-    print(coloured("DEBUG", colour='black', background='orange', style='bold') + " " + coloured(text, colour='orange', style='bold'))
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back
+    filename = os.path.basename(caller_frame.f_code.co_filename)
+    line_number = caller_frame.f_lineno
+    file_line_name = f"{filename}:{line_number}"
+    final_msg = f" | [{file_line_name}] {text}"
+    
+    print(coloured("DEBUG", colour='black', background='orange', style='bold') + coloured(final_msg, colour='orange', style='bold'))
 
 def print_log(text):
     """
@@ -165,7 +204,13 @@ def print_log(text):
     Args:
         text (str): Mensaje de log a imprimir.
     """
-    print(coloured("LOG", colour='black', background='cyan', style='bold') + " " + coloured(text, colour='cyan', style='bold'))
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back
+    filename = os.path.basename(caller_frame.f_code.co_filename)
+    line_number = caller_frame.f_lineno
+    file_line_name = f"{filename}:{line_number}"
+    final_msg = f" | [{file_line_name}] {text}"
+    print(coloured("LOG", colour='black', background='cyan', style='bold') + " " + coloured(final_msg, colour='cyan', style='bold'))
 
 def print_metrics(text):
     """
@@ -174,7 +219,13 @@ def print_metrics(text):
     Args:
         text (str): Mensaje de métricas a imprimir.
     """
-    print(coloured("METRICS", colour='black', background='magenta', style='bold') + " " + coloured(text, colour='magenta', style='bold'))
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back
+    filename = os.path.basename(caller_frame.f_code.co_filename)
+    line_number = caller_frame.f_lineno
+    file_line_name = f"{filename}:{line_number}"
+    final_msg = f" | [{file_line_name}] {text}"
+    print(coloured("METRICS", colour='black', background='magenta', style='bold') + " " + coloured(final_msg, colour='magenta', style='bold'))
     
 def print_header(text):
     """
@@ -183,4 +234,10 @@ def print_header(text):
     Args:
         text (str): Encabezado a imprimir.
     """
-    print(coloured(text, colour='blue', background='yellow', style='bold'))
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back
+    filename = os.path.basename(caller_frame.f_code.co_filename)
+    line_number = caller_frame.f_lineno
+    file_line_name = f"{filename}:{line_number}"
+    final_msg = f" =====> [{file_line_name}] {text} <======= "
+    print(coloured(final_msg, colour='blue', background='yellow', style='bold'))

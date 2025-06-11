@@ -1,0 +1,36 @@
+@startuml Diagrama de Clases
+package torch {
+    class Module
+}
+
+class ModelWrapper{
+    + start()
+    + train()
+    + predict()
+    + evaluate()
+    + fit()
+    + save()
+    + load()
+}
+
+class DRLModelWrapperPyTorch{
+    - model
+    - algorithm
+}
+
+class DDPG{}
+class DQN{}
+class SAC{}
+class TD3BC{}
+
+ModelWrapper <|-- DRLModelWrapperPyTorch
+DRLModelWrapperPyTorch <|-- DDPG
+DRLModelWrapperPyTorch <|-- DQN
+DRLModelWrapperPyTorch <|-- SAC
+DRLModelWrapperPyTorch <|-- TD3BC
+
+torch.Module <|-- DDPG
+torch.Module <|-- DQN
+torch.Module <|-- SAC
+torch.Module <|-- TD3BC
+@enduml

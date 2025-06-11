@@ -13,7 +13,7 @@ from validation.fqe import create_fqe_evaluator
 from validation.dre import create_dre_evaluator
 
 # Modo de Ejecución
-DEBUG = False
+DEBUG = True
 FRAMEWORK_OP = 2
 PROCESSING_OP = 1
 USE_EXCEL_DATA = True
@@ -81,8 +81,8 @@ CONFIG_PROCESSING: dict[str, Union[int, float, str]] = {
 }
 
 TRAINING_CONFIG: Dict[str, Union[int, float, str]] = {
-    "epochs": 100,
-    "episodes": 1000,
+    "epochs": 2 if DEBUG else 100,
+    "episodes": 2 if DEBUG else 1000,
     "batch_size": 32,
     "learning_rate": 0.001,
     "validation_split": 0.2,

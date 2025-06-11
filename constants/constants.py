@@ -1,4 +1,8 @@
 # Metricas
+CONST_AVERAGE_REWARD = "Recompensa Promedio"
+CONST_MAX_REWARD = "Recompensa Máxima"
+CONST_MIN_REWARD = "Recompensa Mínima"
+CONST_STD_REWARD = "Desviación Estándar de Recompensa"
 CONST_VAL_LOSS = "val_loss"
 CONST_LOSS = "loss"
 CONST_METRIC_MAE = "mae"
@@ -67,6 +71,12 @@ CONST_IPS_CLIP: float = 10.0  # Clipping para importance sampling
 CONST_CQL_ALPHA: float = 1.0  # Parámetro para Conservative Q-Learning
 CONST_CONFIDENCE_LEVEL: float = 0.95  # Nivel de confianza para intervalos
 
+# Orden de características de contexto
+CONTEXT_FEATURE_ORDER = [
+    'current_glucose', 'carb_intake', 'iob', 
+    'sleep_quality', 'work_intensity', 'exercise_intensity'
+]
+
 ## Constantes de texto
 CONST_ACTOR = "actor"
 CONST_ACTOR_LOSS = "actor_loss"
@@ -74,7 +84,7 @@ CONST_CRITIC = "critic"
 CONST_CRITIC_LOSS = "critic_loss"
 CONST_TARGET = "target"
 CONST_PARAMS = "params"
-CONST_DEVICE = "device"
+CONST_DEVICE_STR = "device"
 CONST_MODEL_INIT_ERROR = "El modelo debe ser inicializado antes de {}"
 CONST_DROPOUT = "dropout"
 CONST_PARAMS = "params"
