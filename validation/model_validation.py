@@ -5,10 +5,13 @@ from typing import Dict, List, Any, Callable, Optional, Tuple, Union
 import matplotlib.pyplot as plt
 import os
 
+from config.feature_selection import RECOMMENDED_FEATURES
+from custom.printer import print_error, print_warning
+from validation.ClinicalMetrics import ClinicalMetricsEvaluator
 from validation.simulator import GlucoseSimulator
 from validation.metrics import evaluate_glucose_control
 from constants.constants import (
-    SEVERE_HYPOGLYCEMIA_THRESHOLD, HYPOGLYCEMIA_THRESHOLD, 
+    CONTEXT_FEATURE_ORDER, SEVERE_HYPOGLYCEMIA_THRESHOLD, HYPOGLYCEMIA_THRESHOLD, 
     HYPERGLYCEMIA_THRESHOLD, SEVERE_HYPERGLYCEMIA_THRESHOLD, IDEAL_LOWER_BOUND, IDEAL_UPPER_BOUND
 )
 
@@ -16,6 +19,8 @@ def validate_dosing_model_pl(
     model: Any,
     test_data: pl.DataFrame,
     patient_params: Dict[str, Dict[str, float]],
+    # Add context_data_full if you decide to pass the dictionary directly
+    # context_data_full: Optional[Dict[str, np.ndarray]] = None, 
     output_dir: str = "validation_results",
     visualize: bool = True
 ) -> Dict[str, Dict[str, float]]:
@@ -41,117 +46,178 @@ def validate_dosing_model_pl(
         Métricas de control glucémico por paciente
     """
     results = {}
+    # Asegurar que 'subject_id' existe
+    if "subject_id" not in test_data.columns:
+        print_error("La columna 'subject_id' no se encuentra en test_data para validación (Polars).")
+        return {"error": {"error_metric": -1.0}}
+        
     patient_ids = test_data["subject_id"].unique().to_list()
     
+    # Definir las columnas de características CGM y otras que se esperan del preprocesamiento
+    # Esto debe alinearse con lo que produce `prepare_features_for_drl`
+    # Ejemplo: cgm_window_col = 'cgm_window_array' # o como se llame la columna con la secuencia CGM
+    # other_feature_cols = [...] # lista de nombres de otras columnas de características
+
     for patient_id in patient_ids:
         print(f"Validando paciente {patient_id}...")
         
-        # Filtrar datos para este paciente
         patient_data_pl = test_data.filter(pl.col("subject_id") == patient_id)
         
-        # Ordenar datos por timestamp
-        patient_data_pl = patient_data_pl.sort(by="timestamp")
-        
-        # Obtener parámetros específicos del paciente o usar valores por defecto
-        if patient_id in patient_params:
-            params = patient_params[patient_id]
+        if patient_data_pl.is_empty():
+            print_warning(f"No hay datos para el paciente {patient_id} en validate_dosing_model_pl.")
+            continue
+
+        # Ordenar datos por timestamp si existe
+        if "timestamp" in patient_data_pl.columns:
+            patient_data_pl = patient_data_pl.sort(by="timestamp")
         else:
-            params = {
-                "insulin_sensitivity": 50,
-                "carb_ratio": 10,
-                "basal_glucose_impact": 20,
-                "insulin_duration_hours": 4
-            }
+            print_warning("Columna 'timestamp' no encontrada para ordenar datos del paciente.")
+
+        patient_specific_params = patient_params.get(str(patient_id), patient_params.get('default', {}))
+        if not patient_specific_params:
+             print_warning(f"No se encontraron parámetros para el paciente {patient_id}, usando defaults del simulador.")
+             simulator = GlucoseSimulator()
+        else:
+            simulator = GlucoseSimulator(**patient_specific_params)
         
-        # Crear simulador específico para este paciente
-        simulator = GlucoseSimulator(**params)
-        
-        # Para cada punto de inicio en los datos
         patient_metrics_list = []
         
-        # Convertir a pandas solo para esta sección o usar operaciones nativas de polars
-        patient_data = patient_data_pl.to_pandas()
-        
-        for i in range(0, len(patient_data) - 48, 48):  # Bloques de 4 horas (48 muestras de 5 min)
-            # Extraer ventana de datos para predecir
-            window = patient_data.iloc[i:i+24]  # 2 horas para predecir
+        # Iterar sobre cada fila (cada punto de decisión)
+        for i in range(len(patient_data_pl)):
+            current_sample_pl = patient_data_pl.row(i, named=True)
+
+            # Extraer x_cgm y x_other
+            # Esto depende de cómo estén almacenadas las secuencias CGM y otras features en el DataFrame
+            # Asumimos que hay una columna 'cgm_features_array' y 'other_features_array' o nombres individuales
             
-            # Obtener datos CGM y otros valores necesarios
-            current_cgm = window["glucose"].values
-            carb_intake = window["carb_intake"].max() if "carb_intake" in window.columns else 0
-            iob = window["insulin_on_board"].values[-1] if "insulin_on_board" in window.columns else 0
+            # Placeholder: Necesitas una lógica robusta para extraer x_cgm y x_other de `current_sample_pl`
+            # Por ejemplo, si 'cgm_0' a 'cgm_23' son columnas:
+            cgm_cols = [f'cgm_{k}' for k in range(24)] # Ajustar según el número real de características CGM
+            x_cgm_sample_list = []
+            for cgm_col_name in cgm_cols:
+                if cgm_col_name in current_sample_pl:
+                    x_cgm_sample_list.append(current_sample_pl[cgm_col_name])
+                else:
+                    # print_warning(f"Columna CGM '{cgm_col_name}' no encontrada para paciente {patient_id}, muestra {i}. Usando 0.")
+                    x_cgm_sample_list.append(0.0) # O manejar de otra forma
+
+            # Asumiendo que las características CGM son una secuencia temporal, y cada cgm_k es un punto en el tiempo.
+            # Si cada cgm_k es una característica diferente en el mismo punto de tiempo, la lógica cambia.
+            # Para DDPG, se espera (timesteps, cgm_features_per_timestep)
+            # Si 'cgm_0'...'cgm_23' son valores en diferentes timesteps para UNA característica CGM:
+            x_cgm_sample = np.array(x_cgm_sample_list, dtype=np.float32).reshape(-1, 1) # (timesteps, 1)
+            if x_cgm_sample.shape[0] == 0 : # Si no hay columnas cgm
+                 x_cgm_sample = np.zeros((12,1), dtype=np.float32) # Fallback a un shape esperado
+                 print_warning(f"No se encontraron columnas CGM para paciente {patient_id}, muestra {i}. Usando placeholder.")
+
+
+            # Para x_other, necesitas identificar las columnas relevantes
+            # Ejemplo:
+            other_feature_names_from_selection = [
+                f for f in RECOMMENDED_FEATURES 
+                if not (f.startswith('cgm_') and f[4:].isdigit()) and f not in CONTEXT_FEATURE_ORDER and f in current_sample_pl
+            ] # Excluir las que se pasan explícitamente y las CGM
             
-            # Completar el procesamiento de la ventana y predicción igual que antes...
-            # Preparar datos para predicción
-            x_cgm = np.expand_dims(current_cgm, axis=0)  # Forma [1, time_steps]
-            x_other = np.array([[carb_intake, iob]])  # Forma [1, features]
-            
-            # Predecir dosis con el modelo
-            context = {
-                "carb_intake": carb_intake,
-                "iob": iob,
-                "objective_glucose": 100.0
-            }
-            predicted_dose = model.predict_with_context(x_cgm, x_other, **context)
-            
-            # Datos para simulación
-            initial_glucose = current_cgm[-1]
-            insulin_doses = [predicted_dose]
-            carb_intakes = [carb_intake]
-            timestamps = [0]  # Tiempo relativo en horas
-            
-            # Simular efecto de la dosis en glucosa
-            glucose_trajectory = simulator.predict_glucose_trajectory(
-                initial_glucose, 
-                insulin_doses,
-                carb_intakes,
-                timestamps,
-                prediction_horizon=4  # 4 horas
+            x_other_sample_list = [current_sample_pl.get(f, 0.0) for f in other_feature_names_from_selection]
+            x_other_sample = np.array(x_other_sample_list, dtype=np.float32)
+            if x_other_sample.size == 0: # Si no hay otras features
+                # El modelo DDPG espera other_input_dim[0] > 0 si se usa.
+                # Si other_input_dim es (0,), entonces un array vacío está bien.
+                # Ajustar según la configuración del modelo DDPG.
+                # Por ahora, si es (0,), un array vacío está bien. Si no, podría dar error.
+                # print_warning(f"No se encontraron 'otras características' para paciente {patient_id}, muestra {i}. Usando array vacío.")
+                pass
+
+
+            # Extraer contexto explícito
+            # CONTEXT_FEATURE_ORDER = ['current_glucose', 'carb_intake', 'iob', 'sleep_quality', 'work_intensity', 'exercise_intensity']
+            def get_context_val(key: str, default: float) -> float:
+                col_name = key
+                # Mapeo de nombres si es necesario, ej: 'meal_carbs' para 'carb_intake'
+                if key == 'carb_intake' and 'meal_carbs' in current_sample_pl: col_name = 'meal_carbs'
+                if key == 'current_glucose' and 'glucose_last' in current_sample_pl: col_name = 'glucose_last'
+                
+                val = current_sample_pl.get(col_name)
+                if val is None:
+                    # print_warning(f"Contexto '{key}' (col: {col_name}) no encontrado para paciente {patient_id}, muestra {i}. Usando default {default}.")
+                    return default
+                return float(val)
+
+            current_glucose_val = get_context_val('current_glucose', 150.0)
+            carb_intake_val = get_context_val('carb_intake', 0.0)
+            iob_val = get_context_val('iob', 0.0)
+            sleep_quality_val = get_context_val('sleep_quality', 0.0)
+            work_intensity_val = get_context_val('work_intensity', 0.0)
+            exercise_intensity_val = get_context_val('exercise_intensity', 0.0)
+
+            try:
+                predicted_dose = model.predict_with_context(
+                    x_cgm=x_cgm_sample, 
+                    x_other=x_other_sample,
+                    current_glucose=current_glucose_val,
+                    carb_intake=carb_intake_val,
+                    iob=iob_val,
+                    sleep_quality=sleep_quality_val,
+                    work_intensity=work_intensity_val,
+                    exercise_intensity=exercise_intensity_val
+                    # target_glucose no se usa en DDPG predict_with_context actualmente
+                )
+            except Exception as e:
+                print_error(f"Error en model.predict_with_context para paciente {patient_id}, muestra {i}: {e}")
+                predicted_dose = 0.0 # Fallback
+
+            # Simular trayectoria de glucosa
+            # El simulador step espera una sola dosis y un solo carb_intake para el paso actual
+            next_glucose, reward, done, _ = simulator.step(
+                action_insulin=predicted_dose,
+                current_glucose=current_glucose_val, # Glucosa al inicio del paso
+                carb_intake=carb_intake_val # Carbs que afectan este paso
             )
             
-            # Evaluar métricas
-            metrics = evaluate_glucose_control(glucose_trajectory)
-            patient_metrics_list.append(metrics)
+            # Aquí, la métrica se basa en el resultado de un solo paso.
+            # Para métricas como TIR sobre una trayectoria, necesitarías simular más tiempo.
+            # Por ahora, usaremos el 'next_glucose' para una evaluación simple.
+            # Si quieres TIR, etc., necesitarías llamar a simulator.predict_glucose_trajectory
+            # y luego a ClinicalMetricsEvaluator.
             
-            # Visualizar si se solicita
-            if visualize and i % 240 == 0:  # Visualizar cada 20 horas
-                plt.figure(figsize=(10, 6))
-                time_hours = np.arange(0, len(glucose_trajectory) * 5 / 60, 5 / 60)
-                
-                plt.plot(time_hours, glucose_trajectory, 'b-', label='Glucosa Predicha')
-                plt.axhline(y=70, color='r', linestyle='--', label='Límite Inferior (70 mg/dL)')
-                plt.axhline(y=180, color='r', linestyle='--', label='Límite Superior (180 mg/dL)')
-                plt.axvline(x=0, color='g', linestyle='--', label=f'Dosis: {predicted_dose:.2f}U')
-                
-                plt.title(f'Paciente {patient_id} - Simulación de Glucosa')
-                plt.xlabel('Tiempo (horas)')
-                plt.ylabel('Glucosa (mg/dL)')
-                plt.legend()
-                plt.grid(True)
-                
-                # Añadir métricas al gráfico
-                txt = (f"TIR: {metrics['time_in_range']:.1f}%\n"
-                        f"Hypo: {metrics['time_below_range']:.1f}%\n"
-                        f"Hyper: {metrics['time_above_range']:.1f}%")
-                plt.text(0.02, 0.02, txt, transform=plt.gca().transAxes, 
-                        bbox=dict(facecolor='white', alpha=0.8))
-                
-                plt.savefig(os.path.join(output_dir, f'patient_{patient_id}_sim_{i}.png'))
-                plt.close()
-        
-        # Agregar métricas de este paciente
+            # Ejemplo de métrica simple basada en el siguiente estado de glucosa:
+            metrics_step = {
+                'sim_next_glucose': next_glucose,
+                'sim_reward': reward,
+                'sim_predicted_dose': predicted_dose
+            }
+            # Para métricas clínicas completas, necesitarías una trayectoria:
+            glucose_trajectory = simulator.predict_glucose_trajectory(
+                initial_glucose=current_glucose_val,
+                insulin_doses=[predicted_dose], # Dosis para el periodo
+                carb_intakes=[carb_intake_val], # Carbs para el periodo
+                timestamps=[0], # Tiempo relativo de la dosis/carbs
+                prediction_horizon=6 # Simular por 6 horas
+            )
+            clinical_eval_metrics = ClinicalMetricsEvaluator.evaluate_clinical_metrics(glucose_trajectory)
+            patient_metrics_list.append(clinical_eval_metrics)
+
         if patient_metrics_list:
-            # Calcular promedios de todas las métricas
-            avg_metrics = {}
+            # Promediar las métricas clínicas sobre todos los puntos de decisión del paciente
+            avg_patient_metrics: Dict[str, float] = {}
             for key in patient_metrics_list[0].keys():
-                avg_metrics[key] = np.mean([m[key] for m in patient_metrics_list])
-            
-            results[patient_id] = avg_metrics
+                if isinstance(patient_metrics_list[0][key], dict): # Métricas de variabilidad
+                    avg_patient_metrics[key] = {} # type: ignore
+                    for sub_key in patient_metrics_list[0][key].keys():
+                        avg_patient_metrics[key][sub_key] = np.mean([m[key][sub_key] for m in patient_metrics_list]) # type: ignore
+                else:
+                    avg_patient_metrics[key] = np.mean([m[key] for m in patient_metrics_list])
+            results[str(patient_id)] = avg_patient_metrics
+        else:
+            print_warning(f"No se generaron métricas para el paciente {patient_id} en validate_dosing_model_pl.")
+
+    return results
 
 def validate_dosing_model_pd(
     model: Any,
     test_data: pd.DataFrame,
     patient_params: Dict[str, Dict[str, float]],
+    # context_data_full: Optional[Dict[str, np.ndarray]] = None,
     output_dir: str = "validation_results",
     visualize: bool = True
 ) -> Dict[str, Dict[str, float]]:
@@ -177,103 +243,104 @@ def validate_dosing_model_pd(
         Métricas de control glucémico por paciente
     """
     results = {}
-    for patient_id, patient_data in test_data.groupby("subject_id"):
-        print(f"Validando paciente {patient_id}...")
+    if "subject_id" not in test_data.columns:
+        print_error("La columna 'subject_id' no se encuentra en test_data para validación (Pandas).")
+        return {"error": {"error_metric": -1.0}}
+
+    for patient_id, patient_data_pd in test_data.groupby("subject_id"):
+        patient_id_str = str(patient_id)
+        print(f"Validando paciente {patient_id_str}...")
+
+        if patient_data_pd.empty:
+            print_warning(f"No hay datos para el paciente {patient_id_str} en validate_dosing_model_pd.")
+            continue
         
-        # Obtener parámetros específicos del paciente o usar valores por defecto
-        if patient_id in patient_params:
-            params = patient_params[patient_id]
+        if "timestamp" in patient_data_pd.columns:
+            patient_data_pd = patient_data_pd.sort_values("timestamp")
         else:
-            params = {
-                "insulin_sensitivity": 50,
-                "carb_ratio": 10,
-                "basal_glucose_impact": 20,
-                "insulin_duration_hours": 4
-            }
+            print_warning("Columna 'timestamp' no encontrada para ordenar datos del paciente.")
+
+        patient_specific_params = patient_params.get(patient_id_str, patient_params.get('default', {}))
+        if not patient_specific_params:
+             print_warning(f"No se encontraron parámetros para el paciente {patient_id_str}, usando defaults del simulador.")
+             simulator = GlucoseSimulator()
+        else:
+            simulator = GlucoseSimulator(**patient_specific_params)
         
-        # Crear simulador específico para este paciente
-        simulator = GlucoseSimulator(**params)
-        
-        # Ordenar datos por timestamp
-        patient_data = patient_data.sort_values("timestamp")
-        
-        # Para cada punto de inicio en los datos
         patient_metrics_list = []
         
-        for i in range(0, len(patient_data) - 48, 48):  # Bloques de 4 horas (48 muestras de 5 min)
-            # Extraer ventana de datos para predecir
-            window = patient_data.iloc[i:i+24]  # 2 horas para predecir
-            
-            # Obtener datos CGM y otros valores necesarios
-            current_cgm = window["glucose"].values
-            carb_intake = window["carb_intake"].max() if "carb_intake" in window.columns else 0
-            iob = window["insulin_on_board"].values[-1] if "insulin_on_board" in window.columns else 0
-            
-            # Preparar datos para predicción
-            x_cgm = np.expand_dims(current_cgm, axis=0)  # Forma [1, time_steps]
-            x_other = np.array([[carb_intake, iob]])  # Forma [1, features]
-            
-            # Predecir dosis con el modelo
-            context = {
-                "carb_intake": carb_intake,
-                "iob": iob,
-                "objective_glucose": 100.0
-            }
-            predicted_dose = model.predict_with_context(x_cgm, x_other, **context)
-            
-            # Datos para simulación
-            initial_glucose = current_cgm[-1]
-            insulin_doses = [predicted_dose]
-            carb_intakes = [carb_intake]
-            timestamps = [0]  # Tiempo relativo en horas
-            
-            # Simular efecto de la dosis en glucosa
+        for i, current_sample_pd_series in patient_data_pd.iterrows():
+            current_sample_pd = current_sample_pd_series.to_dict()
+
+            cgm_cols = [f'cgm_{k}' for k in range(24)] 
+            x_cgm_sample_list = [current_sample_pd.get(cgm_col_name, 0.0) for cgm_col_name in cgm_cols]
+            x_cgm_sample = np.array(x_cgm_sample_list, dtype=np.float32).reshape(-1, 1)
+            if x_cgm_sample.shape[0] == 0 :
+                 x_cgm_sample = np.zeros((12,1), dtype=np.float32)
+                 print_warning(f"No se encontraron columnas CGM para paciente {patient_id_str}, muestra {i}. Usando placeholder.")
+
+            other_feature_names_from_selection = [
+                f for f in RECOMMENDED_FEATURES 
+                if not (f.startswith('cgm_') and f[4:].isdigit()) and f not in CONTEXT_FEATURE_ORDER and f in current_sample_pd
+            ]
+            x_other_sample_list = [current_sample_pd.get(f, 0.0) for f in other_feature_names_from_selection]
+            x_other_sample = np.array(x_other_sample_list, dtype=np.float32)
+
+            def get_context_val_pd(key: str, default: float) -> float:
+                col_name = key
+                if key == 'carb_intake' and 'meal_carbs' in current_sample_pd: col_name = 'meal_carbs'
+                if key == 'current_glucose' and 'glucose_last' in current_sample_pd: col_name = 'glucose_last'
+                val = current_sample_pd.get(col_name)
+                if pd.isna(val) or val is None: # pd.isna maneja NaNs de pandas
+                    # print_warning(f"Contexto '{key}' (col: {col_name}) no encontrado o NaN para paciente {patient_id_str}, muestra {i}. Usando default {default}.")
+                    return default
+                return float(val)
+
+            current_glucose_val = get_context_val_pd('current_glucose', 150.0)
+            carb_intake_val = get_context_val_pd('carb_intake', 0.0)
+            iob_val = get_context_val_pd('iob', 0.0)
+            sleep_quality_val = get_context_val_pd('sleep_quality', 0.0)
+            work_intensity_val = get_context_val_pd('work_intensity', 0.0)
+            exercise_intensity_val = get_context_val_pd('exercise_intensity', 0.0)
+
+            try:
+                predicted_dose = model.predict_with_context(
+                    x_cgm=x_cgm_sample, 
+                    x_other=x_other_sample,
+                    current_glucose=current_glucose_val,
+                    carb_intake=carb_intake_val,
+                    iob=iob_val,
+                    sleep_quality=sleep_quality_val,
+                    work_intensity=work_intensity_val,
+                    exercise_intensity=exercise_intensity_val
+                )
+            except Exception as e:
+                print_error(f"Error en model.predict_with_context para paciente {patient_id_str}, muestra {i}: {e}")
+                predicted_dose = 0.0
+
             glucose_trajectory = simulator.predict_glucose_trajectory(
-                initial_glucose, 
-                insulin_doses,
-                carb_intakes,
-                timestamps,
-                prediction_horizon=4  # 4 horas
+                initial_glucose=current_glucose_val,
+                insulin_doses=[predicted_dose],
+                carb_intakes=[carb_intake_val],
+                timestamps=[0],
+                prediction_horizon=6 
             )
-            
-            # Evaluar métricas
-            metrics = evaluate_glucose_control(glucose_trajectory)
-            patient_metrics_list.append(metrics)
-            
-            # Visualizar si se solicita
-            if visualize and i % 240 == 0:  # Visualizar cada 20 horas
-                plt.figure(figsize=(10, 6))
-                time_hours = np.arange(0, len(glucose_trajectory) * 5 / 60, 5 / 60)
-                
-                plt.plot(time_hours, glucose_trajectory, 'b-', label='Glucosa Predicha')
-                plt.axhline(y=70, color='r', linestyle='--', label='Límite Inferior (70 mg/dL)')
-                plt.axhline(y=180, color='r', linestyle='--', label='Límite Superior (180 mg/dL)')
-                plt.axvline(x=0, color='g', linestyle='--', label=f'Dosis: {predicted_dose:.2f}U')
-                
-                plt.title(f'Paciente {patient_id} - Simulación de Glucosa')
-                plt.xlabel('Tiempo (horas)')
-                plt.ylabel('Glucosa (mg/dL)')
-                plt.legend()
-                plt.grid(True)
-                
-                # Añadir métricas al gráfico
-                txt = (f"TIR: {metrics['time_in_range']:.1f}%\n"
-                        f"Hypo: {metrics['time_below_range']:.1f}%\n"
-                        f"Hyper: {metrics['time_above_range']:.1f}%")
-                plt.text(0.02, 0.02, txt, transform=plt.gca().transAxes, 
-                        bbox=dict(facecolor='white', alpha=0.8))
-                
-                plt.savefig(os.path.join(output_dir, f'patient_{patient_id}_sim_{i}.png'))
-                plt.close()
-        
-        # Agregar métricas de este paciente
+            clinical_eval_metrics = ClinicalMetricsEvaluator.evaluate_clinical_metrics(glucose_trajectory)
+            patient_metrics_list.append(clinical_eval_metrics)
+
         if patient_metrics_list:
-            # Calcular promedios de todas las métricas
-            avg_metrics = {}
+            avg_patient_metrics: Dict[str, float] = {}
             for key in patient_metrics_list[0].keys():
-                avg_metrics[key] = np.mean([m[key] for m in patient_metrics_list])
+                if isinstance(patient_metrics_list[0][key], dict):
+                    avg_patient_metrics[key] = {} # type: ignore
+                    for sub_key in patient_metrics_list[0][key].keys():
+                        avg_patient_metrics[key][sub_key] = np.mean([m[key][sub_key] for m in patient_metrics_list]) # type: ignore
+                else:
+                    avg_patient_metrics[key] = np.mean([m[key] for m in patient_metrics_list])
+            results[patient_id_str] = avg_patient_metrics
+        else:
+            print_warning(f"No se generaron métricas para el paciente {patient_id_str} en validate_dosing_model_pd.")
             
-            results[patient_id] = avg_metrics
     return results
 
 def validate_dosing_model(

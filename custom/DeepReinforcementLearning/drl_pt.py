@@ -1,21 +1,21 @@
-from typing import Dict, List, Tuple, Any, Optional, Callable, Union
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tqdm.auto import tqdm # Usar tqdm.auto para compatibilidad con notebooks y scripts
-import os 
-
-from config.models_config import EARLY_STOPPING_POLICY
+import numpy as np
+import copy
+from typing import Dict, List, Tuple, Any, Optional, Callable, Union
+from tqdm.auto import tqdm
+import polars as pl
+from config.models_config import BUFFER_CONFIG, EARLY_STOPPING_POLICY
 from constants.constants import (
-    CONST_DEFAULT_BATCH_SIZE, CONST_DEFAULT_EPOCHS, 
-    IDEAL_LOWER_BOUND, IDEAL_UPPER_BOUND, 
-    CONST_MODEL_INIT_ERROR, CONST_DEFAULT_SEED, CONST_EPSILON,
-    CONST_LOSS, CONST_VAL_LOSS, CONST_AVERAGE_REWARD, 
-    CONST_ACTOR_LOSS, CONST_CRITIC_LOSS 
+    CONST_ACTOR_LOSS, CONST_AVERAGE_REWARD, CONST_CRITIC_LOSS, CONST_DEFAULT_BATCH_SIZE, CONST_DEFAULT_EPOCHS, CONST_DEFAULT_SEED, CONST_LOSS, CONST_MODEL_INIT_ERROR, CONTEXT_FEATURE_ORDER,
+    IDEAL_LOWER_BOUND, IDEAL_UPPER_BOUND, SEVERE_HYPOGLYCEMIA_THRESHOLD, HYPOGLYCEMIA_THRESHOLD, 
+    HYPERGLYCEMIA_THRESHOLD, SEVERE_HYPER_PENALTY, HYPO_PENALTY_BASE, 
+    HYPER_PENALTY_BASE, MAX_REWARD, SUBJECT_ID_COL
 )
 from custom.model_wrapper import ModelWrapper
 from custom.printer import print_critical, print_debug, print_error, print_info, print_success, print_warning
+from models.utils.replay_buffer import ReplayBuffer
 # Asumiendo que ReplayBuffer está definido en alguna parte accesible
 # from models.utils.replay_buffer import ReplayBuffer 
 
@@ -55,1056 +55,748 @@ class DRLModelWrapperPyTorch(ModelWrapper, nn.Module):
         Se espera que este modelo contenga la lógica específica del algoritmo DRL.
     algorithm : str, opcional
         Nombre del algoritmo DRL (default: "generic").
+    cgm_input_dim : Optional[Tuple[int, ...]], opcional
+        Dimensiones de la entrada CGM (ej: (timesteps, num_cgm_features)).
+        Requerido si se pasa una clase de modelo.
+    other_input_dim : Optional[Tuple[int, ...]], opcional
+        Dimensiones de otras características (ej: (num_other_features,)).
+        Requerido si se pasa una clase de modelo.
+    context_dim : Optional[int], opcional
+        Dimensión de las características de contexto.
+        Requerido si se pasa una clase de modelo.
     **model_kwargs : dict
-        Argumentos para el constructor del modelo (usado solo si se pasa una clase de modelo).
+        Argumentos adicionales para el constructor del modelo.
     """
     
     def __init__(self, model_or_cls: Union[Callable[..., nn.Module], nn.Module], 
-                 algorithm: str = "generic", **model_kwargs: Any) -> None:
-        ModelWrapper.__init__(self) 
-        nn.Module.__init__(self)    
-        
-        self.is_class = isinstance(model_or_cls, type) 
-    
-        if self.is_class:
-            self.model_cls: Optional[Callable[..., nn.Module]] = model_or_cls
-            self.model: Optional[nn.Module] = None 
-        else:
-            self.model_cls = type(model_or_cls)
-            self.model: Optional[nn.Module] = model_or_cls # type: ignore
-            
-        self.model_kwargs: Dict[str, Any] = model_kwargs
-        self.algorithm: str = model_kwargs.get('algorithm', algorithm)
-        self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        if self.model is not None and isinstance(self.model, nn.Module):
-            self.model = self.model.to(self.device)
-            
-        seed = model_kwargs.get('seed', CONST_DEFAULT_SEED)
-        if seed is None: 
-            seed = CONST_DEFAULT_SEED
-        self.rng: np.random.Generator = np.random.default_rng(seed)
-        
-        self.optimizer: Optional[optim.Optimizer] = None
+                 algorithm: str = "generic", 
+                 feature_config: Optional[Dict[str, List[str]]] = None, # Para nombres de columnas
+                 model_kwargs: Optional[Dict[str, Any]] = None) -> None: # model_kwargs es opcional
+        ModelWrapper.__init__(self, feature_config=feature_config) # Pasa feature_config al padre
+        nn.Module.__init__(self)
 
-    @property
-    def replay_buffer(self) -> Any:
-        """
-        Accede al buffer de experiencia del modelo DRL subyacente.
+        self.model_cls = None
+        self.model: Optional[nn.Module] = None # El modelo DRL subyacente (DDPG, TD3BC, etc.)
+        self.algorithm = algorithm
+        # Guardar una copia de los kwargs originales destinados al constructor del modelo subyacente
+        self.underlying_model_constructor_kwargs = model_kwargs.copy() if model_kwargs else {}
         
-        Retorna:
-        --------
-        Any
-            Buffer de experiencia del modelo.
-            
-        Levanta:
-        -------
-        AttributeError
-            Si el modelo no está inicializado o no tiene un buffer accesible.
-        """
-        if self.model is None:
-            raise AttributeError(CONST_MODEL_INIT_ERROR.format("acceder al buffer de repetición"))
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        if hasattr(self.model, 'buffer'):
-            return self.model.buffer # type: ignore
-        elif hasattr(self.model, 'replay_buffer'):
-            return self.model.replay_buffer # type: ignore
-        else:
-            raise AttributeError(MSG_ATTR_ERROR_BUFFER)
+        # Asegurar que feature_config esté inicializado (ya lo hace ModelWrapper.__init__)
+        # self.feature_config ya está disponible desde ModelWrapper
+        self.cgm_cols = self.feature_config.get('cgm_features', [])
+        self.other_cols = self.feature_config.get('other_features', [])
+        self.context_cols = self.feature_config.get('explicit_context_features', CONTEXT_FEATURE_ORDER) 
+        self.target_col = self.feature_config.get('target_variable', 'bolus_log1p') 
+        self.reward_col = self.feature_config.get('reward_variable', 'reward')
 
-    def start(self, x_cgm: np.ndarray, x_other: np.ndarray, y: np.ndarray, 
-             rng_key: Optional[Any] = None) -> Any:
+        # Dimensiones para el estado (aplanado) y acción
+        self.state_dim = len(self.cgm_cols) + len(self.other_cols) + len(self.context_cols)
+        self.action_dim = self.underlying_model_constructor_kwargs.get('action_dim', BUFFER_CONFIG.get('action_dim', 1))
+        
+        # Dimensiones específicas para modelos que las necesiten (como TD3BC)
+        self.cgm_input_dim_tuple = (len(self.cgm_cols), 1) if self.cgm_cols else (0,0)
+        self.other_input_dim_tuple = (len(self.other_cols),) if self.other_cols else (0,)
+
+        self.prepared_model_constructor_args: Dict[str, Any] = {}
+
+        if callable(model_or_cls) and isinstance(model_or_cls, type) and issubclass(model_or_cls, nn.Module):
+            self.model_cls = model_or_cls
+            # Preparar los argumentos para el constructor del modelo subyacente
+            self.prepared_model_constructor_args = self.underlying_model_constructor_kwargs.copy()
+
+            if self.algorithm == "DDPG":
+                self.prepared_model_constructor_args['state_dim'] = self.state_dim
+            elif self.algorithm == "TD3+BC":
+                self.prepared_model_constructor_args['cgm_input_dim'] = self.cgm_input_dim_tuple
+                self.prepared_model_constructor_args['other_input_dim'] = (len(self.other_cols) + len(self.context_cols),)
+            # Añadir más casos para otros algoritmos si es necesario
+            
+        elif isinstance(model_or_cls, nn.Module):
+            self.model = model_or_cls.to(self.device)
+            # Si se pasa una instancia, se asume que ya está configurada correctamente.
+            # Se puede intentar inferir state_dim si es relevante y no se calculó antes.
+            if hasattr(self.model, 'state_dim') and isinstance(getattr(self.model, 'state_dim'), int):
+                 self.state_dim = getattr(self.model, 'state_dim')
+            # Similar para action_dim, cgm_input_dim_tuple, other_input_dim_tuple si es necesario
+        else:
+            raise ValueError("model_or_cls debe ser una clase de modelo nn.Module o una instancia de nn.Module.")
+        
+        self._instantiate_model_if_needed() # Asegurar que el modelo se instancia si se pasó una clase
+        
+        self.optimizer = None 
+        buffer_size = self.underlying_model_constructor_kwargs.get('buffer_size', BUFFER_CONFIG['buffer_size'])
+        # El ReplayBuffer usa state_dim (dimensión del estado aplanado) y action_dim
+        self.replay_buffer = ReplayBuffer(self.state_dim, self.action_dim, buffer_size, seed=CONST_DEFAULT_SEED)
+        self.history: Dict[str, List[float]] = {CONST_LOSS: [], CONST_AVERAGE_REWARD: []}
+        self.early_stopping_config = None
+
+    def _instantiate_model_if_needed(self) -> None:
+         if self.model is None and self.model_cls is not None:
+             try:
+                 self.model = self.model_cls(**self.prepared_model_constructor_args)
+                 self.model.to(self.device)
+             except TypeError as e:
+                 print_error(f"Error al instanciar el modelo {self.model_cls.__name__}: {e}")
+                 print_debug(f"Argumentos proporcionados: {self.prepared_model_constructor_args}")
+                 raise
+             except Exception as e:
+                 print_error(f"Error inesperado al instanciar el modelo {self.model_cls.__name__}: {e}")
+                 raise
+
+    def _build_state_from_row(self, row: pl.Series) -> Optional[np.ndarray]:
+        """Construye un vector de estado aplanado desde una fila de DataFrame (Polars Series)."""
+        try:
+            # Convertir la Polars Series a un diccionario para facilitar la extracción
+            row_dict = row.to_dicts()[0] # asumiendo que la Series viene de una fila de DataFrame (slice(0,1).to_series()) o similar
+                                       # Si row ya es un dict, no es necesario to_dicts()
+
+            cgm_values = [row_dict.get(col, 0.0) for col in self.cgm_cols]
+            other_values = [row_dict.get(col, 0.0) for col in self.other_cols]
+            context_values = [row_dict.get(col, 0.0) for col in self.context_cols] # Usar CONTEXT_FEATURE_ORDER
+            
+            # Aplanar y concatenar
+            state_list = cgm_values + other_values + context_values
+            return np.array(state_list, dtype=np.float32)
+        except Exception as e:
+            print_error(f"Error construyendo estado desde la fila: {e}. Fila: {row.to_dicts()}")
+            # print_debug(f"Columnas CGM esperadas: {self.cgm_cols}")
+            # print_debug(f"Columnas Other esperadas: {self.other_cols}")
+            # print_debug(f"Columnas Context esperadas: {self.context_cols}")
+            return None
+
+    def start(self, train_df: pl.DataFrame, rng_key: Optional[Any] = None) -> Any:
         """
-        Inicializa el modelo DRL subyacente si aún no está instanciado,
-        y luego llama a su método de inicialización si existe.
+        Inicializa el modelo DRL, incluyendo dimensiones y buffer si es necesario.
         
         Parámetros:
         -----------
-        x_cgm : np.ndarray
-            Datos CGM de entrada.
-        x_other : np.ndarray
-            Otras características de entrada.
-        y : np.ndarray
-            Valores objetivo (pueden ser acciones o no usados directamente en DRL).
-        rng_key : Optional[Any], opcional
-            Clave para generación aleatoria (default: None), más común en JAX.
+        train_df : pl.DataFrame
+            DataFrame de entrenamiento para inferir dimensiones si es necesario.
+        rng_key : Optional[Any]
+            Semilla o clave aleatoria para reproducibilidad (para PyTorch será un int).
             
         Retorna:
         --------
         Any
-            El modelo inicializado o su estado/parámetros.
+            Clave o estado inicializado (para compatibilidad con interfaz).
         """
-        self._instantiate_model_if_needed()
-        self._validate_model_exists()
-        self._ensure_model_on_device()
-        
-        return self._initialize_model_with_data(x_cgm, x_other, y, rng_key)
-
-    def _instantiate_model_if_needed(self) -> None:
-        """Instancia el modelo DRL si aún no está creado."""
-        if self.model is None and self.model_cls is not None:
-            print_info(f"Instanciando modelo DRL: {self.model_cls.__name__}")
-            if 'seed' not in self.model_kwargs and hasattr(self.rng, '_bit_generator'):
-                 self.model_kwargs['seed'] = self.rng._bit_generator.seed_seq.entropy[0] # type: ignore
-            self.model = self.model_cls(**self.model_kwargs) # type: ignore
-
-    def _validate_model_exists(self) -> None:
-        """Valida que el modelo esté inicializado."""
-        if self.model is None:
-            raise ValueError(CONST_MODEL_INIT_ERROR.format("inicializar (modelo es None)"))
-
-    def _ensure_model_on_device(self) -> None:
-        """Asegura que el modelo esté en el dispositivo correcto."""
-        if isinstance(self.model, nn.Module):
-            self.model = self.model.to(self.device)
-
-    def _initialize_model_with_data(self, x_cgm: np.ndarray, x_other: np.ndarray, 
-                                   y: np.ndarray, rng_key: Optional[Any]) -> Any:
-        """Inicializa el modelo con los datos proporcionados."""
-        if hasattr(self.model, 'start'):
-            return self.model.start(x_cgm, x_other, y, rng_key=rng_key) # type: ignore
-        elif hasattr(self.model, 'initialize'):
-            state_dim_info = self._build_state_dim_info(x_cgm, x_other)
-            action_dim = y.shape[-1] if y.ndim > 1 else 1
-            return self.model.initialize(state_dim_info, action_dim, rng_key=rng_key) # type: ignore
+        try:
+            # Configurar semilla para reproducibilidad
+            if rng_key is not None:
+                torch.manual_seed(rng_key)
+                np.random.seed(rng_key)
             
-        print_warning(f"El modelo DRL subyacente ({type(self.model).__name__}) no tiene método 'start' ni 'initialize'. Se devuelve el modelo tal cual.")
-        return self.model
+            # Verificar que el DataFrame no esté vacío
+            if train_df.is_empty():
+                print_warning("El DataFrame de entrenamiento está vacío. No se puede inicializar el modelo.")
+                return None
+                
+            # Instanciar el modelo si aún no está instanciado
+            self._instantiate_model_if_needed()
+            
+            if self.model is None:
+                print_error("No se pudo instanciar el modelo DRL.")
+                return None
+                
+            # Verificar que las columnas necesarias existan en el DataFrame
+            missing_cols = []
+            all_required_cols = self.cgm_cols + self.other_cols + self.context_cols + [self.target_col]
+            
+            df_columns = train_df.columns
+            for col in all_required_cols:
+                if col not in df_columns:
+                    missing_cols.append(col)
+                    
+            if missing_cols:
+                print_error(f"Faltan las siguientes columnas en train_df: {', '.join(missing_cols)}")
+                return None
+                
+            # Configurar el dispositivo del modelo
+            self.model.to(self.device)
+            print_info(f"Modelo DRL {self.algorithm} movido a dispositivo: {self.device}")
+            
+            # Inicializar el replay buffer con las dimensiones correctas
+            if hasattr(self, 'replay_buffer') and self.replay_buffer is not None:
+                print_info(f"Replay buffer ya inicializado con capacidad {self.replay_buffer.capacity}.")
+            else:
+                buffer_size = self.underlying_model_constructor_kwargs.get('buffer_size', BUFFER_CONFIG['buffer_size'])
+                self.replay_buffer = ReplayBuffer(self.state_dim, self.action_dim, buffer_size, seed=CONST_DEFAULT_SEED)
+                print_info(f"Replay buffer inicializado: state_dim={self.state_dim}, action_dim={self.action_dim}, capacity={buffer_size}")
+                
+            # Configurar early stopping si está definido en la configuración
+            if EARLY_STOPPING_POLICY.get('enabled', False):
+                self.early_stopping_config = EARLY_STOPPING_POLICY
+                print_info(MSG_EARLY_STOPPING_CONFIGURED.format(self.early_stopping_config.get('patience', 'N/A')))
+                
+            # Inicializar historial de entrenamiento
+            self.history = {
+                CONST_LOSS: [],
+                CONST_AVERAGE_REWARD: [],
+                CONST_ACTOR_LOSS: [],
+                CONST_CRITIC_LOSS: []
+            }
+            
+            # Validar que el modelo tiene los métodos necesarios
+            required_methods = ['update', 'select_action']
+            missing_methods = []
+            for method in required_methods:
+                if not hasattr(self.model, method) or not callable(getattr(self.model, method)):
+                    missing_methods.append(method)
+                    
+            if missing_methods:
+                print_error(f"El modelo DRL {self.algorithm} no implementa los métodos requeridos: {', '.join(missing_methods)}")
+                return None
+                
+            # Imprimir información del modelo inicializado
+            num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            print_info(f"Modelo DRL {self.algorithm} inicializado con {num_params:,} parámetros entrenables.")
+            print_info(f"Dimensiones: state_dim={self.state_dim}, action_dim={self.action_dim}")
+            
+            print_success(f"Modelo DRL {self.algorithm} listo para entrenamiento.")
+            
+            # Retornar algo para compatibilidad (podría ser útil para tracking)
+            return {
+                'model_ready': True,
+                'state_dim': self.state_dim,
+                'action_dim': self.action_dim,
+                'device': str(self.device),
+                'num_parameters': num_params
+            }
+            
+        except Exception as e:
+            print_error(f"Error en start() del modelo DRL {self.algorithm}: {e}")
+            return None
+    
+    def _build_state_from_row_dict(self, row_dict: Dict[str, Any]) -> Optional[np.ndarray]:
+        """Construye un vector de estado aplanado desde un diccionario de fila."""
+        try:
+            cgm_values = [row_dict.get(col, 0.0) for col in self.cgm_cols]
+            other_values = [row_dict.get(col, 0.0) for col in self.other_cols]
+            context_values = [row_dict.get(col, 0.0) for col in self.context_cols] # Usar CONTEXT_FEATURE_ORDER
+            
+            state_list = cgm_values + other_values + context_values
+            return np.array(state_list, dtype=np.float32)
+        except Exception as e:
+            print_error(f"Error construyendo estado desde dict de fila: {e}. Fila: {row_dict}")
+            return None
 
-    def _build_state_dim_info(self, x_cgm: np.ndarray, x_other: np.ndarray) -> Dict[str, Tuple[int, ...]]:
-        """Construye información de dimensiones del estado."""
-        cgm_input_shape = x_cgm.shape[1:] if x_cgm.ndim > 1 else (0,)
-        other_input_shape = x_other.shape[1:] if x_other.ndim > 1 and x_other.shape[1] > 0 else (0,)
-        return {'cgm_shape': cgm_input_shape, 'other_shape': other_input_shape}
-
-    def fit(self, 
-            x: Union[np.ndarray, List[np.ndarray]], 
-            y: np.ndarray,
-            context_data_train: Optional[Dict[str, np.ndarray]] = None,
-            validation_data: Optional[Tuple[Union[np.ndarray, List[np.ndarray]], np.ndarray, Optional[Dict[str, np.ndarray]]]] = None,
+    def fit(self, train_df: pl.DataFrame,
+            val_df: Optional[pl.DataFrame] = None,
             epochs: int = CONST_DEFAULT_EPOCHS, 
             batch_size: int = CONST_DEFAULT_BATCH_SIZE, 
             verbose: int = 1) -> Dict[str, List[float]]:
-        """
-        Entrena el modelo DRL. Esta función orquesta el bucle de entrenamiento DRL.
-        Delega la lógica de actualización de la época al método `_run_drl_training_epoch`,
-        que a su vez debe delegar al método `run_training_step` del modelo DRL subyacente.
-
-        Parámetros:
-        -----------
-        x : Union[np.ndarray, List[np.ndarray]]
-            Datos de entrada. Si es lista: [x_cgm, x_other].
-        y : np.ndarray
-            Valores objetivo (ej: acciones históricas para BC o DRL offline).
-        context_data_train : Optional[Dict[str, np.ndarray]], opcional
-            Contexto para los datos de entrenamiento (ej: {'carb_intake': array, 'iob': array}).
-        validation_data : Optional[Tuple[Union[np.ndarray, List[np.ndarray]], np.ndarray, Optional[Dict[str, np.ndarray]]]], opcional
-            Datos de validación: (x_val, y_val, context_data_val).
-        epochs : int, opcional
-            Número de épocas.
-        batch_size : int, opcional
-            Tamaño de lote para actualizaciones del agente DRL (pasado a `run_training_step`).
-        verbose : int, opcional
-            Nivel de verbosidad.
-
-        Retorna:
-        --------
-        Dict[str, List[float]]
-            Historial de entrenamiento.
-        """
-        x_cgm, x_other = self._unpack_input_data(x)
-        self._initialize_training_components(x_cgm, x_other, y)
-        
-        x_cgm_val, x_other_val, y_val, context_data_val = self._unpack_validation_data_with_context(validation_data)
-        do_validation = x_cgm_val is not None
-        
-        history = self._setup_history_drl()
-        self._setup_early_stopping_drl(verbose)
-
-        epoch_iterator = tqdm(range(epochs), desc=f"Entrenando {self.algorithm} (DRL)", 
-                              disable=(verbose == 0), unit="época")
-
-        for epoch in epoch_iterator:
-            epoch_metrics = self._run_drl_training_epoch(
-                x_cgm, x_other, y, context_data_train, batch_size, epoch
-            )
-            current_epoch_loss = self._process_epoch_metrics_drl(epoch_metrics, history)
-            
-            current_val_metric_for_es = self._process_validation_epoch(
-                do_validation, x_cgm_val, x_other_val, y_val, context_data_val, history
-            )
-
-            self._log_epoch_progress_drl(epoch, epochs, current_epoch_loss, 
-                                       getattr(self, '_last_val_metrics', None), history, epoch_iterator)
-
-            if self.early_stopping and self._check_early_stopping_drl(current_val_metric_for_es):
-                if verbose > 0:
-                    print_info(MSG_EARLY_STOPPING_ACTIVATED.format(epoch + 1))
-                break
-        
-        self._restore_best_weights_drl(verbose)
-        
-        if verbose > 0:
-            print_success(MSG_TRAINING_COMPLETE.format(self.algorithm))
-        return history
-
-    def predict(self, x_cgm: np.ndarray, x_other: np.ndarray) -> np.ndarray:
-        """
-        Realiza predicciones (selección de acciones determinísticas) con el modelo DRL.
-        Delega al método `select_action` o `actor` del modelo DRL subyacente.
-        
-        Parámetros:
-        -----------
-        x_cgm : np.ndarray
-            Datos CGM para predicción.
-        x_other : np.ndarray
-            Otras características para predicción.
-            
-        Retorna:
-        --------
-        np.ndarray
-            Acciones predichas por el modelo.
-        """
+        self._instantiate_model_if_needed()
         if self.model is None:
-            raise ValueError(CONST_MODEL_INIT_ERROR.format("predecir"))
-    
-        self.eval() 
-        x_cgm_t = torch.FloatTensor(x_cgm).to(self.device)
-        x_other_t = torch.FloatTensor(x_other).to(self.device)
+            print_error("Modelo DRL no instanciado. No se puede entrenar.")
+            return {}
+
+        if not hasattr(self.model, 'parameters') or not callable(self.model.parameters):
+             print_error(MSG_INIT_OPTIMIZER_FAIL)
+             return {}
+             
+        # Inicializar optimizador si no existe (para actor y crítico dentro del modelo DRL)
+        # El modelo DRL (ej. DDPG) es responsable de sus propios optimizadores.
+        # Esta sección podría eliminarse si el modelo DDPG/TD3BC maneja sus optimizadores internamente.
+        # if self.optimizer is None and hasattr(self.model, 'parameters') and callable(self.model.parameters):
+        #     try:
+        #         params_to_optimize = list(self.model.parameters())
+        #         if params_to_optimize:
+        #             lr = self.underlying_model_constructor_kwargs.get('learning_rate', self.underlying_model_constructor_kwargs.get('actor_lr', 1e-3)) # Tomar LR específico si existe
+        #             self.optimizer = optim.Adam(params_to_optimize, lr=lr)
+        #             if verbose > 0: print_info(MSG_INIT_OPTIMIZER_SUCCESS.format("Adam", lr))
+        #         else:
+        #             if verbose > 0: print_warning(MSG_INIT_OPTIMIZER_NO_PARAMS.format(self.algorithm))
+        #     except Exception as e:
+        #         print_error(f"Error al inicializar el optimizador: {e}")
+
+        if train_df.is_empty():
+            print_error("DataFrame de entrenamiento vacío.")
+            return {}
         
-        with torch.no_grad():
-            if hasattr(self.model, 'select_action'):
-                # Asumimos que select_action(state_cgm, state_other, add_noise=False) es para inferencia determinista
-                actions_t = self.model.select_action(x_cgm_t, x_other_t, add_noise=False) # type: ignore
-            elif hasattr(self.model, 'actor') and callable(self.model.actor): # type: ignore
-                actions_t = self.model.actor(x_cgm_t, x_other_t) # type: ignore
-            elif callable(self.model): 
-                # Fallback si el modelo mismo es el actor (menos común para DRL complejos)
-                print_warning(f"El modelo DRL ({type(self.model).__name__}) no tiene 'select_action' o 'actor'. Se intentará llamar directamente al modelo.")
-                actions_t = self.model(x_cgm_t, x_other_t) # type: ignore
-            else:
-                raise NotImplementedError(f"El modelo DRL ({type(self.model).__name__}) no tiene un método 'select_action', 'actor', ni es llamable para predicción.")
+        # Popular el Replay Buffer
+        # Asumimos que train_df tiene columnas: [features_estado_actual...], 'action', 'reward', [features_siguiente_estado...]
+        # Necesitamos construir 'state', 'action', 'reward', 'next_state', 'done'
+        print_info(f"Populando Replay Buffer con {len(train_df)} transiciones...")
+        for i in tqdm(range(len(train_df) - 1), desc="Populando Replay Buffer"): # -1 para tener siempre un next_state
+            current_row_series = train_df.row(i, named=True) # Devuelve un diccionario
+            next_row_series = train_df.row(i + 1, named=True)
+
+            # Convertir dict a Polars Series temporalmente para _build_state_from_row si es necesario
+            # o adaptar _build_state_from_row para tomar dict.
+            # Para simplificar, asumimos que _build_state_from_row puede manejar un dict.
             
-            actions_np = actions_t.cpu().numpy()
-            # Asegurar que la salida sea (N,) o (N, action_dim)
-            return actions_np.reshape(len(x_cgm), -1).squeeze() if actions_np.ndim > 0 else actions_np
+            state = self._build_state_from_row_dict(current_row_series)
+            next_state = self._build_state_from_row_dict(next_row_series)
 
-    def predict_with_context(self, x_cgm: np.ndarray, x_other: np.ndarray, 
-                        current_glucose: float, carb_intake: float, iob: float,
-                        exercise_intensity: Optional[float] = None, stress_level: Optional[float] = None,
-                        work_intensity: Optional[float] = None, sleep_quality: Optional[float] = None,
-                        target_glucose: Optional[float] = None) -> float:
-        """
-        Realiza predicciones con el modelo DRL entrenado, considerando contexto adicional.
-        Este método es para inferencia determinística (sin ruido de exploración).
+            if state is None or next_state is None:
+                print_warning(f"Saltando transición en el índice {i} debido a un error al construir el estado.")
+                continue # Saltar esta transición si el estado no se pudo construir
 
-        Parámetros:
-        -----------
-        x_cgm : np.ndarray
-            Datos CGM para predicción (ej: [1, timesteps, cgm_features] o [timesteps, cgm_features]).
-        x_other : np.ndarray
-            Otras características para predicción (ej: [1, other_features_len] o [other_features_len]).
-        current_glucose : float
-            Nivel actual de glucosa en mg/dL.
-        carb_intake : float
-            Ingesta de carbohidratos en gramos.
-        iob : float
-            Insulina a bordo en unidades.
-        activity_level : Optional[float], opcional
-            Nivel de actividad física.
-        stress_level : Optional[float], opcional
-            Nivel de estrés general.
-        work_intensity : Optional[float], opcional
-            Intensidad del trabajo.
-        sleep_quality : Optional[float], opcional
-            Calidad del sueño.
-        target_glucose : Optional[float], opcional
-            Nivel objetivo de glucosa (puede no ser usado por todos los modelos DRL).
+            action = np.array([current_row_series.get(self.target_col, 0.0)], dtype=np.float32) # Acción tomada
+            reward = float(current_row_series.get(self.reward_col, 0.0)) # Recompensa obtenida
+            
+            # 'done' es más complejo. Si el siguiente estado pertenece a un sujeto diferente o es el final de un episodio.
+            # Simplificación: no 'done' a menos que sea la última transición del dataset.
+            done = (i == len(train_df) - 2) 
+            if current_row_series.get(SUBJECT_ID_COL) != next_row_series.get(SUBJECT_ID_COL):
+                done = True
+
+            self.replay_buffer.add(state, action, reward, next_state, done)
+        
+        if len(self.replay_buffer) < batch_size:
+            print_warning(f"Replay buffer tiene menos muestras ({len(self.replay_buffer)}) que batch_size ({batch_size}). El entrenamiento podría no ser efectivo.")
+            # return self.history # O continuar si el modelo puede manejarlo
+
+        # Bucle de entrenamiento DRL
+        if not hasattr(self.model, 'update') or not callable(getattr(self.model, 'update')):
+            print_error(f"El modelo DRL {self.algorithm} no tiene un método 'update'. No se puede entrenar.")
+            return self.history
+
+        for epoch in range(epochs):
+            epoch_losses = []
+            epoch_rewards = [] # Si el método update devuelve recompensas o si se calculan
+            
+            # El número de pasos de actualización por época puede variar.
+            # Por ejemplo, puede ser len(train_df) // batch_size o un número fijo.
+            num_updates_per_epoch = max(1, len(self.replay_buffer) // batch_size) if len(self.replay_buffer) > 0 else 1
+            
+            for _ in tqdm(range(num_updates_per_epoch), desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+                if len(self.replay_buffer) < batch_size:
+                    print_warning(f"No hay suficientes muestras en el buffer ({len(self.replay_buffer)}) para el tamaño de batch ({batch_size}). Saltando actualización.")
+                    continue
+
+                states, actions, rewards, next_states, dones = self.replay_buffer.sample(batch_size)
                 
-        Retorna:
-        --------
-        float
-            Dosis de insulina recomendada en unidades.
-        """
-        self._validate_model_exists()
-        self._ensure_model_on_device()
-        
-        if hasattr(self.model, 'predict_with_context') and callable(getattr(self.model, 'predict_with_context')):
-            # Delegar al método del modelo subyacente
-            return self.model.predict_with_context(
-                x_cgm=x_cgm, x_other=x_other,
-                current_glucose=current_glucose, carb_intake=carb_intake, iob=iob,
-                exercise_intensity=exercise_intensity, # Usar el nuevo parámetro
-                stress_level=stress_level,
-                work_intensity=work_intensity, sleep_quality=sleep_quality,
-                target_glucose=target_glucose
-            )
-        else:
-            # Fallback o error si el modelo subyacente no lo implementa
-            print_error(MSG_PREDICT_CTX_NOT_IMPLEMENTED_UNDERLYING.format(self.algorithm_name))
-            raise NotImplementedError(MSG_PREDICT_CTX_NOT_IMPLEMENTED_ERROR.format(self.algorithm_name))
-    
-    def select_action_for_rollout(self, 
-                                  x_cgm_sample: np.ndarray, 
-                                  x_other_sample: np.ndarray, 
-                                  context_dict: Dict[str, float], 
-                                  add_noise: bool = True) -> np.ndarray:
-        """
-        Selecciona una acción para la interacción con el entorno durante el entrenamiento/rollout.
-        Delega al método `select_action` del modelo DRL subyacente.
+                # Convertir a tensores y mover al dispositivo
+                states_tensor = torch.FloatTensor(states).to(self.device)
+                actions_tensor = torch.FloatTensor(actions).to(self.device)
+                rewards_tensor = torch.FloatTensor(rewards).to(self.device)
+                next_states_tensor = torch.FloatTensor(next_states).to(self.device)
+                dones_tensor = torch.FloatTensor(dones.astype(np.float32)).to(self.device) # Convertir bool a float para PyTorch
 
-        Parámetros:
-        -----------
-        x_cgm_sample : np.ndarray
-            Muestra de datos CGM (ventana, ej. forma (timesteps, cgm_features)).
-        x_other_sample : np.ndarray
-            Muestra de otras características (ej. forma (other_features_len,)).
-        context_dict : Dict[str, float]
-            Diccionario con valores de contexto escalares para la muestra actual.
-        add_noise : bool, opcional
-            Si se debe añadir ruido para exploración (default: True).
+                # Llamar al método update del modelo DRL subyacente
+                # La firma de update puede variar, así que adaptamos según el algoritmo
+                if self.algorithm == "DDPG":
+                    loss_dict = self.model.update((states_tensor, actions_tensor, rewards_tensor, next_states_tensor, dones_tensor))
+                elif self.algorithm == "TD3+BC":
+                    # TD3BC espera x_cgm, x_other, etc. por separado. Necesitamos reconstruirlos desde 'states_tensor'.
+                    # Esto asume que _build_state_from_row_dict concatena CGM, luego Other, luego Context.
+                    cgm_len = len(self.cgm_cols)
+                    other_len = len(self.other_cols)
+                    # context_len = len(self.context_cols) # No se usa directamente aquí, ya que está en x_other_full
 
-        Retorna:
-        --------
-        np.ndarray
-            Acción seleccionada (ej. array de dosis de insulina).
-        
-        Lanza:
-        ------
-        NotImplementedError
-            Si el modelo subyacente no tiene un método `select_action` compatible.
-        """
-        self._validate_model_exists()
-        if not hasattr(self.model, 'select_action'):
-            print_error(MSG_SELECT_ACTION_ROLLOUT_FAIL.format(type(self.model).__name__))
-            raise NotImplementedError(MSG_SELECT_ACTION_ROLLOUT_FAIL.format(type(self.model).__name__))
-        
-        try:
-            # state_tuple es (x_cgm_sample, x_other_sample)
-            action = self.model.select_action(
-                state_tuple=(x_cgm_sample, x_other_sample),
-                context_dict=context_dict,
-                add_noise=add_noise
-            )
-            return action
-        except Exception as e:
-            print_error(f"Error al llamar a self.model.select_action: {e}")
-            raise NotImplementedError(MSG_SELECT_ACTION_ROLLOUT_FAIL.format(type(self.model).__name__))
-    
-    def evaluate(self, x_cgm: np.ndarray, x_other: np.ndarray, y: np.ndarray,
-                 context: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
-        """
-        Evalúa el modelo DRL.
-        Delega al método `evaluate_policy` o similar del modelo DRL subyacente si existe,
-        o calcula métricas básicas como MSE de acción si `y` es provisto.
-        
-        Parámetros:
-        -----------
-        x_cgm : np.ndarray
-            Datos CGM de prueba.
-        x_other : np.ndarray
-            Otras características de prueba.
-        y : np.ndarray
-            Acciones de referencia (ej: dosis históricas). Puede ser None si la evaluación es puramente basada en simulación/recompensa.
-        context : Optional[Dict[str, Any]], opcional
-            Contexto adicional para evaluación (ej: simulador, datos contextuales completos para `evaluate_policy`).
+                    x_cgm_batch = states_tensor[:, :cgm_len]
+                    x_other_batch = states_tensor[:, cgm_len:] # Esto incluye 'other' y 'context'
+                    
+                    next_x_cgm_batch = next_states_tensor[:, :cgm_len]
+                    next_x_other_batch = next_states_tensor[:, cgm_len:]
+
+                    # Reshape CGM si es necesario (ej. para CNNs)
+                    if self.cgm_input_dim_tuple != (0,0) and len(self.cgm_input_dim_tuple) == 2:
+                        x_cgm_batch = x_cgm_batch.view(-1, self.cgm_input_dim_tuple[0], self.cgm_input_dim_tuple[1])
+                        next_x_cgm_batch = next_x_cgm_batch.view(-1, self.cgm_input_dim_tuple[0], self.cgm_input_dim_tuple[1])
+                    
+                    loss_dict = self.model.update((x_cgm_batch, x_other_batch, actions_tensor, rewards_tensor, next_x_cgm_batch, next_x_other_batch, dones_tensor))
+                else:
+                    # Para otros algoritmos, asumimos que aceptan el estado aplanado directamente
+                    loss_dict = self.model.update((states_tensor, actions_tensor, rewards_tensor, next_states_tensor, dones_tensor))
+
+                if loss_dict:
+                    if CONST_ACTOR_LOSS in loss_dict:
+                        self.history[CONST_ACTOR_LOSS].append(loss_dict[CONST_ACTOR_LOSS])
+                    if CONST_CRITIC_LOSS in loss_dict:
+                        self.history[CONST_CRITIC_LOSS].append(loss_dict[CONST_CRITIC_LOSS])
+                    # Podrías tener una métrica de recompensa o Q-valor devuelta por update
+                    if 'average_reward' in loss_dict:
+                        epoch_rewards.append(loss_dict['average_reward'])
+                    elif 'q_value' in loss_dict: # O si devuelve Q-valor promedio
+                        epoch_rewards.append(loss_dict['q_value'])
+
+            avg_epoch_loss = np.mean(self.history[CONST_CRITIC_LOSS][-num_updates_per_epoch:]) if self.history[CONST_CRITIC_LOSS] else np.nan
+            avg_epoch_reward = np.mean(epoch_rewards) if epoch_rewards else np.nan
             
-        Retorna:
-        --------
-        Dict[str, float]
-            Métricas de evaluación.
-        """
+            self.history[CONST_LOSS].append(avg_epoch_loss) # Usar critic loss como la pérdida principal para early stopping
+            self.history[CONST_AVERAGE_REWARD].append(avg_epoch_reward)
+            
+            if verbose > 0:
+                log_msg = f"Epoch {epoch+1}/{epochs} - Loss: {avg_epoch_loss:.4f}"
+                if not np.isnan(avg_epoch_reward):
+                    log_msg += f", Avg Reward/Q-value: {avg_epoch_reward:.4f}"
+                print_info(log_msg)
+
+            # Early stopping (si configurado y val_df proporcionado)
+            if self.early_stopping_config and val_df is not None and not val_df.is_empty():
+                # Aquí necesitarías una forma de evaluar el modelo en val_df.
+                # Esto podría ser ejecutar la política en un entorno simulado o calcular una métrica offline.
+                # Por simplicidad, vamos a asumir que `evaluate_performance` existe y devuelve una métrica.
+                if hasattr(self.model, 'evaluate_performance'):
+                    val_performance = self.model.evaluate_performance(val_df) # Esto necesita ser implementado en DDPG/TD3BC
+                    self.history.setdefault(CONST_VAL_LOSS, []).append(val_performance) # Asumiendo que devuelve una 'pérdida' o métrica a minimizar
+                    
+                    if self.early_stopping.step(val_performance):
+                        print_info(MSG_EARLY_STOPPING_ACTIVATED.format(epoch + 1))
+                        if self.early_stopping_config.get('restore_best_weights', False):
+                            print_info(MSG_RESTORE_BEST_WEIGHTS_DRL.format(self.early_stopping.best_score))
+                            self.model.load_state_dict(self.early_stopping.best_model_state_dict)
+                        break 
+                else:
+                    if epoch == 0: # Solo advertir una vez
+                        print_warning(MSG_NO_EVAL_PERFORMANCE)
+
+
+        if verbose > 0: print_success(MSG_TRAINING_COMPLETE.format(self.algorithm))
+        return self.history
+
+    def predict(self, df: pl.DataFrame) -> np.ndarray:
+        self._instantiate_model_if_needed()
         if self.model is None:
-            raise ValueError(CONST_MODEL_INIT_ERROR.format("evaluar"))
+            print_error(f"Modelo DRL {self.algorithm} no instanciado. No se puede predecir.")
+            return np.array([])
         
-        metrics: Dict[str, float] = {}
+        if not (hasattr(self.model, 'select_action') or hasattr(self.model, 'forward')):
+            print_error(f"Modelo DRL {self.algorithm} no tiene 'select_action' ni 'forward'.")
+            return np.array([])
         
-        # Intentar evaluación delegada primero
-        metrics = self._try_delegated_evaluation(x_cgm, x_other, y, context)
-        
-        # Si no hay métricas, calcular MSE como fallback
-        if not metrics:
-            metrics = self._calculate_fallback_metrics(x_cgm, x_other, y)
-        
-        return metrics if metrics else {'evaluation_status': 0.0}
+        predictions = []
+        if df.is_empty(): return np.array([])
 
-    def _try_delegated_evaluation(self, x_cgm: np.ndarray, x_other: np.ndarray, 
-                                 y: np.ndarray, context: Optional[Dict[str, Any]]) -> Dict[str, float]:
-        """Intenta la evaluación delegada usando evaluate_policy del modelo subyacente."""
-        metrics: Dict[str, float] = {}
-        
-        if not hasattr(self.model, 'evaluate_policy'):
-            return metrics
+        for i in tqdm(range(len(df)), desc="Prediciendo", leave=False):
+            row_dict = df.row(i, named=True)
             
-        if context is None:
-            print_warning(f"El modelo {type(self.model).__name__} tiene 'evaluate_policy' pero no se proporcionó contexto para la evaluación delegada.")
-            return metrics
-            
-        try:
-            model_eval_metrics = self.model.evaluate_policy(x_cgm, x_other, y, context_dict=context) # type: ignore
-            if isinstance(model_eval_metrics, dict):
-                metrics.update(model_eval_metrics)
-        except Exception as e:
-            print_warning(f"Error al llamar a self.model.evaluate_policy con contexto: {e}")
-            
-        return metrics
+            if self.algorithm == "TD3+BC":
+                # Para TD3BC, necesitamos separar CGM y otras características
+                cgm_data = np.array([row_dict.get(col, 0.0) for col in self.cgm_cols], dtype=np.float32)
+                other_data_list = [row_dict.get(col, 0.0) for col in self.other_cols]
+                context_data_list = [row_dict.get(col, 0.0) for col in self.context_cols]
+                other_full_data = np.array(other_data_list + context_data_list, dtype=np.float32)
 
-    def _calculate_fallback_metrics(self, x_cgm: np.ndarray, x_other: np.ndarray, 
-                                   y: np.ndarray) -> Dict[str, float]:
-        """Calcula métricas de fallback usando MSE si y está disponible."""
-        if y is None:
-            print_warning(f"Evaluación DRL para {type(self.model).__name__} no produjo métricas (ej: 'y' no proporcionado, 'evaluate_policy' no disponible/utilizable, o error en su ejecución).")
-            return {}
+                # Asegurar que las dimensiones sean correctas para el modelo TD3BC
+                # cgm_input_dim es (timesteps, features_per_timestep)
+                # other_input_dim es (total_other_features_len,)
+                if self.cgm_input_dim_tuple != (0,0):
+                    x_cgm_tensor = torch.FloatTensor(cgm_data).reshape(1, *self.cgm_input_dim_tuple).to(self.device)
+                else:
+                    x_cgm_tensor = torch.empty(1, 0).to(self.device) # O manejar de otra forma si no hay CGM
+
+                if self.other_input_dim_tuple != (0,):
+                    x_other_tensor = torch.FloatTensor(other_full_data).unsqueeze(0).to(self.device)
+                else:
+                    x_other_tensor = torch.empty(1, 0).to(self.device) # O manejar de otra forma
+
+                with torch.no_grad():
+                    action_tensor = self.model.select_action(x_cgm_tensor, x_other_tensor, add_noise=False)
+
+            else: # Para DDPG y otros modelos que esperan un estado aplanado
+                state_np = self._build_state_from_row_dict(row_dict)
+                if state_np is None:
+                    predictions.append(np.nan) # O alguna otra forma de manejar el error
+                    continue
+                state_tensor = torch.tensor(state_np, dtype=torch.float32).unsqueeze(0).to(self.device)
+                
+                with torch.no_grad():
+                    if hasattr(self.model, 'select_action'):
+                        action_tensor = self.model.select_action(state_tensor, add_noise=False) # Asumiendo que select_action puede tomar un tensor de estado
+                    elif hasattr(self.model, 'forward'):
+                        action_tensor = self.model(state_tensor)
+                    else:
+                        # Esto no debería ocurrir si la verificación al inicio de la función se hizo correctamente
+                        predictions.append(np.nan)
+                        continue
             
-        predicted_actions_np = self.predict(x_cgm, x_other)
-        if len(y) != len(predicted_actions_np):
-            print_warning("Longitudes de y (objetivo) y acciones predichas no coinciden para calcular MSE.")
-            return {}
+            predictions.append(action_tensor.cpu().numpy().flatten()[0])
+        return np.array(predictions)
+
+    def predict_with_context(self, 
+                             x_cgm: np.ndarray, 
+                             x_other: np.ndarray, 
+                             current_glucose: float, 
+                             carb_intake: float, 
+                             iob: float, 
+                             sleep_quality: Optional[float] = None, 
+                             work_intensity: Optional[float] = None, 
+                             exercise_intensity: Optional[float] = None,
+                             target_glucose: Optional[float] = None, # Añadido para consistencia
+                             **kwargs: Any) -> float:
+        self._instantiate_model_if_needed()
+        if self.model is None:
+            print_error(MSG_PREDICT_CTX_NOT_IMPLEMENTED_ERROR.format(self.algorithm))
+            return 0.0 # O lanzar una excepción
+
+        if hasattr(self.model, 'predict_with_context'):
+            # El modelo subyacente tiene su propio método predict_with_context
+            # Asegurarse de que los datos estén en el formato correcto (numpy arrays)
+            # x_cgm y x_other ya son np.ndarray según la firma
+            return self.model.predict_with_context(
+                x_cgm, x_other, current_glucose, carb_intake, iob,
+                sleep_quality, work_intensity, exercise_intensity, target_glucose=target_glucose, **kwargs
+            )
+        elif hasattr(self.model, 'select_action'):
+            # Construir el estado completo como lo haría el ReplayBuffer
+            context_values = [
+                current_glucose, carb_intake, iob,
+                sleep_quality if sleep_quality is not None else 0.0, # Usar 0 o un valor por defecto si None
+                work_intensity if work_intensity is not None else 0.0,
+                exercise_intensity if exercise_intensity is not None else 0.0
+            ]
+            # Asegurar que el orden de context_values coincida con CONTEXT_FEATURE_ORDER
+            # Esto es crucial si el modelo fue entrenado con un orden específico.
+            # Si CONTEXT_FEATURE_ORDER define el orden, usarlo para construir context_np.
+            # Ejemplo:
+            # context_map = {
+            #     'glucose_last': current_glucose,
+            #     'meal_carbs': carb_intake,
+            #     'insulin_on_board': iob,
+            #     'sleep_quality': sleep_quality if sleep_quality is not None else 0.0,
+            #     'work_intensity': work_intensity if work_intensity is not None else 0.0,
+            #     'exercise_intensity': exercise_intensity if exercise_intensity is not None else 0.0
+            # }
+            # context_values_ordered = [context_map[feature_name] for feature_name in CONTEXT_FEATURE_ORDER]
+            # context_np = np.array(context_values_ordered, dtype=np.float32)
+
+            # Para simplificar, asumimos que context_values_list está en el orden correcto
+            context_np = np.array(context_values, dtype=np.float32)
+
+            # Aplanar x_cgm y x_other si no lo están ya
+            x_cgm_flat = x_cgm.flatten() if x_cgm is not None else np.array([])
+            x_other_flat = x_other.flatten() if x_other is not None else np.array([])
             
-        action_mse = float(np.mean((predicted_actions_np.flatten() - y.flatten()) ** 2))
-        return {'action_mse': action_mse}
+            state_parts = []
+            if x_cgm_flat.size > 0:
+                state_parts.append(x_cgm_flat)
+            if x_other_flat.size > 0:
+                state_parts.append(x_other_flat)
+            if context_np.size > 0:
+                state_parts.append(context_np)
+            
+            if not state_parts:
+                print_error("No se proporcionaron datos de estado para la predicción.")
+                return 0.0 # O manejar de otra manera
+
+            state_np = np.concatenate(state_parts)
+            
+            # Verificar que la dimensión del estado coincida con self.state_dim
+            if state_np.shape[0] != self.state_dim:
+                print_error(f"Dimensiones de estado inconsistentes. Esperado: {self.state_dim}, Obtenido: {state_np.shape[0]}")
+                # Aquí podrías intentar depurar qué parte del estado está mal o faltante
+                # print(f"CGM cols: {self.cgm_cols}, Other cols: {self.other_cols}, Context cols: {self.context_cols}")
+                # print(f"x_cgm_flat: {x_cgm_flat.shape}, x_other_flat: {x_other_flat.shape}, context_np: {context_np.shape}")
+                return 0.0 # O lanzar una excepción
+
+            state_tensor = torch.tensor(state_np, dtype=torch.float32).unsqueeze(0).to(self.device)
+            
+            with torch.no_grad():
+                action_tensor = self.model.select_action(state_tensor, add_noise=False) # Asumiendo que select_action toma estado y add_noise
+            
+            return action_tensor.item()
+        else:
+            print_error(MSG_PREDICT_CTX_NOT_IMPLEMENTED_UNDERLYING.format(self.algorithm))
+            return 0.0 # O lanzar una excepción
+
+    def evaluate(self, test_df: pl.DataFrame, metrics: Optional[List[str]] = None) -> Dict[str, float]:
+        """
+        Evalúa el modelo DRL. Para DRL, esto podría implicar ejecutar la política en un entorno
+        o usar métricas específicas de RL como el retorno promedio.
+        """
+        self._instantiate_model_if_needed()
+        if self.model is None:
+            print_error(f"Modelo {self.algorithm} no instanciado. No se puede evaluar.")
+            return {}
+
+        if test_df.is_empty():
+            print_warning("DataFrame de prueba vacío. No se puede evaluar.")
+            return {}
+
+        # Si el modelo tiene un método `evaluate_performance` específico, úsalo.
+        if hasattr(self.model, 'evaluate_performance') and callable(getattr(self.model, 'evaluate_performance')):
+            try:
+                return self.model.evaluate_performance(test_df, metrics)
+            except Exception as e:
+                print_error(f"Error durante la evaluación específica del modelo {self.algorithm}: {e}")
+                # Fallback a una evaluación genérica si es posible, o simplemente retornar vacío.
+        
+        # Evaluación genérica: Calcular recompensas promedio si la columna 'reward' está presente
+        # Esto es una simplificación. Una evaluación DRL adecuada a menudo requiere simulación.
+        if self.reward_col in test_df.columns:
+            total_reward = 0
+            num_episodes = 0 # O número de pasos, dependiendo de cómo se estructuren los datos
+            
+            # Esto es una simplificación. En un escenario real, necesitarías simular episodios.
+            # Aquí, asumimos que cada fila es un paso y queremos la recompensa promedio por paso.
+            if 'reward' in test_df.columns:
+                avg_reward = test_df.select(pl.col(self.reward_col).mean()).item()
+                print_info(f"Evaluación genérica: Recompensa promedio en datos de prueba = {avg_reward:.4f}")
+                return {"average_reward": avg_reward}
+            else:
+                print_warning(f"Columna de recompensa '{self.reward_col}' no encontrada en test_df. No se puede calcular la recompensa promedio.")
+                return {}
+        else:
+            print_warning(f"No se pudo realizar la evaluación para el modelo {self.algorithm}. "
+                          f"Implemente 'evaluate_performance' en el modelo o asegúrese de que '{self.reward_col}' esté en los datos.")
+            return {}
+
+    def get_params(self, deep: bool = True) -> Dict[str, Any]:
+        """Obtiene los parámetros del modelo."""
+        params = {
+            'algorithm': self.algorithm,
+            'feature_config': self.feature_config, # Guardar la configuración de características
+            'model_kwargs': self.underlying_model_constructor_kwargs # Guardar los kwargs originales
+        }
+        if deep and self.model is not None and hasattr(self.model, 'get_params'):
+            params.update(self.model.get_params(deep=deep))
+        return params
+
+    def set_params(self, **params: Any) -> 'DRLModelWrapperPyTorch':
+        """Establece los parámetros del modelo."""
+        if 'algorithm' in params:
+            self.algorithm = params.pop('algorithm')
+        if 'feature_config' in params:
+            self.feature_config = params.pop('feature_config')
+            # Re-inicializar columnas basadas en la nueva feature_config
+            self.cgm_cols = self.feature_config.get('cgm_features', [])
+            self.other_cols = self.feature_config.get('other_features', [])
+            self.context_cols = self.feature_config.get('explicit_context_features', CONTEXT_FEATURE_ORDER)
+            self.target_col = self.feature_config.get('target_variable', 'bolus_log1p')
+            self.reward_col = self.feature_config.get('reward_variable', 'reward')
+            self.state_dim = len(self.cgm_cols) + len(self.other_cols) + len(self.context_cols)
+            self.cgm_input_dim_tuple = (len(self.cgm_cols), 1) if self.cgm_cols else (0,0)
+            self.other_input_dim_tuple = (len(self.other_cols),) if self.other_cols else (0,)
+            
+            # Actualizar model_kwargs con las nuevas dimensiones si es necesario
+            if self.algorithm == "DDPG":
+                self.underlying_model_constructor_kwargs['state_dim'] = self.state_dim
+            elif self.algorithm == "TD3+BC":
+                self.underlying_model_constructor_kwargs['cgm_input_dim'] = self.cgm_input_dim_tuple
+                self.underlying_model_constructor_kwargs['other_input_dim'] = (len(self.other_cols) + len(self.context_cols),)
+
+        if 'model_kwargs' in params:
+            self.underlying_model_constructor_kwargs.update(params.pop('model_kwargs'))
+
+        # Re-instanciar el modelo si los parámetros relevantes cambiaron
+        # Esto es un poco simplista; idealmente, se verificaría si los parámetros que afectan la arquitectura del modelo han cambiado.
+        if self.model_cls:
+            self.prepared_model_constructor_args = self.underlying_model_constructor_kwargs.copy()
+            if self.algorithm == "DDPG":
+                self.prepared_model_constructor_args['state_dim'] = self.state_dim
+            elif self.algorithm == "TD3+BC":
+                self.prepared_model_constructor_args['cgm_input_dim'] = self.cgm_input_dim_tuple
+                self.prepared_model_constructor_args['other_input_dim'] = (len(self.other_cols) + len(self.context_cols),)
+            
+            self.model = self.model_cls(**self.prepared_model_constructor_args).to(self.device)
+            # Re-inicializar optimizadores si es necesario
+            if hasattr(self.model, 'actor_optimizer') and hasattr(self.model, 'critic_optimizer'):
+                self.model.actor_optimizer = optim.Adam(self.model.actor.parameters(), lr=self.model.config.get('actor_lr', 1e-4), weight_decay=self.model.config.get('actor_weight_decay', 0.0))
+                if hasattr(self.model, 'critic1') and hasattr(self.model, 'critic2'): # Para TD3
+                    self.model.critic_optimizer = optim.Adam(list(self.model.critic1.parameters()) + list(self.model.critic2.parameters()), lr=self.model.config.get('critic_lr', 1e-3), weight_decay=self.model.config.get('critic_weight_decay', 0.0))
+                elif hasattr(self.model, 'critic'): # Para DDPG
+                    self.model.critic_optimizer = optim.Adam(self.model.critic.parameters(), lr=self.model.config.get('critic_lr', 1e-3), weight_decay=self.model.config.get('critic_weight_decay', 0.0))
+
+        elif self.model and hasattr(self.model, 'set_params'):
+            self.model.set_params(**params)
+        
+        return self
+
+    def get_model_name(self) -> str:
+        """Retorna el nombre del algoritmo DRL."""
+        return self.algorithm
 
     def save(self, path: str) -> None:
-        """
-        Guarda el estado del modelo DRL (incluyendo el modelo subyacente) y del optimizador.
-        
-        Parámetros:
-        -----------
-        path : str
-            Ruta para guardar el checkpoint.
-        """
-        if self.model is None or not isinstance(self.model, nn.Module):
-            raise ValueError(CONST_MODEL_INIT_ERROR.format("guardar (modelo no es nn.Module o es None)"))
-
-        save_content: Dict[str, Any] = {
-            'model_state_dict': self.model.state_dict(), # Estado del modelo DRL subyacente
-            'model_kwargs': self.model_kwargs, # Kwargs usados para crear el modelo DRL
-            'algorithm': self.algorithm,
-            'torch_rng_state': torch.get_rng_state()
-        }
-        if self.optimizer is not None:
-            save_content['optimizer_state_dict'] = self.optimizer.state_dict()
-        if self.device.type == 'cuda':
-            save_content['torch_cuda_rng_state'] = torch.cuda.get_rng_state_all()
-
-        torch.save(save_content, path)
-        print_success(MSG_SAVE_DRL_SUCCESS.format(self.algorithm, path))
+        self._instantiate_model_if_needed()
+        if self.model is None:
+            print_error(f"Modelo {self.algorithm} no instanciado, no se puede guardar.")
+            return
+        try:
+            # Guardar el estado del modelo DRL subyacente
+            # Si el modelo DRL tiene su propio método save_state o save
+            if hasattr(self.model, 'save_state') and callable(getattr(self.model, 'save_state')):
+                model_state = self.model.save_state()
+            else: # Guardar state_dict como fallback
+                model_state = self.model.state_dict()
+            
+            # Guardar también los kwargs y configuración del wrapper para reconstrucción
+            wrapper_state = {
+                'model_cls_name': self.model_cls.__name__ if self.model_cls else None,
+                'algorithm': self.algorithm,
+                'model_kwargs': self.model_kwargs,
+                'feature_config': self.feature_config,
+                'model_state_dict': model_state # Estado del modelo DRL
+            }
+            torch.save(wrapper_state, path)
+            print_success(MSG_SAVE_DRL_SUCCESS.format(self.algorithm, path))
+        except Exception as e:
+            print_error(f"Error al guardar el modelo DRL {self.algorithm}: {e}")
 
     def load(self, path: str) -> None:
-        """
-        Carga el estado del modelo DRL (incluyendo el modelo subyacente) y del optimizador.
-        
-        Parámetros:
-        -----------
-        path : str
-            Ruta desde donde cargar el checkpoint.
-        """
-        checkpoint = torch.load(path, map_location=self.device)
-        
-        self._load_model_from_checkpoint(checkpoint)
-        self._load_optimizer_from_checkpoint(checkpoint)
-        self._load_rng_states_from_checkpoint(checkpoint)
-        
-        self.algorithm = checkpoint.get('algorithm', self.algorithm)
-        print_success(MSG_LOAD_DRL_SUCCESS.format(self.algorithm, path))
-        self.eval() # Poner en modo evaluación después de cargar
-
-    def _load_model_from_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """Carga el modelo desde el checkpoint."""
-        # Re-instanciar el modelo DRL subyacente si es necesario (si se guardó la clase)
-        if self.model is None and self.model_cls is not None:
-            loaded_kwargs = checkpoint.get('model_kwargs', self.model_kwargs)
-            if 'seed' not in loaded_kwargs and hasattr(self.rng, '_bit_generator'):
-                 loaded_kwargs['seed'] = self.rng._bit_generator.seed_seq.entropy[0] # type: ignore
-            self.model = self.model_cls(**loaded_kwargs) # type: ignore
-        
-        if self.model is None or not isinstance(self.model, nn.Module):
-             raise ValueError(CONST_MODEL_INIT_ERROR.format("cargar (modelo no es nn.Module o es None después de creación)"))
-
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model = self.model.to(self.device)
-
-    def _load_optimizer_from_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """Carga el estado del optimizador desde el checkpoint."""
-        if 'optimizer_state_dict' not in checkpoint:
-            return
+        try:
+            checkpoint = torch.load(path, map_location=self.device)
             
-        if self.optimizer is None: # Intentar inicializar si no existe
-             self._initialize_optimizer_from_model_params()
-             
-        if self.optimizer: # Chequear de nuevo si la inicialización fue exitosa
-            try:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except Exception as e:
-                print_warning(f"No se pudo cargar el estado del optimizador: {e}. Puede ser necesario re-inicializarlo o asegurar que los parámetros coinciden.")
-        else:
-            print_warning("Optimizador no inicializado, no se puede cargar su estado.")
+            self.algorithm = checkpoint.get('algorithm', self.algorithm)
+            self.model_kwargs = checkpoint.get('model_kwargs', self.model_kwargs)
+            self.feature_config = checkpoint.get('feature_config', self.feature_config)
+            
+            # Re-derivar nombres de columnas y dimensiones desde feature_config
+            self.cgm_cols = self.feature_config.get('cgm_features', [])
+            self.other_cols = self.feature_config.get('other_features', [])
+            self.context_cols = self.feature_config.get('explicit_context_features', [])
+            self.state_dim = len(self.cgm_cols) + len(self.other_cols) + len(self.context_cols)
+            self.action_dim = self.model_kwargs.get('action_dim', 1)
 
-    def _load_rng_states_from_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """Carga los estados de generadores aleatorios desde el checkpoint."""
-        if 'torch_rng_state' in checkpoint:
-            torch.set_rng_state(checkpoint['torch_rng_state'].cpu()) # Asegurar que se carga al CPU primero si es necesario
-        if 'torch_cuda_rng_state' in checkpoint and self.device.type == 'cuda':
-            torch.cuda.set_rng_state_all(checkpoint['torch_cuda_rng_state'])
+            # Actualizar kwargs para la instanciación del modelo si es necesario
+            self.model_kwargs['cgm_input_dim'] = (len(self.cgm_cols), 1) if self.cgm_cols else (0,0)
+            self.model_kwargs['other_input_dim'] = (len(self.other_cols),) if self.other_cols else (0,)
+            self.model_kwargs['context_dim'] = len(self.context_cols)
+            self.model_kwargs['state_dim'] = self.state_dim
 
-    def forward(self, # type: ignore[override]
-            glucose: float, carb_intake: float, iob: float,
-            activity_level: float, stress_level: float, 
-            work_intensity: float, sleep_quality: float,
-            target_glucose_range: Optional[Tuple[float, float]] = None
-            ) -> float:
+
+            model_cls_name = checkpoint.get('model_cls_name')
+            if model_cls_name:
+                # Necesitas una forma de obtener la clase del modelo desde su nombre
+                # Esto podría implicar un mapeo o importación dinámica.
+                # Ejemplo: self.model_cls = globals().get(model_cls_name)
+                # Por ahora, asumimos que la clase correcta ya está en self.model_cls
+                # o que se pasó al constructor del wrapper al cargar.
+                if self.model_cls is None or self.model_cls.__name__ != model_cls_name:
+                    print_warning(f"La clase del modelo {model_cls_name} guardada difiere o no está disponible. Intentando usar la actual.")
+                
+                self._instantiate_model_if_needed() # Instanciar con los kwargs actualizados
+            
+            if self.model is None:
+                print_error(f"No se pudo instanciar el modelo {self.algorithm} durante la carga.")
+                return
+
+            model_state_dict = checkpoint.get('model_state_dict')
+            if model_state_dict:
+                if hasattr(self.model, 'load_state') and callable(getattr(self.model, 'load_state')):
+                    self.model.load_state(model_state_dict)
+                else: # Cargar state_dict como fallback
+                    self.model.load_state_dict(model_state_dict)
+            
+            self.model.to(self.device)
+            print_success(MSG_LOAD_DRL_SUCCESS.format(self.algorithm, path))
+        except Exception as e:
+            print_error(f"Error al cargar el modelo DRL {self.algorithm} desde {path}: {e}")
+  
+    def forward(self, *args, **kwargs) -> torch.Tensor:
         """
-        Interfaz principal para obtener una dosis de insulina recomendada usando contexto completo.
-        Este método construye las entradas `x_cgm` y `x_other` necesarias y luego llama
-        a `predict_with_context` para obtener la dosis.
-
+        Paso hacia adelante del wrapper. Para DRL, esto usualmente significa obtener una acción del actor/política.
+        Este método necesita ser compatible con la firma de nn.Module.forward, pero su uso directo
+        puede ser limitado si `predict_with_context` es la interfaz principal.
+        
         Parámetros:
         -----------
-        glucose : float
-            Nivel actual de glucosa en sangre (mg/dL).
-        carb_intake : float
-            Carbohidratos consumidos (gramos).
-        iob : float
-            Insulina a bordo (unidades).
-        activity_level : float
-            Nivel de actividad física (ej: 0-10). Se usa 0.0 si es None.
-        stress_level : float
-            Nivel de estrés (ej: 0-10). Se usa 0.0 si es None.
-        work_intensity : float
-            Intensidad del trabajo (ej: 0-10). Se usa 0.0 si es None.
-        sleep_quality : float
-            Calidad del sueño (ej: 0-4). Se usa 0.0 si es None.
-        target_glucose_range : Optional[Tuple[float, float]], opcional
-            Rango objetivo de glucosa (min, max) en mg/dL. Si es None, se usa un default.
-
+        *args : Posicionales
+            Argumentos posicionales para el modelo DRL subyacente.
+        **kwargs : Clave-valor
+            Argumentos clave-valor para el modelo DRL subyacente.
+            
         Retorna:
         --------
-        float
-            Dosis de insulina recomendada.
+        torch.Tensor
+            Acción predicha.
         """
-        if self.model is None:
-            raise ValueError(CONST_MODEL_INIT_ERROR.format("realizar una predicción forward"))
-
-        effective_target_glucose: Optional[float]
-        if target_glucose_range:
-            effective_target_glucose = (target_glucose_range[0] + target_glucose_range[1]) / 2.0
-        elif hasattr(self.model, 'default_target_glucose'): # El modelo subyacente puede tener un default
-            effective_target_glucose = self.model.default_target_glucose # type: ignore
-        else: 
-            # Se utiliza el punto medio del rango ideal como valor por defecto si no se especifica otro.
-            effective_target_glucose = (IDEAL_LOWER_BOUND + IDEAL_UPPER_BOUND) / 2.0
-
-        # Construir x_cgm (historial CGM)
-        # El modelo subyacente debe exponer sus dimensiones de entrada esperadas
-        if not hasattr(self.model, 'cgm_input_dim') or not getattr(self.model, 'cgm_input_dim', None):
-            raise AttributeError(MSG_ATTR_ERROR_CGM_DIM)
-        cgm_timesteps, cgm_features = self.model.cgm_input_dim # type: ignore
-        # Crear un historial CGM simple usando el valor actual de glucosa
-        # Esto es una simplificación; en un caso real, se usaría el historial real.
-        x_cgm_hist_np = np.full((1, cgm_timesteps, cgm_features), float(glucose), dtype=np.float32)
-
-        # Construir x_other (otras características)
-        if not hasattr(self.model, 'other_input_dim') or not getattr(self.model, 'other_input_dim', None):
-             raise AttributeError(MSG_ATTR_ERROR_OTHER_DIM)
-        other_features_len = self.model.other_input_dim[0] # type: ignore
-        # Crear un array base para x_other. El modelo subyacente en predict_with_context
-        # decidirá cómo usar estas o las características del diccionario de contexto.
-        x_other_base_np = np.zeros((1, other_features_len), dtype=np.float32)
-        
-        # Llamar a predict_with_context, que es el método que realmente interactúa
-        # con la lógica de predicción contextual del modelo DRL subyacente.
-        return self.predict_with_context(
-            x_cgm=x_cgm_hist_np, 
-            x_other=x_other_base_np, # x_other puede ser un placeholder si el contexto lo maneja todo
-            current_glucose=float(glucose), 
-            carb_intake=float(carb_intake), 
-            iob=float(iob),
-            exercise_intensity=float(activity_level) if activity_level is not None else None,
-            stress_level=float(stress_level) if stress_level is not None else None,
-            work_intensity=float(work_intensity) if work_intensity is not None else None,
-            sleep_quality=float(sleep_quality) if sleep_quality is not None else None,
-            target_glucose=effective_target_glucose
-        )
-
-    def _unpack_input_data(self, x: Union[np.ndarray, List[np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
-        """Desempaqueta los datos de entrada x en x_cgm y x_other."""
-        if isinstance(x, list):
-            return self._unpack_list_input(x)
-        
-        # Si x es un solo ndarray, se asume que es x_cgm
-        x_cgm = x
-        other_dim = self._get_other_input_dimension()
-        return x_cgm, np.zeros((x_cgm.shape[0], other_dim), dtype=np.float32)
-
-    def _unpack_list_input(self, x: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        """Desempaqueta entrada cuando x es una lista."""
-        if len(x) == 2:
-            return self._handle_two_element_list(x)
-        elif len(x) == 1:
-            return self._handle_single_element_list(x)
-        raise ValueError(MSG_UNSUPPORTED_INPUT_LIST)
-
-    def _handle_two_element_list(self, x: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        """Maneja lista con dos elementos."""
-        x_cgm, x_other = x[0], x[1]
-        if x_other is None and self.model and hasattr(self.model, 'other_input_dim'):
-            other_dim = getattr(self.model, 'other_input_dim', [0])[0]
-            x_other = np.zeros((x_cgm.shape[0], other_dim), dtype=np.float32)
-        return x_cgm, x_other
-
-    def _handle_single_element_list(self, x: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        """Maneja lista con un elemento."""
-        x_cgm = x[0]
-        other_dim = self._get_other_input_dimension()
-        return x_cgm, np.zeros((x_cgm.shape[0], other_dim), dtype=np.float32)
-
-    def _get_other_input_dimension(self) -> int:
-        """Obtiene la dimensión de entrada 'other' del modelo."""
-        if not self.model or not hasattr(self.model, 'other_input_dim'):
-            return 0
-            
-        other_dim_attr = getattr(self.model, 'other_input_dim', [0])
-        if isinstance(other_dim_attr, (list, tuple)) and len(other_dim_attr) > 0:
-            return other_dim_attr[0]
-        elif isinstance(other_dim_attr, int):
-            return other_dim_attr
-        return 0
-
-
-    def _unpack_validation_data_with_context(self, 
-        validation_data: Optional[Tuple[Union[np.ndarray, List[np.ndarray]], Optional[np.ndarray], Optional[Dict[str, np.ndarray]]]]
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[Dict[str, np.ndarray]]]:
-        """
-        Desempaqueta los datos de validación, incluyendo el contexto opcional.
-        Permite que y_val sea None, ya que en DRL la evaluación puede ser por recompensa.
-        """
-        if validation_data is None:
-            return None, None, None, None
-        try:
-            x_val_data: Union[np.ndarray, List[np.ndarray]]
-            y_val: Optional[np.ndarray]
-            context_val: Optional[Dict[str, np.ndarray]]
-
-            if len(validation_data) == 2: # (x_val_data, y_val_or_context)
-                x_val_data, y_val_or_context = validation_data # type: ignore
-                if isinstance(y_val_or_context, np.ndarray) or y_val_or_context is None:
-                    y_val = y_val_or_context
-                    context_val = None
-                elif isinstance(y_val_or_context, dict): # Asumir (x_val_data, context_val) y y_val es None
-                    y_val = None
-                    context_val = y_val_or_context
-                else:
-                    raise ValueError("Formato de validation_data (2 elementos) no reconocido.")
-            elif len(validation_data) == 3: # (x_val_data, y_val, context_val)
-                (x_val_data, y_val, context_val) = validation_data # type: ignore
-            else:
-                raise ValueError("validation_data debe ser una tupla de 2 o 3 elementos.")
-
-            x_cgm_val, x_other_val = self._unpack_input_data(x_val_data)
-            return x_cgm_val, x_other_val, y_val, context_val
-        except Exception as e:
-            print_warning(MSG_CTX_UNPACK_ERROR.format(e))
-            return None, None, None, None
-
-    def _initialize_training_components(self, x_cgm: np.ndarray, x_other: np.ndarray, y: np.ndarray) -> None:
-        """Inicializa el modelo (si es necesario) y el optimizador."""
-        if self.model is None: # Si el modelo no fue pre-instanciado
-            self.start(x_cgm, x_other, y) # Llama a start para instanciar/inicializar self.model
-        
-        # Inicializar optimizador después de que self.model esté definitivamente disponible
-        self._initialize_optimizer_from_model_params()
-
-
-    def _initialize_optimizer_from_model_params(self, learning_rate: Optional[float] = None) -> None:
-        """
-        Inicializa el optimizador usando los parámetros del modelo DRL subyacente.
-        Usa 'learning_rate' de model_kwargs si está disponible, sino el argumento o un default.
-        """
-        if self.model is not None and isinstance(self.model, nn.Module):
-            model_params = list(self.model.parameters())
-            if not model_params:
-                print_warning(MSG_INIT_OPTIMIZER_NO_PARAMS.format(self.algorithm))
-                self.optimizer = None
-                return
-            
-            # Priorizar LR del argumento, luego de model_kwargs, luego default
-            lr_to_use: float = learning_rate if learning_rate is not None \
-                else self.model_kwargs.get('learning_rate', 1e-4)
-
-            opt_class_name: str = self.model_kwargs.get('optimizer_cls', 'Adam')
-            
-            optimizer_cls_map: Dict[str, torch.Type[optim.Optimizer]] = {
-                'Adam': optim.Adam, 
-                'AdamW': optim.AdamW, 
-                'RMSprop': optim.RMSprop,
-                'SGD': optim.SGD
-            }
-            selected_optimizer_cls = optimizer_cls_map.get(opt_class_name, optim.Adam)
-            
-            # Algunos optimizadores pueden tener kwargs adicionales (ej: weight_decay para AdamW)
-            opt_kwargs_from_model = self.model_kwargs.get('optimizer_kwargs', {})
-
-            try:
-                self.optimizer = selected_optimizer_cls(model_params, lr=lr_to_use, **opt_kwargs_from_model)
-                print_info(MSG_INIT_OPTIMIZER_SUCCESS.format(opt_class_name, lr_to_use))
-            except TypeError as e:
-                print_warning(f"Error al inicializar optimizador {opt_class_name} con kwargs {opt_kwargs_from_model}: {e}. Intentando sin kwargs adicionales.")
-                self.optimizer = selected_optimizer_cls(model_params, lr=lr_to_use)
-                print_info(MSG_INIT_OPTIMIZER_SUCCESS.format(opt_class_name, lr_to_use) + " (sin kwargs adicionales)")
-
-        else:
-            print_warning(MSG_INIT_OPTIMIZER_FAIL)
-            self.optimizer = None
-            
-    def _setup_history_drl(self) -> Dict[str, List[float]]:
-        """Configura el diccionario de historial para el entrenamiento DRL."""
-        return {
-            CONST_LOSS: [], CONST_ACTOR_LOSS: [], CONST_CRITIC_LOSS: [],
-            CONST_AVERAGE_REWARD: [], CONST_VAL_LOSS: [] # CONST_VAL_LOSS se usa para early stopping
-        }
-
-    def _setup_early_stopping_drl(self, verbose: int) -> None:
-        """Configura el early stopping para DRL."""
-        # Usar valores de model_kwargs si están presentes, sino los de EARLY_STOPPING_POLICY
-        patience = self.model_kwargs.get('patience', EARLY_STOPPING_POLICY.get('drl_patience', 20))
-        min_delta = self.model_kwargs.get('min_delta', EARLY_STOPPING_POLICY.get('drl_min_delta', 0.001)) # Ajustado min_delta
-        restore_best = self.model_kwargs.get('restore_best_weights', True)
-
-        if self.early_stopping is None: # Solo configurar si no existe
-            self.add_early_stopping(
-                patience=patience,
-                min_delta=min_delta,
-                restore_best_weights=restore_best
-            )
-            if verbose > 0 and self.early_stopping is not None:
-                print_info(MSG_EARLY_STOPPING_CONFIGURED.format(self.early_stopping['patience']))
-        
-        # Siempre resetear el estado de early stopping al inicio de fit
-        if self.early_stopping is not None: 
-            self.early_stopping['best_loss'] = float('inf') # Asume que se minimiza una pérdida o -recompensa
-            self.early_stopping['wait'] = 0 
-            self.early_stopping['best_params'] = None
-
-
-    def _run_drl_training_epoch(self, x_cgm_data: np.ndarray, x_other_data: np.ndarray, 
-                               y_data: np.ndarray, context_data_train: Optional[Dict[str, np.ndarray]],
-                               agent_update_batch_size: int, epoch_num: int) -> Dict[str, float]:
-        """
-        Ejecuta una 'época' de entrenamiento DRL, delegando al método `run_training_step`
-        del modelo DRL subyacente.
-        """
-        if not self._validate_training_components():
-            return self._get_empty_metrics()
-
-        self.train()
-        epoch_metrics_sum = self._initialize_epoch_metrics()
-        
-        if not hasattr(self.model, 'run_training_step'):
-            print_warning(MSG_NO_RUN_TRAINING_STEP + f" Modelo: {type(self.model).__name__}")
-            return {k: float('nan') for k in epoch_metrics_sum}
-
-        num_updates = self._execute_training_steps(
-            x_cgm_data, x_other_data, y_data, context_data_train, 
-            agent_update_batch_size, epoch_num, epoch_metrics_sum
-        )
-        
-        return self._compute_averaged_metrics(epoch_metrics_sum, num_updates)
-
-    def _validate_training_components(self) -> bool:
-        """Valida que el modelo y optimizador estén inicializados."""
-        if self.model is None or self.optimizer is None:
-            print_warning("Modelo DRL u optimizador no inicializados. Saltando época de entrenamiento DRL.")
-            return False
-        return True
-
-    def _get_empty_metrics(self) -> Dict[str, float]:
-        """Retorna métricas vacías con valores NaN."""
-        return {
-            CONST_LOSS: float('nan'), 
-            CONST_ACTOR_LOSS: float('nan'), 
-            CONST_CRITIC_LOSS: float('nan'), 
-            CONST_AVERAGE_REWARD: float('nan')
-        }
-
-    def _initialize_epoch_metrics(self) -> Dict[str, float]:
-        """Inicializa el diccionario de métricas de época."""
-        return {
-            CONST_LOSS: 0.0, 
-            CONST_ACTOR_LOSS: 0.0, 
-            CONST_CRITIC_LOSS: 0.0, 
-            CONST_AVERAGE_REWARD: 0.0
-        }
-
-    def _execute_training_steps(self, x_cgm_data: np.ndarray, x_other_data: np.ndarray,
-                              y_data: np.ndarray, context_data_train: Optional[Dict[str, np.ndarray]],
-                              agent_update_batch_size: int, epoch_num: int,
-                              epoch_metrics_sum: Dict[str, float]) -> int:
-        """Ejecuta los pasos de entrenamiento y acumula métricas."""
-        steps_per_epoch = self.model_kwargs.get('drl_steps_per_epoch', 1)
-        num_updates = 0
-        
-        for _ in range(steps_per_epoch):
-            step_metrics = self.model.run_training_step( # type: ignore
-                x_cgm_data=x_cgm_data, 
-                x_other_data=x_other_data, 
-                y_data=y_data,
-                context_data=context_data_train,
-                batch_size=agent_update_batch_size,
-                optimizer=self.optimizer
-            )
-            
-            if not self._process_step_metrics(step_metrics, epoch_metrics_sum, epoch_num):
-                if num_updates == 0:
-                    num_updates = 1  # Para evitar división por cero
-                break
-                
-            num_updates += 1
-            
-        return num_updates
-
-    def _process_step_metrics(self, step_metrics: Any, epoch_metrics_sum: Dict[str, float], 
-                            epoch_num: int) -> bool:
-        """Procesa las métricas de un paso y las acumula. Retorna True si es exitoso."""
-        if isinstance(step_metrics, dict):
-            for key in epoch_metrics_sum:
-                epoch_metrics_sum[key] += step_metrics.get(key, 0.0)
-            return True
-        else:
-            print_warning(f"run_training_step del modelo {type(self.model).__name__} no devolvió un diccionario de métricas en la época {epoch_num}.")
-            return False
-
-    def _compute_averaged_metrics(self, epoch_metrics_sum: Dict[str, float], 
-                                num_updates: int) -> Dict[str, float]:
-        """Calcula las métricas promediadas de la época."""
-        if num_updates > 0:
-            return {k: v / num_updates for k, v in epoch_metrics_sum.items()}
-        else:
-            return {k: float('nan') for k in epoch_metrics_sum}
-
-
-    def _validate_drl_agent(self, x_cgm_val: np.ndarray, x_other_val: np.ndarray, 
-                            y_val: Optional[np.ndarray], context_data_val: Optional[Dict[str, np.ndarray]]
-                           ) -> Dict[str, float]:
-        """
-        Valida el agente DRL, delegando a `evaluate_performance` del modelo subyacente.
-        Si `y_val` está presente y `evaluate_performance` no devuelve métricas de recompensa,
-        puede calcular MSE de acción como fallback.
-        """
-        if self.model is None: 
-            return {CONST_AVERAGE_REWARD: -float('inf'), CONST_VAL_LOSS: float('inf')}
-        
-        self.eval()
-        val_metrics_result = self._get_default_validation_metrics()
-        
-        # Evaluar con el modelo si tiene método de evaluación
-        self._evaluate_with_model_performance(x_cgm_val, x_other_val, y_val, context_data_val, val_metrics_result)
-        
-        # Calcular MSE como fallback si es necesario
-        self._calculate_mse_fallback(x_cgm_val, x_other_val, y_val, val_metrics_result)
-        
-        self.train()
-        return val_metrics_result
-
-    def _get_default_validation_metrics(self) -> Dict[str, float]:
-        """Retorna métricas de validación por defecto."""
-        return {
-            CONST_AVERAGE_REWARD: -float('inf'),
-            CONST_VAL_LOSS: float('inf')
-        }
-
-    def _evaluate_with_model_performance(self, x_cgm_val: np.ndarray, x_other_val: np.ndarray, 
-                                       y_val: Optional[np.ndarray], context_data_val: Optional[Dict[str, np.ndarray]],
-                                       val_metrics_result: Dict[str, float]) -> None:
-        """Evalúa usando el método evaluate_performance del modelo si existe."""
-        if not hasattr(self.model, 'evaluate_performance'):
-            print_warning(MSG_NO_EVAL_PERFORMANCE + f" Modelo: {type(self.model).__name__}")
-            return
-            
-        try:
-            perf_metrics = self.model.evaluate_performance( # type: ignore
-                x_cgm_val=x_cgm_val, 
-                x_other_val=x_other_val, 
-                y_val=y_val,
-                context_data=context_data_val
-            )
-            self._process_performance_metrics(perf_metrics, val_metrics_result)
-        except Exception as e:
-            print_warning(f"Error al llamar a self.model.evaluate_performance: {e}")
-
-    def _process_performance_metrics(self, perf_metrics: Any, val_metrics_result: Dict[str, float]) -> None:
-        """Procesa las métricas devueltas por evaluate_performance."""
-        if isinstance(perf_metrics, dict):
-            val_metrics_result.update(perf_metrics)
-        elif isinstance(perf_metrics, (float, int, np.number)):
-            self._handle_numeric_performance_metric(perf_metrics, val_metrics_result)
-        else:
-            print_warning(f"evaluate_performance de {type(self.model).__name__} devolvió un tipo inesperado: {type(perf_metrics)}")
-
-    def _handle_numeric_performance_metric(self, perf_metrics: Union[float, int, np.number], 
-                                         val_metrics_result: Dict[str, float]) -> None:
-        """Maneja métricas numéricas simples de evaluate_performance."""
-        if perf_metrics > -CONST_EPSILON:  # Probablemente una recompensa
-            val_metrics_result[CONST_AVERAGE_REWARD] = float(perf_metrics)
-            val_metrics_result[CONST_VAL_LOSS] = -float(perf_metrics)  # Para early stopping
-        else:  # Probablemente una pérdida
-            val_metrics_result[CONST_VAL_LOSS] = float(perf_metrics)
-
-    def _calculate_mse_fallback(self, x_cgm_val: np.ndarray, x_other_val: np.ndarray, 
-                              y_val: Optional[np.ndarray], val_metrics_result: Dict[str, float]) -> None:
-        """Calcula MSE como fallback si y_val está disponible y faltan métricas."""
-        if not self._should_calculate_mse_fallback(y_val, val_metrics_result):
-            return
-            
-        actions_pred_val = self.predict(x_cgm_val, x_other_val)
-        if len(y_val) != len(actions_pred_val): # type: ignore
-            print_warning("Longitudes de y_val y acciones predichas no coinciden para MSE de validación.")
-            return
-            
-        action_mse_val = float(np.mean((actions_pred_val.flatten() - y_val.flatten())**2)) # type: ignore
-        val_metrics_result['action_mse_val'] = action_mse_val
-        
-        # Si no hay otra métrica de pérdida, usar MSE para early stopping
-        if val_metrics_result.get(CONST_VAL_LOSS, float('inf')) == float('inf'):
-            val_metrics_result[CONST_VAL_LOSS] = action_mse_val
-
-    def _should_calculate_mse_fallback(self, y_val: Optional[np.ndarray], 
-                                     val_metrics_result: Dict[str, float]) -> bool:
-        """Determina si se debe calcular MSE como fallback."""
-        if y_val is None:
-            return False
-            
-        reward_missing = val_metrics_result.get(CONST_AVERAGE_REWARD, -float('inf')) == -float('inf')
-        loss_missing = val_metrics_result.get(CONST_VAL_LOSS, float('inf')) == float('inf')
-        
-        return reward_missing or loss_missing
-
-
-    def _process_epoch_metrics_drl(self, epoch_metrics: Dict[str, float], history: Dict[str, List[float]]) -> float:
-        """Procesa y registra las métricas de la época DRL en el historial."""
-        # La 'pérdida principal' para DRL puede ser la del crítico, o una combinada.
-        # Usar CONST_LOSS de epoch_metrics si está, sino default a critic_loss o actor_loss.
-        main_loss = epoch_metrics.get(CONST_LOSS, 
-                                      epoch_metrics.get(CONST_CRITIC_LOSS, 
-                                                        epoch_metrics.get(CONST_ACTOR_LOSS, 0.0)))
-        
-        history[CONST_LOSS].append(main_loss)
-        history[CONST_ACTOR_LOSS].append(epoch_metrics.get(CONST_ACTOR_LOSS, 0.0))
-        history[CONST_CRITIC_LOSS].append(epoch_metrics.get(CONST_CRITIC_LOSS, 0.0))
-        history[CONST_AVERAGE_REWARD].append(epoch_metrics.get(CONST_AVERAGE_REWARD, 0.0))
-        return main_loss # Devuelve la pérdida principal de la época de entrenamiento
-
-    def _log_epoch_progress_drl(self, epoch: int, epochs: int, train_loss: float, 
-                               val_metrics: Optional[Dict[str, float]], 
-                               history: Dict[str, List[float]],
-                               pbar: tqdm) -> None:
-        """Registra el progreso de la época DRL en la barra de progreso y opcionalmente en logs."""
-        log_msg_parts = [f"Época {epoch + 1}/{epochs}"]
-        
-        # Añadir métricas de entrenamiento
-        self._add_training_metrics_to_log(history, log_msg_parts)
-        
-        # Añadir métricas de validación
-        self._add_validation_metrics_to_log(val_metrics, log_msg_parts)
-        
-        # Actualizar barra de progreso y log opcional
-        log_msg = " - ".join(log_msg_parts)
-        pbar.set_description(log_msg)
-        
-        if self._should_log_detailed(epoch):
-            print_debug(log_msg)
-
-    def _add_training_metrics_to_log(self, history: Dict[str, List[float]], 
-                                   log_msg_parts: List[str]) -> None:
-        """Añade métricas de entrenamiento al mensaje de log."""
-        actor_l_train = history[CONST_ACTOR_LOSS][-1] if history[CONST_ACTOR_LOSS] else float('nan')
-        critic_l_train = history[CONST_CRITIC_LOSS][-1] if history[CONST_CRITIC_LOSS] else float('nan')
-        avg_reward_train = history[CONST_AVERAGE_REWARD][-1] if history[CONST_AVERAGE_REWARD] else float('nan')
-
-        if self._is_valid_metric(actor_l_train):
-            log_msg_parts.append(f"ActorL: {actor_l_train:.4f}")
-        if self._is_valid_metric(critic_l_train):
-            log_msg_parts.append(f"CriticL: {critic_l_train:.4f}")
-        if self._is_valid_metric(avg_reward_train):
-            log_msg_parts.append(f"RecompProm: {avg_reward_train:.2f}")
-
-    def _add_validation_metrics_to_log(self, val_metrics: Optional[Dict[str, float]], 
-                                     log_msg_parts: List[str]) -> None:
-        """Añade métricas de validación al mensaje de log."""
-        if not val_metrics:
-            return
-            
-        avg_reward_val = val_metrics.get(CONST_AVERAGE_REWARD)
-        val_loss_metric = val_metrics.get(CONST_VAL_LOSS)
-        action_mse_val = val_metrics.get('action_mse_val')
-
-        if self._is_valid_metric(avg_reward_val):
-            log_msg_parts.append(f"RecompVal: {avg_reward_val:.2f}")
-        if self._is_valid_loss_metric(val_loss_metric):
-            log_msg_parts.append(f"ValPerd: {val_loss_metric:.4f}")
-        if self._is_valid_loss_metric(action_mse_val):
-            log_msg_parts.append(f"ValMSEAcc: {action_mse_val:.4f}")
-
-    def _is_valid_metric(self, metric: Optional[float]) -> bool:
-        """Verifica si una métrica es válida para mostrar."""
-        return metric is not None and not np.isnan(metric) and abs(metric) > CONST_EPSILON
-
-    def _is_valid_loss_metric(self, metric: Optional[float]) -> bool:
-        """Verifica si una métrica de pérdida es válida para mostrar."""
-        return metric is not None and not np.isnan(metric)
-
-    def _should_log_detailed(self, epoch: int) -> bool:
-        """Determina si se debe hacer log detallado en esta época."""
-        return hasattr(self, 'verbose') and getattr(self, 'verbose', 0) > 1 and epoch % 10 == 0
-
-
-    def _check_early_stopping_drl(self, current_val_metric: float) -> bool:
-        """
-        Comprueba early stopping para DRL. 
-        `current_val_metric` debe ser una métrica donde menor es mejor (ej: pérdida, -recompensa).
-        """
-        if not self.early_stopping: return False
-        if np.isnan(current_val_metric): # No se puede tomar decisión con NaN
-            print_warning("Métrica de validación para early stopping es NaN. No se aplicará early stopping en esta época.")
-            return False
-
-        es_config = self.early_stopping
-        # current_val_metric es la que se quiere minimizar (ej: val_loss, o -avg_reward_val)
-        if current_val_metric < es_config['best_loss'] - es_config['min_delta']:
-            es_config['best_loss'] = current_val_metric
-            es_config['wait'] = 0
-            if es_config['restore_best_weights'] and self.model and isinstance(self.model, nn.Module):
-                try:
-                    # Guardar parámetros en CPU para evitar problemas de memoria GPU si hay muchos modelos
-                    es_config['best_params'] = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
-                except Exception as e:
-                    print_warning(f"No se pudieron guardar los mejores pesos para DRL (early stopping): {e}")
-                    es_config['best_params'] = None # No se pudieron guardar los pesos
-        else:
-            es_config['wait'] += 1
-        
-        return es_config['wait'] >= es_config['patience']
-
-    def _restore_best_weights_drl(self, verbose: int) -> None:
-        """Restaura los mejores pesos para DRL si early stopping los guardó."""
-        if not self.early_stopping: return
-        
-        es_config = self.early_stopping
-        if es_config['restore_best_weights'] and es_config['best_params'] is not None and \
-           self.model and isinstance(self.model, nn.Module):
-            if verbose > 0:
-                # Asegurar que best_loss no es inf antes de formatear
-                best_loss_display = es_config['best_loss'] if es_config['best_loss'] != float('inf') else float('nan')
-                print_info(MSG_RESTORE_BEST_WEIGHTS_DRL.format(best_loss_display))
-            
-            # Cargar los parámetros guardados (que están en CPU) al dispositivo del modelo
-            # Es importante que las claves coincidan perfectamente.
-            try:
-                # Crear un nuevo state_dict en el dispositivo correcto antes de cargar
-                device_state_dict = {k: v.to(self.device) for k,v in es_config['best_params'].items()}
-                self.model.load_state_dict(device_state_dict)
-                # self.model = self.model.to(self.device) # Asegurar que el modelo está en el dispositivo (ya debería estarlo)
-            except Exception as e:
-                print_critical(f"Error crítico al restaurar los mejores pesos del modelo DRL: {e}")
-                print_warning("El modelo podría no estar en su mejor estado.")
-        elif es_config['restore_best_weights'] and es_config['best_params'] is None and verbose > 0:
-            print_warning("Early stopping estaba configurado para restaurar pesos, pero no se guardaron mejores pesos (posiblemente debido a errores o no mejora).")
+        # Este forward es para cumplir con nn.Module, pero la lógica principal de DRL está en select_action o predict_with_context del modelo DRL subyacente.
+        self._instantiate_model_if_needed()
+        if self.model and hasattr(self.model, 'forward'):
+            return self.model.forward(*args, **kwargs)
+        raise NotImplementedError("El modelo DRL subyacente no tiene un método forward o no está instanciado.")

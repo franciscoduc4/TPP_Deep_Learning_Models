@@ -8,6 +8,7 @@ TD3+BC es un algoritmo de aprendizaje por refuerzo profundo offline que combina:
 4. Regularización para evitar extrapolaciones fuera de la distribución de datos
 """
 
+import copy
 import os
 import sys
 import numpy as np
@@ -21,7 +22,7 @@ from collections import deque
 from custom.DeepReinforcementLearning.drl_pt import DRLModelWrapperPyTorch
 from custom.printer import print_critical, print_debug, print_warning, print_info
 from constants.constants import (
-    IDEAL_LOWER_BOUND, IDEAL_UPPER_BOUND, SEVERE_HYPOGLYCEMIA_THRESHOLD, HYPOGLYCEMIA_THRESHOLD, 
+    CONST_ACTOR_LOSS, CONST_CRITIC_LOSS, CONST_DEFAULT_SEED, CONST_EPSILON, CONTEXT_FEATURE_ORDER, IDEAL_LOWER_BOUND, IDEAL_UPPER_BOUND, SEVERE_HYPOGLYCEMIA_THRESHOLD, HYPOGLYCEMIA_THRESHOLD, 
     HYPERGLYCEMIA_THRESHOLD, SEVERE_HYPERGLYCEMIA_THRESHOLD, SEVERE_HYPO_PENALTY, HYPO_PENALTY_BASE, 
     HYPER_PENALTY_BASE, SEVERE_HYPER_PENALTY, MAX_REWARD
 )
@@ -38,112 +39,96 @@ class TD3Actor(nn.Module):
     Parámetros:
     -----------
     cgm_input_dim : tuple
-        Dimensiones de entrada para datos CGM
+        Dimensiones de entrada para datos CGM. Ejemplo: (timesteps, cgm_features) o (flat_cgm_dim,).
     other_input_dim : tuple
-        Dimensiones de entrada para otras características
+        Dimensiones de entrada para otras características. Ejemplo: (other_features_len,).
     action_dim : int
-        Dimensión de la acción (dosis de insulina)
+        Dimensión de la acción (dosis de insulina).
     hidden_dim : int
-        Dimensión de las capas ocultas
+        Dimensión de las capas ocultas.
     max_action : float
-        Valor máximo de acción permitido
+        Valor máximo de acción permitido.
     """
     
     def __init__(self, cgm_input_dim: tuple, other_input_dim: tuple, 
-             action_dim: int = TD3_BC_CONFIG['action_dim'], 
-             hidden_dim: int = TD3_BC_CONFIG['hidden_dim'], 
-             max_action: float = TD3_BC_CONFIG['max_action']) -> None:
+                 action_dim: int = TD3_BC_CONFIG.get('action_dim', 1), 
+                 hidden_dim: int = TD3_BC_CONFIG.get('hidden_dim', 256), 
+                 max_action: float = TD3_BC_CONFIG.get('max_action', 10.0)) -> None:
         super().__init__()
         
-        # Guardar dimensiones de entrada como atributos de instancia
-        self.cgm_input_dim = cgm_input_dim
-        self.other_input_dim = other_input_dim
-        self.action_dim = action_dim
-        self.hidden_dim = hidden_dim
+        self.flat_cgm_dim = np.prod(cgm_input_dim) if cgm_input_dim and np.prod(cgm_input_dim) > 0 else 0
+        self.flat_other_dim = np.prod(other_input_dim) if other_input_dim and np.prod(other_input_dim) > 0 else 0
+        total_input_dim = self.flat_cgm_dim + self.flat_other_dim
+
+        if total_input_dim == 0:
+            print_warning("TD3Actor: total_input_dim es 0. El modelo podría no funcionar correctamente.")
+            # Se podría considerar levantar un error si total_input_dim es 0 y no es un caso esperado.
+            # Por ahora, se permite para que la inicialización no falle, pero las capas lineales fallarán si se usan.
+            # Alternativamente, definir capas dummy o no definir capas si total_input_dim es 0.
+            # Para este ejemplo, asumimos que total_input_dim > 0 si el actor se usa.
+            
+        self.l1 = nn.Linear(total_input_dim, hidden_dim) if total_input_dim > 0 else nn.Identity() # Usar Identity si no hay entrada
+        self.l2 = nn.Linear(hidden_dim, hidden_dim) if total_input_dim > 0 else nn.Identity()
+        self.l3 = nn.Linear(hidden_dim, action_dim) if total_input_dim > 0 else nn.Identity()
+        
         self.max_action = max_action
-        
-        # Encoder para datos CGM
-        self.cgm_encoder = nn.Sequential(
-            nn.Linear(np.prod(cgm_input_dim), hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU()
-        )
-        
-        # Encoder para otras características
-        self.other_encoder = nn.Sequential(
-            nn.Linear(np.prod(other_input_dim), hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU()
-        )
-        
-        # Capas combinadas
-        self.combined_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU()
-        )
-        
-        # Capa de salida para acción (dosis de insulina)
-        self.action_head = nn.Linear(hidden_dim // 2, action_dim)
         
     def forward(self, x_cgm: torch.Tensor, x_other: torch.Tensor) -> torch.Tensor:
         """
         Paso hacia adelante de la red del actor.
-        
+
         Parámetros:
         -----------
         x_cgm : torch.Tensor
-            Datos CGM de entrada
+            Tensor de datos CGM. Forma: (batch_size, *cgm_input_dim).
         x_other : torch.Tensor
-            Otras características de entrada
-            
+            Tensor de otras características. Forma: (batch_size, *other_input_dim).
+
         Retorna:
         --------
         torch.Tensor
-            Acción predicha (dosis de insulina)
+            Acción predicha. Forma: (batch_size, action_dim).
         """
-        # Aplanar entradas si es necesario
-        if len(x_cgm.shape) > 2:
-            x_cgm = x_cgm.reshape(x_cgm.shape[0], -1)
-        if len(x_other.shape) > 2:
-            x_other = x_other.reshape(x_other.shape[0], -1)
-        
-        # Verificar y manejar entradas vacías o incorrectas
-        if x_cgm.shape[1] != np.prod(self.cgm_input_dim):
-            print_warning(f"x_cgm shape mismatch: expected {np.prod(self.cgm_input_dim)}, got {x_cgm.shape[1]}")
-            if x_cgm.shape[1] < np.prod(self.cgm_input_dim):
-                padding = torch.zeros(x_cgm.shape[0], np.prod(self.cgm_input_dim) - x_cgm.shape[1], device=x_cgm.device)
-                x_cgm = torch.cat([x_cgm, padding], dim=1)
-        
-        if x_other.shape[1] != np.prod(self.other_input_dim):
-            print_warning(f"x_other shape mismatch: expected {np.prod(self.other_input_dim)}, got {x_other.shape[1]}")
-            if x_other.shape[1] < np.prod(self.other_input_dim):
-                padding = torch.zeros(x_other.shape[0], np.prod(self.other_input_dim) - x_other.shape[1], device=x_other.device)
-                x_other = torch.cat([x_other, padding], dim=1)
-        
-        # Codificar cada componente
-        cgm_features = self.cgm_encoder(x_cgm)
-        other_features = self.other_encoder(x_other)
-        
-        # Combinar características
-        combined = torch.cat([cgm_features, other_features], dim=1)
-        features = self.combined_layer(combined)
-        
-        # Generar acción
-        action = torch.sigmoid(self.action_head(features)) * self.max_action
-        
-        # Ajustar acción para dosis de insulina
-        carbs_factor = x_other[:, 0:1] / 20.0  # Simple 1:20 insulin:carb ratio
-        carbs_factor = torch.clamp(carbs_factor, 0.0, self.max_action / 2)
-        
-        # Combinar acción con factor de carbohidratos
-        action = 0.7 * action + 0.3 * carbs_factor
-        
-        return action
+        inputs = []
+        if self.flat_cgm_dim > 0:
+            if x_cgm.shape[0] == 0 : # Si el batch es vacío
+                 # Devolver un tensor vacío con la forma correcta de salida si es posible
+                return torch.empty((0, self.l3.out_features if hasattr(self.l3, 'out_features') else 1), device=x_cgm.device)
 
+            inputs.append(x_cgm.reshape(x_cgm.shape[0], -1))
+        
+        if self.flat_other_dim > 0:
+            if x_other.shape[0] == 0: # Si el batch es vacío
+                return torch.empty((0, self.l3.out_features if hasattr(self.l3, 'out_features') else 1), device=x_other.device)
+            inputs.append(x_other.reshape(x_other.shape[0], -1))
+
+        if not inputs: # Si no hay características de entrada
+             # Esto podría suceder si flat_cgm_dim y flat_other_dim son 0.
+             # Devolver una acción por defecto o manejar el error.
+             # Si l3 es Identity, necesitaríamos saber action_dim para crear un tensor de ceros.
+             # Asumiendo que action_dim es conocido (ej. self.l3.out_features si l3 es Linear)
+            action_dim_val = self.l3.out_features if hasattr(self.l3, 'out_features') and not isinstance(self.l3, nn.Identity) else TD3_BC_CONFIG.get('action_dim', 1)
+            # Necesitamos una forma de obtener el device si los inputs son vacíos.
+            # Por ahora, si no hay inputs, es difícil determinar el device o batch_size.
+            # Este caso debería ser prevenido por una validación anterior de dimensiones de entrada.
+            print_warning("TD3Actor.forward: No hay datos de entrada (CGM u Otros).")
+            # Devolver un tensor vacío con la forma correcta si es posible.
+            # Esto es problemático si no hay forma de determinar batch_size.
+            # Si se llega aquí, es probable que haya un problema en la preparación de datos.
+            # Para evitar un error inmediato, si l3 es Identity, intentamos devolver algo,
+            # pero esto es una curita.
+            if isinstance(self.l3, nn.Identity): # No se puede determinar out_features
+                 # Devolver un tensor vacío con la dimensión de acción esperada, pero batch_size 0
+                return torch.empty((0, action_dim_val)) # device?
+            # Si l3 es Linear, podemos usar out_features
+            return torch.empty((0, self.l3.out_features))
+
+
+        x = torch.cat(inputs, dim=1)
+        
+        a = F.relu(self.l1(x))
+        a = F.relu(self.l2(a))
+        return self.max_action * torch.tanh(self.l3(a))
 
 class TD3Critic(nn.Module):
     """
@@ -152,113 +137,94 @@ class TD3Critic(nn.Module):
     Parámetros:
     -----------
     cgm_input_dim : tuple
-        Dimensiones de entrada para datos CGM
+        Dimensiones de entrada para datos CGM.
     other_input_dim : tuple
-        Dimensiones de entrada para otras características
+        Dimensiones de entrada para otras características.
     action_dim : int
-        Dimensión de la acción (dosis de insulina)
+        Dimensión de la acción (dosis de insulina).
     hidden_dim : int
-        Dimensión de las capas ocultas
+        Dimensión de las capas ocultas.
     """
     
     def __init__(self, cgm_input_dim: tuple, other_input_dim: tuple, 
-                action_dim: int = TD3_BC_CONFIG['action_dim'], 
-                hidden_dim: int = TD3_BC_CONFIG['hidden_dim']) -> None:
+                 action_dim: int = TD3_BC_CONFIG.get('action_dim', 1), 
+                 hidden_dim: int = TD3_BC_CONFIG.get('hidden_dim', 256)) -> None:
         super().__init__()
         
-        # Guardar dimensiones de entrada como atributos de instancia
-        self.cgm_input_dim = cgm_input_dim
-        self.other_input_dim = other_input_dim
-        self.action_dim = action_dim
-        self.hidden_dim = hidden_dim
-        
-        # Encoder para datos CGM
-        self.cgm_encoder = nn.Sequential(
-            nn.Linear(np.prod(cgm_input_dim), hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU()
-        )
-        
-        # Encoder para otras características
-        self.other_encoder = nn.Sequential(
-            nn.Linear(np.prod(other_input_dim), hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU()
-        )
-        
-        # Encoder para acciones
-        self.action_encoder = nn.Sequential(
-            nn.Linear(action_dim, hidden_dim // 4),
-            nn.ReLU()
-        )
-        
-        # Capa combinada
-        combined_dim = hidden_dim + hidden_dim // 4
-        self.combined_layer = nn.Sequential(
-            nn.Linear(combined_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
+        self.flat_cgm_dim = np.prod(cgm_input_dim) if cgm_input_dim and np.prod(cgm_input_dim) > 0 else 0
+        self.flat_other_dim = np.prod(other_input_dim) if other_input_dim and np.prod(other_input_dim) > 0 else 0
+        total_input_dim = self.flat_cgm_dim + self.flat_other_dim
+
+        if total_input_dim == 0:
+            print_warning("TD3Critic: total_input_dim es 0. El modelo podría no funcionar correctamente.")
+            # Similar al Actor, manejar el caso de entrada 0.
+            # Usaremos nn.Identity() para las capas si total_input_dim es 0.
+            # La capa de salida será un escalar (valor Q).
+
+        # Q1 architecture
+        self.l1 = nn.Linear(total_input_dim + action_dim, hidden_dim) if total_input_dim > 0 or action_dim > 0 else nn.Identity()
+        self.l2 = nn.Linear(hidden_dim, hidden_dim) if total_input_dim > 0 or action_dim > 0 else nn.Identity()
+        self.l3 = nn.Linear(hidden_dim, 1) if total_input_dim > 0 or action_dim > 0 else nn.Identity()
+
+        # Q2 architecture
+        self.l4 = nn.Linear(total_input_dim + action_dim, hidden_dim) if total_input_dim > 0 or action_dim > 0 else nn.Identity()
+        self.l5 = nn.Linear(hidden_dim, hidden_dim) if total_input_dim > 0 or action_dim > 0 else nn.Identity()
+        self.l6 = nn.Linear(hidden_dim, 1) if total_input_dim > 0 or action_dim > 0 else nn.Identity()
         
     def forward(self, x_cgm: torch.Tensor, x_other: torch.Tensor, 
-           action: torch.Tensor) -> torch.Tensor:
+                action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Paso hacia adelante de la red del crítico.
-        
+        Paso hacia adelante de las redes del crítico.
+
         Parámetros:
         -----------
         x_cgm : torch.Tensor
-            Datos CGM de entrada
+            Tensor de datos CGM.
         x_other : torch.Tensor
-            Otras características de entrada
+            Tensor de otras características.
         action : torch.Tensor
-            Acción (dosis de insulina)
-            
+            Tensor de acciones.
+
         Retorna:
         --------
-        torch.Tensor
-            Valor Q estimado
+        Tuple[torch.Tensor, torch.Tensor]
+            Valores Q estimados por los dos críticos (Q1, Q2).
         """
-        # Aplanar entradas si es necesario
-        if len(x_cgm.shape) > 2:
-            x_cgm = x_cgm.reshape(x_cgm.shape[0], -1)
-        if len(x_other.shape) > 2:
-            x_other = x_other.reshape(x_other.shape[0], -1)
+        inputs = []
+        # Manejar batch vacío para CGM
+        if self.flat_cgm_dim > 0:
+            if x_cgm.shape[0] == 0: # Batch vacío
+                return torch.empty((0, 1), device=x_cgm.device), torch.empty((0, 1), device=x_cgm.device)
+            inputs.append(x_cgm.reshape(x_cgm.shape[0], -1))
         
-        # Verificar y manejar entradas vacías o incorrectas
-        if x_cgm.shape[1] != np.prod(self.cgm_input_dim):
-            print_warning(f"Critic: x_cgm shape mismatch: expected {np.prod(self.cgm_input_dim)}, got {x_cgm.shape[1]}")
-            if x_cgm.shape[1] < np.prod(self.cgm_input_dim):
-                padding = torch.zeros(x_cgm.shape[0], np.prod(self.cgm_input_dim) - x_cgm.shape[1], device=x_cgm.device)
-                x_cgm = torch.cat([x_cgm, padding], dim=1)
-        
-        if x_other.shape[1] != np.prod(self.other_input_dim):
-            print_warning(f"Critic: x_other shape mismatch: expected {np.prod(self.other_input_dim)}, got {x_other.shape[1]}")
-            if x_other.shape[1] < np.prod(self.other_input_dim):
-                padding = torch.zeros(x_other.shape[0], np.prod(self.other_input_dim) - x_other.shape[1], device=x_other.device)
-                x_other = torch.cat([x_other, padding], dim=1)
-        
-        # Codificar cada componente
-        cgm_features = self.cgm_encoder(x_cgm)
-        other_features = self.other_encoder(x_other)
-        action_features = self.action_encoder(action)
-        
-        # Combinar características de estado
-        state_features = torch.cat([cgm_features, other_features], dim=1)
-        
-        # Combinar con características de acción
-        combined = torch.cat([state_features, action_features], dim=1)
-        
-        # Estimar valor Q
-        q_value = self.combined_layer(combined)
-        
-        return q_value
+        # Manejar batch vacío para Other
+        if self.flat_other_dim > 0:
+            if x_other.shape[0] == 0: # Batch vacío
+                 return torch.empty((0, 1), device=x_other.device), torch.empty((0, 1), device=x_other.device)
+            inputs.append(x_other.reshape(x_other.shape[0], -1))
 
+        # Manejar batch vacío para Action
+        if action.shape[0] == 0 and (self.flat_cgm_dim == 0 and self.flat_other_dim == 0) : # Si no hay estado y la acción es vacía
+            return torch.empty((0, 1), device=action.device), torch.empty((0, 1), device=action.device)
+        
+        # Si no hay características de estado pero sí acción (poco probable pero posible)
+        if not inputs and action.shape[0] > 0:
+            sa1 = action.reshape(action.shape[0], -1) # Solo acción
+        elif not inputs and action.shape[0] == 0: # No hay estado ni acción
+            print_warning("TD3Critic.forward: No hay datos de entrada (CGM, Otros, o Acción).")
+            return torch.empty((0, 1)), torch.empty((0, 1)) # device?
+        else: # Hay características de estado
+            state_features = torch.cat(inputs, dim=1)
+            sa1 = torch.cat([state_features, action.reshape(action.shape[0], -1)], 1)
 
+        q1 = F.relu(self.l1(sa1))
+        q1 = F.relu(self.l2(q1))
+        q1 = self.l3(q1)
+
+        q2 = F.relu(self.l4(sa1)) # Reutilizar sa1 ya que las entradas son las mismas
+        q2 = F.relu(self.l5(q2))
+        q2 = self.l6(q2)
+        return q1, q2
 class TD3BCModel(nn.Module):
     """
     Implementación de Twin Delayed DDPG with Behavior Cloning (TD3+BC) para dosificación de insulina.
@@ -266,314 +232,222 @@ class TD3BCModel(nn.Module):
     Parámetros:
     -----------
     cgm_input_dim : tuple
-        Dimensiones de entrada para datos CGM
+        Dimensiones de entrada para datos CGM (ej: (timesteps, num_features_per_timestep)).
+        Estas son las dimensiones *antes* de cualquier aplanamiento que el actor/crítico interno pueda hacer.
     other_input_dim : tuple
-        Dimensiones de entrada para otras características
+        Dimensiones de entrada para otras características (ej: (total_other_features_len,)).
+        Estas son las dimensiones *antes* de cualquier aplanamiento. Incluye características contextuales explícitas.
     config : Dict[str, Any]
-        Configuración del modelo TD3+BC
-    rewards_function : callable
-        Función para calcular recompensas
+        Configuración del modelo TD3+BC.
+    rewards_function : Optional[Callable]
+        Función para calcular recompensas.
     """
     
     def __init__(self,
-                cgm_input_dim: tuple, 
-                other_input_dim: tuple,
-                config: Dict[str, Any] = TD3_BC_CONFIG,
-                rewards_function = None) -> None:
-        """
-        Inicializa el modelo TD3+BC para dosificación de insulina.
-        
-        Parámetros:
-        -----------
-        cgm_input_dim : tuple
-            Dimensiones de entrada para datos CGM
-        other_input_dim : tuple
-            Dimensiones de entrada para otras características
-        config : Dict[str, Any], opcional
-            Configuración del modelo TD3+BC (default: TD3_BC_CONFIG)
-        rewards_function : callable, opcional
-            Función para calcular recompensas (default: None)
-        """
+                 cgm_input_dim: tuple, 
+                 other_input_dim: tuple,
+                 config: Dict[str, Any] = TD3_BC_CONFIG,
+                 rewards_function: Optional[Callable] = None) -> None:
         super().__init__()
         
-        # Guardar dimensiones de entrada
         self.cgm_input_dim = cgm_input_dim
-        self.other_input_dim = other_input_dim
-        
-        # Inicializar semilla aleatoria para reproducibilidad
-        seed = config.get('seed', TD3_BC_CONFIG['seed'])
-        self.seed = seed
-        torch.manual_seed(seed)
-        self.rng = np.random.Generator(np.random.PCG64(seed))
-        
+        self.other_input_dim = other_input_dim # Ya incluye características de contexto explícitas
         self.config = config
-        
-        # Parámetros del algoritmo
-        self.action_dim = config.get('action_dim', TD3_BC_CONFIG['action_dim'])
-        self.hidden_dim = config.get('hidden_dim', TD3_BC_CONFIG['hidden_dim'])
-        self.gamma = config.get('gamma', TD3_BC_CONFIG['gamma'])
-        self.tau = config.get('tau', TD3_BC_CONFIG['tau'])
-        self.policy_noise = config.get('policy_noise', TD3_BC_CONFIG['policy_noise'])
-        self.noise_clip = config.get('noise_clip', TD3_BC_CONFIG['noise_clip'])
-        self.policy_delay = config.get('policy_delay', TD3_BC_CONFIG['policy_delay'])
-        self.alpha = config.get('alpha', TD3_BC_CONFIG['alpha'])  # Factor de peso para la pérdida de BC
-        self.max_action = config.get('max_action', TD3_BC_CONFIG['max_action'])
-        self.min_action = config.get('min_action', TD3_BC_CONFIG['min_action'])
-        self.exploration_noise = config.get('exploration_noise', TD3_BC_CONFIG['exploration_noise'])
-        self.actor_lr = config.get('actor_lr', TD3_BC_CONFIG['actor_lr'])
-        self.critic_lr = config.get('critic_lr', TD3_BC_CONFIG['critic_lr'])
-        self.buffer_size = config.get('buffer_size', TD3_BC_CONFIG['buffer_size'])
-        
-        # Inicializar redes
-        self.actor = TD3Actor(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim, self.max_action)
-        self.actor_target = TD3Actor(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim, self.max_action)
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        
-        # Twin critics (dos críticos para reducir sobreestimación)
-        self.critic1 = TD3Critic(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim)
-        self.critic2 = TD3Critic(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim)
-        
-        self.critic1_target = TD3Critic(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim)
-        self.critic2_target = TD3Critic(cgm_input_dim, other_input_dim, self.action_dim, self.hidden_dim)
-        
-        self.critic1_target.load_state_dict(self.critic1.state_dict())
-        self.critic2_target.load_state_dict(self.critic2.state_dict())
-        
-        # Optimizadores
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.actor_lr, weight_decay=1e-5)
-        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=self.critic_lr, weight_decay=1e-5)
-        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=self.critic_lr, weight_decay=1e-5)
-        
-        # Buffer de experiencia
-        self.buffer = ReplayBuffer(self.buffer_size, cgm_input_dim, other_input_dim, self.action_dim, self.rng)
-        
-        # Función de recompensa
-        self.compute_rewards = rewards_function
-        
-        # Contador para actualización retrasada del actor
-        self.update_counter = 0
-        
-        # Enviar redes al dispositivo correcto (CPU/GPU)
+        self.rewards_function = rewards_function if rewards_function is not None else compute_reward
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Calcular dimensiones aplanadas para referencia, si es necesario para alguna lógica interna.
+        # Los actores/críticos usarán cgm_input_dim y other_input_dim directamente.
+        flat_cgm_dim = np.prod(self.cgm_input_dim) if self.cgm_input_dim and np.prod(self.cgm_input_dim) > 0 else 0
+        # other_input_dim ya es la dimensión aplanada de "otras" características (incluyendo contexto)
+        flat_other_dim = np.prod(self.other_input_dim) if self.other_input_dim and np.prod(self.other_input_dim) > 0 else 0
+        
+        # Esta es la variable que causaba el UnboundLocalError.
+        # Se usa para una verificación, pero no necesariamente como la state_dim unificada para el actor/crítico
+        # si estos manejan las entradas CGM y Otras por separado.
+        total_state_dim_for_check = flat_cgm_dim + flat_other_dim 
+
+        if total_state_dim_for_check == 0: # Esta es la línea de la traza de error
+            print_critical("TD3BCModel: La dimensión total del estado (CGM aplanado + Otras aplanado) es 0. "
+                           "Esto indica que no se proporcionaron características CGM ni Otras. "
+                           "El modelo no podrá aprender. Verifique la configuración de características.")
+            # Considerar levantar un ValueError aquí, ya que un modelo sin entradas no tiene sentido.
+            # raise ValueError("La dimensión total del estado no puede ser cero.")
+
+        self.action_dim = self.config.get('action_dim', 1)
+        self.max_action = self.config.get('max_action', 10.0)
+        self.min_action = self.config.get('min_action', 0.0) # Asegurar que min_action esté en config
+
+        self._initialize_networks() # Llama al método para crear las redes
+        
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.config.get('actor_lr', 3e-4))
+        self.critic_optimizer = optim.Adam(list(self.critic1.parameters()) + list(self.critic2.parameters()), lr=self.config.get('critic_lr', 3e-4))
+
+        self.total_it = 0
         self.to(self.device)
-        
-        # Inicializar con pesos adecuados
-        self._initialize_networks()
-        
-        print_info("TD3+BC Model iniciado correctamente")
-    
+
     def _initialize_networks(self) -> None:
-        """
-        Inicializa las redes con pesos que producen salidas razonables desde el inicio.
-        """
-        # Inicialización especial para la última capa del actor para generar valores no nulos
-        if hasattr(self.actor, 'action_head'):
-            # Initialize action_head to produce non-zero outputs
-            nn.init.uniform_(self.actor.action_head.weight, -0.003, 0.003)
-            nn.init.uniform_(self.actor.action_head.bias, 0.1, 0.3)  # Positive bias to start
-            print_debug("Initialized actor head with special weights")
+        """Inicializa las redes del actor y crítico (y sus objetivos)."""
+        hidden_dim = self.config.get('hidden_dim', 256)
         
-        # Inicialización especial para la última capa del crítico
-        for critic in [self.critic1, self.critic2]:
-            if hasattr(critic, 'combined_layer'):
-                last_layer = critic.combined_layer[-1]
-                if isinstance(last_layer, nn.Linear):
-                    nn.init.uniform_(last_layer.weight, -0.003, 0.003)
-                    nn.init.uniform_(last_layer.bias, -0.1, 0.1)
-                    print_debug("Initialized critic output layer with special weights")
+        # El actor y los críticos reciben cgm_input_dim y other_input_dim (que ya incluye contexto)
+        self.actor = TD3Actor(self.cgm_input_dim, self.other_input_dim, self.action_dim, hidden_dim, self.max_action).to(self.device)
+        self.target_actor = copy.deepcopy(self.actor)
         
-        # Asegurar que los críticos target tengan los mismos pesos
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.critic1_target.load_state_dict(self.critic1.state_dict())
-        self.critic2_target.load_state_dict(self.critic2.state_dict())
-    
+        self.critic1 = TD3Critic(self.cgm_input_dim, self.other_input_dim, self.action_dim, hidden_dim).to(self.device)
+        self.target_critic1 = copy.deepcopy(self.critic1)
+        
+        self.critic2 = TD3Critic(self.cgm_input_dim, self.other_input_dim, self.action_dim, hidden_dim).to(self.device)
+        self.target_critic2 = copy.deepcopy(self.critic2)
+        
+        print_info(f"Redes TD3+BC inicializadas en {self.device}.")
+        print_debug(f"  Actor CGM dim: {self.cgm_input_dim}, Other dim: {self.other_input_dim}, Action dim: {self.action_dim}")
+
     def forward(self, x_cgm: torch.Tensor, x_other: torch.Tensor) -> torch.Tensor:
         """
-        Realiza el paso hacia adelante del modelo.
-        
+        Paso hacia adelante del modelo TD3BC (usado principalmente para inferencia).
+        Retorna la acción determinada por el actor.
+
         Parámetros:
         -----------
         x_cgm : torch.Tensor
-            Datos CGM de entrada
+            Tensor de datos CGM.
         x_other : torch.Tensor
-            Otras características de entrada
-            
+            Tensor de otras características (incluyendo contexto).
+
         Retorna:
         --------
         torch.Tensor
-            Acción predicha (dosis de insulina)
+            Acción predicha.
         """
         return self.actor(x_cgm, x_other)
     
     def select_action(self, x_cgm: torch.Tensor, x_other: torch.Tensor, 
-                  add_noise: bool = True) -> torch.Tensor:
+                      add_noise: bool = True) -> torch.Tensor:
         """
-        Selecciona una acción basada en el estado actual.
-        
+        Selecciona una acción basada en el estado actual, opcionalmente añadiendo ruido.
+        Los tensores de entrada deben estar en el dispositivo correcto.
+
         Parámetros:
         -----------
         x_cgm : torch.Tensor
-            Datos CGM de entrada
+            Tensor de datos CGM (ya en self.device).
         x_other : torch.Tensor
-            Otras características de entrada
+            Tensor de otras características (incluyendo contexto, ya en self.device).
         add_noise : bool, opcional
-            Si agregar ruido de exploración (default: True)
-        
+            Si añadir ruido de exploración (default: True).
+
         Retorna:
         --------
         torch.Tensor
-            Acción seleccionada
+            Acción seleccionada.
         """
-        # Asegurar modo de evaluación
-        self.actor.eval()
-        
-        # Aplanar tensores si es necesario
-        if len(x_cgm.shape) > 2:
-            x_cgm = x_cgm.reshape(x_cgm.shape[0], -1)
-            print_debug(f"Reshaping x_cgm to {x_cgm.shape}")
-        if len(x_other.shape) > 2:
-            x_other = x_other.reshape(x_other.shape[0], -1)
-            print_debug(f"Reshaping x_other to {x_other.shape}")
-        
-        # Obtener acción del actor
+        self.actor.eval() # Modo evaluación para selección de acción
         with torch.no_grad():
             action = self.actor(x_cgm, x_other)
+        self.actor.train() # Volver a modo entrenamiento
+
+        if add_noise:
+            noise_std = self.config.get('exploration_noise', 0.1) * self.max_action
+            noise = (torch.randn_like(action) * noise_std).to(self.device)
+            action = (action + noise).clamp(self.min_action, self.max_action)
+        else:
+            action = action.clamp(self.min_action, self.max_action)
             
-            # Agregar ruido de exploración si está habilitado
-            if add_noise:
-                noise = torch.randn_like(action) * self.exploration_noise
-                action = action + noise
-            
-            # Recortar a los límites de acción
-            action = torch.clamp(action, self.min_action, self.max_action)
-            print_debug(f"TD3+BC action: {action.cpu().numpy()}")
-        
-        # Volver a modo de entrenamiento
-        self.actor.train()
-        
         return action
-    
-    def update(self, batch: Tuple) -> Dict[str, float]:
+
+    def update(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]) -> Dict[str, float]:
         """
-        Actualiza las redes de actor y crítico usando un batch de experiencias.
-        
+        Realiza una actualización de los parámetros del modelo TD3+BC.
+
         Parámetros:
         -----------
-        batch : Tuple
-            Batch de experiencias (states, actions, rewards, next_states, dones)
-            
+        batch : Tuple[torch.Tensor, ...]
+            Un batch de transiciones:
+            (x_cgm, x_other, actions, rewards, next_x_cgm, next_x_other, dones)
+            Todos los tensores deben estar en self.device.
+
         Retorna:
         --------
         Dict[str, float]
-            Diccionario con pérdidas de actor y crítico
+            Diccionario con las pérdidas del actor y crítico.
         """
-        states, actions, rewards, next_states, dones = batch
-        states_cgm, states_other = states
-        next_states_cgm, next_states_other = next_states
+        self.total_it += 1
         
-        # Convertir a tensores
-        states_cgm_t = torch.FloatTensor(states_cgm).to(self.device)
-        states_other_t = torch.FloatTensor(states_other).to(self.device)
-        actions_t = torch.FloatTensor(actions).to(self.device)
-        rewards_t = torch.FloatTensor(rewards).to(self.device)
-        next_states_cgm_t = torch.FloatTensor(next_states_cgm).to(self.device)
-        next_states_other_t = torch.FloatTensor(next_states_other).to(self.device)
-        dones_t = torch.FloatTensor(dones).to(self.device)
-        
-        # Asegurar que los tensores no contengan NaN
-        states_cgm_t = torch.nan_to_num(states_cgm_t)
-        states_other_t = torch.nan_to_num(states_other_t)
-        actions_t = torch.nan_to_num(actions_t)
-        rewards_t = torch.nan_to_num(rewards_t)
-        next_states_cgm_t = torch.nan_to_num(next_states_cgm_t)
-        next_states_other_t = torch.nan_to_num(next_states_other_t)
-        
-        # ===== Actualización de los críticos =====
+        x_cgm, x_other, actions, rewards, next_x_cgm, next_x_other, dones = batch
+
         with torch.no_grad():
-            # Seleccionar acción del siguiente estado con el actor target
-            next_actions = self.actor_target(next_states_cgm_t, next_states_other_t)
+            # Ruido para regularización de la política objetivo
+            policy_noise_std = self.config.get('policy_noise', 0.2) * self.max_action
+            noise_clip_val = self.config.get('noise_clip', 0.5) * self.max_action
             
-            # Agregar ruido con recorte para target policy smoothing
-            noise = torch.randn_like(next_actions) * self.policy_noise
-            noise = torch.clamp(noise, -self.noise_clip, self.noise_clip)
-            next_actions = torch.clamp(next_actions + noise, self.min_action, self.max_action)
+            noise = (torch.randn_like(actions) * policy_noise_std).clamp(-noise_clip_val, noise_clip_val)
             
-            # Calcular el Q mínimo entre los dos críticos target
-            q1_next = self.critic1_target(next_states_cgm_t, next_states_other_t, next_actions)
-            q2_next = self.critic2_target(next_states_cgm_t, next_states_other_t, next_actions)
-            q_next = torch.min(q1_next, q2_next)
+            next_actions_target = (self.target_actor(next_x_cgm, next_x_other) + noise).clamp(self.min_action, self.max_action)
+
+            # Calcular el valor Q objetivo de los dos críticos objetivo
+            q1_target_next, q2_target_next = self.target_critic1(next_x_cgm, next_x_other, next_actions_target), \
+                                             self.target_critic2(next_x_cgm, next_x_other, next_actions_target)
+            q_target_next = torch.min(q1_target_next, q2_target_next)
             
-            # Calcular el objetivo Q usando la fórmula de Bellman
-            q_target = rewards_t + (1 - dones_t) * self.gamma * q_next
+            # TD target
+            y_target = rewards + (self.config['gamma'] * q_target_next * (1.0 - dones.float()))
+
+        # --- Actualización del Crítico ---
+        current_q1, current_q2 = self.critic1(x_cgm, x_other, actions), self.critic2(x_cgm, x_other, actions)
         
-        # Calcular pérdida del primer crítico
-        q1 = self.critic1(states_cgm_t, states_other_t, actions_t)
-        critic1_loss = F.mse_loss(q1, q_target)
+        critic_loss = F.mse_loss(current_q1, y_target) + F.mse_loss(current_q2, y_target)
         
-        # Actualizar primer crítico
-        self.critic1_optimizer.zero_grad()
-        critic1_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 1.0)
-        self.critic1_optimizer.step()
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
         
-        # Calcular pérdida del segundo crítico
-        q2 = self.critic2(states_cgm_t, states_other_t, actions_t)
-        critic2_loss = F.mse_loss(q2, q_target)
-        
-        # Actualizar segundo crítico
-        self.critic2_optimizer.zero_grad()
-        critic2_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 1.0)
-        self.critic2_optimizer.step()
-        
-        # ===== Actualización del actor (retrasada) =====
-        actor_loss = torch.tensor(0.0, device=self.device)
-        
-        # Actualizar el actor solo cada policy_delay pasos
-        if self.update_counter % self.policy_delay == 0:
-            # Acciones generadas por el actor actual
-            pi = self.actor(states_cgm_t, states_other_t)
+        actor_loss_val = torch.tensor(0.0) # Valor por defecto si el actor no se actualiza
+
+        # --- Actualización Retrasada del Actor y Redes Objetivo ---
+        if self.total_it % self.config.get('policy_delay', 2) == 0:
+            # Pérdida del actor
+            actor_actions = self.actor(x_cgm, x_other)
+            q_actor = self.critic1(x_cgm, x_other, actor_actions) # Usar critic1 para la pérdida del actor
             
-            # Componente de RL: maximizar Q-value
-            q_pi = self.critic1(states_cgm_t, states_other_t, pi)
-            lmbda = self.alpha / q_pi.abs().mean().detach()
+            # Pérdida de Behavior Cloning (BC)
+            # lambda_bc = alpha / (promedio de Q_actor) --> alpha es self.config['alpha']
+            # El paper original de TD3+BC usa: alpha / (|mean(Q_values_for_actor_loss)| / N)
+            # donde N es el tamaño del batch.
+            # Simplificado: lambda_bc = alpha / mean(|Q_actor|)
+            lambda_bc = self.config.get('alpha', 2.5) / (q_actor.abs().mean().detach() + 1e-3) # +1e-3 para evitar división por cero
             
-            # TD3+BC: combinar pérdida de RL con pérdida de BC
-            actor_loss = -lmbda * q_pi.mean() + F.mse_loss(pi, actions_t)
+            # La pérdida de BC es MSE entre la acción del actor y la acción del batch
+            bc_loss = F.mse_loss(actor_actions, actions)
             
-            # Actualizar actor
+            actor_loss = -lambda_bc * q_actor.mean() + bc_loss
+            actor_loss_val = actor_loss.item() # Guardar para log
+            
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_optimizer.step()
             
-            # Actualización suave de redes target
+            # Actualización suave de las redes objetivo
             self._update_target_networks()
-        
-        self.update_counter += 1
-        
+            
         return {
-            'actor_loss': actor_loss.item(),
-            'critic1_loss': critic1_loss.item(),
-            'critic2_loss': critic2_loss.item(),
-            'total_loss': critic1_loss.item() + critic2_loss.item() + actor_loss.item()
+            CONST_CRITIC_LOSS: critic_loss.item(),
+            CONST_ACTOR_LOSS: actor_loss_val.item() if isinstance(actor_loss_val, torch.Tensor) else actor_loss_val
         }
-    
+
     def _update_target_networks(self) -> None:
-        """
-        Actualiza las redes target usando actualización suave (soft update).
-        """
-        # Actualizar actor target
-        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        """Actualización suave de los parámetros de las redes objetivo."""
+        tau = self.config.get('tau', 0.005)
+        
+        for target_param, param in zip(self.target_actor.parameters(), self.actor.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
             
-        # Actualizar críticos target
-        for target_param, param in zip(self.critic1_target.parameters(), self.critic1.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            
-        for target_param, param in zip(self.critic2_target.parameters(), self.critic2.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-    
+        for target_param, param in zip(self.target_critic1.parameters(), self.critic1.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
+        for target_param, param in zip(self.target_critic2.parameters(), self.critic2.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
     def _validate_inputs(self, x_cgm: np.ndarray, x_other: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Valida y corrige entradas con valores nulos o NaN.
@@ -670,46 +544,117 @@ class TD3BCModel(nn.Module):
             
         return pred_numpy
 
+    def _prepare_predict_tensors(self, 
+                                 x_cgm: np.ndarray, 
+                                 x_other_base: np.ndarray, # x_other sin contexto explícito
+                                 current_glucose: float,
+                                 carb_intake: float,
+                                 iob: float,
+                                 sleep_quality: Optional[float],
+                                 work_intensity: Optional[float],
+                                 exercise_intensity: Optional[float]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Prepara los tensores de entrada para predict_with_context, asegurando que x_other
+        se construya correctamente con las características de contexto.
+        """
+        # Construir el array de contexto explícito
+        context_values_list = [
+            current_glucose,
+            carb_intake,
+            iob,
+            sleep_quality if sleep_quality is not None else 0.0,
+            work_intensity if work_intensity is not None else 0.0,
+            exercise_intensity if exercise_intensity is not None else 0.0
+        ]
+        # Asegurar que el orden coincida con CONTEXT_FEATURE_ORDER si se usa directamente
+        # Aquí asumimos que other_input_dim ya fue definido para incluir estas características en orden.
+        context_np = np.array(context_values_list, dtype=np.float32)
+
+        # Concatenar x_other_base (características no contextuales) con context_np
+        # Se asume que x_other_base es (num_other_non_context_features,)
+        # y context_np es (num_context_features,)
+        # El other_input_dim para el modelo debe ser (num_other_non_context_features + num_context_features,)
+        
+        # Si x_other_base está vacío, x_other_full es solo context_np
+        if x_other_base.size == 0:
+            x_other_full_np = context_np
+        else:
+            x_other_full_np = np.concatenate((x_other_base, context_np))
+
+        # Validar que la dimensión de x_other_full_np coincida con self.other_input_dim[0]
+        expected_other_dim = np.prod(self.other_input_dim)
+        if x_other_full_np.shape[0] != expected_other_dim:
+            print_critical(f"Dimensión de x_other_full_np ({x_other_full_np.shape[0]}) no coincide con la esperada "
+                           f"por el modelo other_input_dim ({expected_other_dim}). "
+                           f"x_other_base: {x_other_base.shape}, context_np: {context_np.shape}")
+            # Esto podría indicar un desajuste en cómo se define/usa other_input_dim
+            # o cómo se construye x_other_base.
+            # Por ahora, se procederá, pero es probable que falle en el forward del actor/crítico.
+
+        # Añadir dimensión de batch y convertir a tensores
+        x_cgm_tensor = torch.tensor(x_cgm[np.newaxis, ...], dtype=torch.float32).to(self.device)
+        x_other_tensor = torch.tensor(x_other_full_np[np.newaxis, ...], dtype=torch.float32).to(self.device)
+        
+        return x_cgm_tensor, x_other_tensor
+
+    def predict_with_context(self, 
+                             x_cgm: np.ndarray, # Ventana CGM (ej: (timesteps, cgm_features) o (flat_cgm_dim,))
+                             x_other: np.ndarray, # Otras características NO contextuales (ej: (other_non_context_len,))
+                             current_glucose: float,
+                             carb_intake: float,
+                             iob: float,
+                             sleep_quality: Optional[float] = None,
+                             work_intensity: Optional[float] = None,
+                             exercise_intensity: Optional[float] = None,
+                             stress_level: Optional[float] = None, # No usado actualmente en CONTEXT_FEATURE_ORDER
+                             target_glucose: Optional[float] = None, # No usado por TD3 para acción
+                             **kwargs: Any                             
+                             ) -> float:
+        """
+        Realiza una predicción de dosis de insulina basada en el estado actual y contexto.
+        x_cgm y x_other deben ser arrays NumPy.
+        x_other aquí se refiere a las características que NO son parte del contexto explícito
+        pasado como argumentos separados (current_glucose, carb_intake, etc.).
+        """
+        self.actor.eval() # Asegurar modo de evaluación
+
+        # Preparar tensores de entrada. x_other aquí es la parte "base" de otras características.
+        # _prepare_predict_tensors construirá el tensor x_other completo.
+        x_cgm_tensor, x_other_tensor = self._prepare_predict_tensors(
+            x_cgm, x_other, 
+            current_glucose, carb_intake, iob, 
+            sleep_quality, work_intensity, exercise_intensity
+        )
+        
+        with torch.no_grad():
+            action_tensor = self.actor(x_cgm_tensor, x_other_tensor) # No añadir ruido para predicción determinística
+        
+        # Aplicar clamp a la acción predicha
+        action_value = action_tensor.clamp(self.min_action, self.max_action).item()
+        
+        return action_value
+    
     def predict(self, x_cgm: np.ndarray, x_other: np.ndarray) -> np.ndarray:
         """
-        Predice dosis de insulina para los estados dados.
-        
-        Parámetros:
-        -----------
-        x_cgm : np.ndarray
-            Datos CGM para predicción
-        x_other : np.ndarray
-            Otras características para predicción
-            
-        Retorna:
-        --------
-        np.ndarray
-            Dosis de insulina predichas
+        Predicción simplificada. Se recomienda usar `predict_with_context` para predicciones en producción/evaluación.
+        Esta función asume que `x_other` ya contiene todas las características necesarias,
+        incluyendo las contextuales, en el formato correcto.
         """
-        # Validar entradas
-        x_cgm, x_other = self._validate_inputs(x_cgm, x_other)
-        
-        # Preparar tensores
+        self._validate_inputs(x_cgm, x_other) # x_other aquí debe ser el combinado
         x_cgm_tensor, x_other_tensor = self._prepare_tensors(x_cgm, x_other)
         
-        # Depuración
-        print_debug(f"predict x_cgm_tensor shape: {x_cgm_tensor.shape}, x_other_tensor shape: {x_other_tensor.shape}")
-        
-        # Predecir sin ruido
+        # Permutar CGM si es necesario para Conv1d, similar a _prepare_predict_tensors
+        # (Batch, Features, Timesteps)
+        if x_cgm_tensor.ndim == 3 and x_cgm_tensor.shape[1] == self.cgm_input_dim[0] and x_cgm_tensor.shape[2] == self.cgm_input_dim[1]:
+             x_cgm_tensor = x_cgm_tensor.permute(0, 2, 1)
+
+        self.actor.eval()
         with torch.no_grad():
-            action = self.select_action(x_cgm_tensor, x_other_tensor, add_noise=False)
+            predictions_tensor = self.actor(x_cgm_tensor, x_other_tensor)
+        self.actor.train()
         
-        # Convertir a numpy
-        pred_numpy = action.cpu().numpy()
-        
-        # Extraer valor de carbohidratos
-        carbs = float(x_other[0, 0]) if x_other.shape[1] > 0 else 0.0
-        
-        # Aplicar correcciones basadas en carbohidratos
-        pred_numpy = self._apply_carb_corrections(pred_numpy, carbs)
-        
-        print_debug(f"Dosis final TD3+BC: {pred_numpy}, para carbohidratos: {carbs}")
-        return pred_numpy
+        pred_numpy = predictions_tensor.cpu().numpy()
+        return pred_numpy.flatten()
     
     def _extract_current_glucose(self, x_cgm: np.ndarray) -> float:
         """
@@ -861,84 +806,6 @@ class TD3BCModel(nn.Module):
         
         return adjusted_dose
     
-    def predict_with_context(self, x_cgm: np.ndarray, x_other: np.ndarray, 
-                          carb_intake: float,
-                          sleep_quality: float = None,
-                          work_intensity: float = None,
-                          exercise_intensity: float = None,
-                          current_glucose: float = None,
-                          iob: float = None) -> float:
-        """
-        Predice dosis de insulina con información contextual adicional.
-        
-        Parámetros:
-        -----------
-        x_cgm : np.ndarray
-            Datos CGM para predicción
-        x_other : np.ndarray
-            Otras características para predicción
-        carb_intake : float
-            Ingesta de carbohidratos en gramos
-        sleep_quality : float, opcional
-            Calidad del sueño (escala 0-10)
-        work_intensity : float, opcional
-            Intensidad del trabajo (escala 0-10)
-        exercise_intensity : float, opcional
-            Intensidad del ejercicio (escala 0-10)
-        current_glucose : float, opcional
-            Nivel actual de glucosa en mg/dL
-        iob : float, opcional
-            Insulina activa en el cuerpo (Insulin On Board)
-
-        Retorna:
-        --------
-        float
-            Dosis de insulina recomendada
-        """
-        # Añadir un print claro para confirmar que se usa esta implementación
-        print_critical("Using TD3+BC's predict_with_context - Direct from nn.Module")
-        
-        if carb_intake <= 0.0:
-            print_critical("Ingesta de carbohidratos es 0.0, no se recomienda dosis de insulina.")
-            return 0.0
-        
-        print_debug(f"Predicción con contexto: ingesta de carbohidratos: {carb_intake}, glucosa actual: {current_glucose}, IOB: {iob}, sleep_quality: {sleep_quality}, work_intensity: {work_intensity}, exercise_intensity: {exercise_intensity}")
-        
-        # Extraer o utilizar nivel de glucosa proporcionado
-        if current_glucose is None:
-            current_glucose = self._extract_current_glucose(x_cgm)
-
-        # Manejar IOB no proporcionado
-        if iob is None:
-            from training.common import calculate_iob
-            iob = calculate_iob(x_cgm, carb_intake)
-
-        # Valores por defecto para parámetros opcionales
-        sleep_quality = 5.0 if sleep_quality is None else float(sleep_quality)
-        work_intensity = 0.0 if work_intensity is None else float(work_intensity)
-        exercise_intensity = 0.0 if exercise_intensity is None else float(exercise_intensity)
-
-        # Preparar entrada con contexto
-        x_other_with_context = self._prepare_context_inputs(
-            x_other, carb_intake, iob, sleep_quality, 
-            work_intensity, exercise_intensity
-        )
-
-        # Predecir usando la entrada con contexto
-        prediction = self.predict(x_cgm, x_other_with_context)
-        
-        print_debug(f"Predicción inicial: {prediction}, glucosa actual: {current_glucose}, IOB: {iob}, ingesta de carbohidratos: {carb_intake}")
-
-        # Extraer valor de predicción
-        prediction_value = float(prediction.item() if hasattr(prediction, 'item') else prediction[0])
-        
-        # Aplicar ajustes
-        prediction_value = self._adjust_for_glucose_level(prediction_value, current_glucose)
-        prediction_value = self._adjust_for_carbs_and_iob(prediction_value, carb_intake, iob)
-
-        # Asegurar límites seguros
-        return max(0.0, min(prediction_value, self.max_action))
-    
     def to(self, device: torch.device) -> 'TD3BCModel':
         """
         Mueve el modelo al dispositivo especificado.
@@ -961,37 +828,209 @@ class TD3BCModel(nn.Module):
         self.critic1_target = self.critic1_target.to(device)
         self.critic2_target = self.critic2_target.to(device)
         return self
+    
+    def _update_target_networks(self) -> None:
+        """
+        Realiza una actualización suave (soft update) de las redes objetivo.
+        """
+        # Actualización suave del actor
+        for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        # Actualización suave del crítico 1
+        for param, target_param in zip(self.critic1.parameters(), self.critic1_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        # Actualización suave del crítico 2
+        for param, target_param in zip(self.critic2.parameters(), self.critic2_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+    def run_training_step(self, replay_buffer: ReplayBuffer, batch_size: int) -> Dict[str, float]:
+        """
+        Ejecuta un paso de entrenamiento para el modelo TD3+BC.
+
+        Parámetros:
+        -----------
+        replay_buffer : ReplayBuffer
+            Buffer de repetición del cual muestrear transiciones.
+        batch_size : int
+            Tamaño del minibatch a muestrear.
+
+        Retorna:
+        --------
+        Dict[str, float]
+            Diccionario con las pérdidas del actor y los críticos.
+        """
+        if len(replay_buffer) < batch_size:
+            # No hay suficientes muestras en el buffer para formar un batch completo
+            return {CONST_ACTOR_LOSS: 0.0, "critic1_loss": 0.0, "critic2_loss": 0.0}
+
+        state_np, action_np, next_state_np, reward_np, not_done_np = replay_buffer.sample(batch_size)
+
+        # ---- INICIO: Validación de datos del batch ----
+        if np.isnan(state_np).any() or np.isinf(state_np).any():
+            print_critical("NaN/Inf detectado en 'state_np' del batch de replay_buffer")
+            return {CONST_ACTOR_LOSS: float('nan'), "critic1_loss": float('nan'), "critic2_loss": float('nan')}
+        if np.isnan(action_np).any() or np.isinf(action_np).any():
+            print_critical("NaN/Inf detectado en 'action_np' del batch de replay_buffer")
+            return {CONST_ACTOR_LOSS: float('nan'), "critic1_loss": float('nan'), "critic2_loss": float('nan')}
+        if np.isnan(next_state_np).any() or np.isinf(next_state_np).any():
+            print_critical("NaN/Inf detectado en 'next_state_np' del batch de replay_buffer")
+            return {CONST_ACTOR_LOSS: float('nan'), "critic1_loss": float('nan'), "critic2_loss": float('nan')}
+        if np.isnan(reward_np).any() or np.isinf(reward_np).any():
+            print_critical("NaN/Inf detectado en 'reward_np' del batch de replay_buffer")
+            return {CONST_ACTOR_LOSS: float('nan'), "critic1_loss": float('nan'), "critic2_loss": float('nan')}
+        # ---- FIN: Validación de datos del batch ----
+
+        state = torch.FloatTensor(state_np).to(self.device)
+        action = torch.FloatTensor(action_np).to(self.device) # Shape: (batch_size, action_dim)
+        next_state = torch.FloatTensor(next_state_np).to(self.device)
+        reward = torch.FloatTensor(reward_np).unsqueeze(1).to(self.device) # Shape: (batch_size, 1)
+        not_done = torch.FloatTensor(not_done_np).unsqueeze(1).to(self.device) # Shape: (batch_size, 1)
+        
+        # Descomponer el estado en datos CGM y otros datos
+        # flat_cgm_dim = int(np.prod(self.cgm_input_dim)) if self.cgm_input_dim and np.prod(self.cgm_input_dim) > 0 else 0
+        # flat_other_dim = int(np.prod(self.other_input_dim)) if self.other_input_dim and np.prod(self.other_input_dim) > 0 else 0
+        # total_flat_dim = flat_cgm_dim + flat_other_dim
+        # if state.shape[1] != total_flat_dim:
+        #     print_critical(f"La dimensión del estado en el batch ({state.shape[1]}) no coincide con la esperada ({total_flat_dim})")
+        #     return {CONST_ACTOR_LOSS: float('nan'), "critic1_loss": float('nan'), "critic2_loss": float('nan')}
+
+        # Usar las dimensiones de entrada del modelo para la división
+        # Asegurarse que cgm_input_dim y other_input_dim son tuplas (ej. (timesteps, features) o (features,))
+        flat_cgm_dim = int(np.prod(self.cgm_input_dim))
+
+        cgm_data = state[:, :flat_cgm_dim].reshape(batch_size, *self.cgm_input_dim) if flat_cgm_dim > 0 else torch.empty(batch_size, 0).to(self.device)
+        other_data = state[:, flat_cgm_dim:] if state.shape[1] > flat_cgm_dim else torch.empty(batch_size, 0).to(self.device)
+
+        next_cgm_data = next_state[:, :flat_cgm_dim].reshape(batch_size, *self.cgm_input_dim) if flat_cgm_dim > 0 else torch.empty(batch_size, 0).to(self.device)
+        next_other_data = next_state[:, flat_cgm_dim:] if next_state.shape[1] > flat_cgm_dim else torch.empty(batch_size, 0).to(self.device)
+        
+        gamma = self.config.get('gamma', 0.99)
+
+        # --- Actualización de los Críticos ---
+        with torch.no_grad():
+            # Seleccionar acción según la política objetivo (actor_target) y añadir ruido
+            noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+            
+            next_action = (self.actor_target(next_cgm_data, next_other_data) + noise).clamp(self.min_action, self.max_action)
+
+            # Calcular el valor Q objetivo
+            target_Q1 = self.critic1_target(next_cgm_data, next_other_data, next_action)
+            target_Q2 = self.critic2_target(next_cgm_data, next_other_data, next_action)
+            target_Q = torch.min(target_Q1, target_Q2)
+            target_Q = reward + not_done * gamma * target_Q
+
+        # Obtener valores Q actuales
+        current_Q1 = self.critic1(cgm_data, other_data, action)
+        current_Q2 = self.critic2(cgm_data, other_data, action)
+
+        # Calcular pérdida de los críticos
+        critic1_loss = F.mse_loss(current_Q1, target_Q)
+        critic2_loss = F.mse_loss(current_Q2, target_Q)
+        
+        # Optimizar crítico 1
+        self.critic1_optimizer.zero_grad()
+        critic1_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), max_norm=1.0) # Opcional: gradient clipping
+        self.critic1_optimizer.step()
+
+        # Optimizar crítico 2
+        self.critic2_optimizer.zero_grad()
+        critic2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), max_norm=1.0) # Opcional: gradient clipping
+        self.critic2_optimizer.step()
+        
+        actor_loss_val = torch.tensor(0.0) # Inicializar en caso de que no se actualice el actor
+
+        # Actualización Retrasada de la Política (Actor) y Redes Objetivo
+        self.total_it += 1
+        if self.total_it % self.policy_delay == 0:
+            # Calcular pérdida del actor
+            pi_actions = self.actor(cgm_data, other_data)
+            
+            # Componente RL de la pérdida del actor
+            q_pi_for_rl = self.critic1(cgm_data, other_data, pi_actions)
+            actor_loss_rl = -q_pi_for_rl.mean()
+            
+            # Componente de Behavior Cloning (BC)
+            # Usar q_pi_for_rl (Q(s, pi(s))) para la normalización de BC, como es común
+            lambda_bc_norm_factor = q_pi_for_rl.abs().mean().detach()
+            # Asegurar que el factor de normalización no sea demasiado pequeño
+            lambda_bc_norm_factor = torch.clamp(lambda_bc_norm_factor, min=CONST_EPSILON) 
+            
+            actor_loss_bc = F.mse_loss(pi_actions, action) / lambda_bc_norm_factor # Ya se sumó CONST_EPSILON o se clampeó
+            
+            actor_loss = actor_loss_rl + self.alpha_bc * actor_loss_bc
+            actor_loss_val = actor_loss.item()
+
+            # Optimizar actor
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0) # Opcional: gradient clipping
+            self.actor_optimizer.step()
+
+            # Actualizar redes objetivo
+            self._update_target_networks()
+
+        return {
+            CONST_ACTOR_LOSS: actor_loss_val if isinstance(actor_loss_val, float) else actor_loss_val.item(),
+            "critic1_loss": critic1_loss.item(),
+            "critic2_loss": critic2_loss.item(),
+        }
 
 
-def create_td3_bc_model(cgm_input_dim: tuple, other_input_dim: tuple) -> DRLModelWrapperPyTorch:
+
+def create_td3_bc_model(
+    feature_config: Optional[Dict[str, List[str]]] = None
+) -> DRLModelWrapperPyTorch:
     """
     Crea un modelo TD3+BC para dosificación de insulina.
     
     Parámetros:
     -----------
-    cgm_input_dim : tuple
-        Dimensiones de entrada para datos CGM
-    other_input_dim : tuple
-        Dimensiones de entrada para otras características
+    feature_config : Optional[Dict[str, List[str]]], opcional
+        Configuración de características para determinar las dimensiones de entrada del modelo
+        y para uso del wrapper. Si es None, se usará get_feature_groups().
         
     Retorna:
     --------
     DRLModelWrapperPyTorch
         Modelo TD3+BC inicializado envuelto en DRLModelWrapperPyTorch
     """
-    from training.utils import compute_reward
+    effective_feature_config = feature_config
     
-    model = TD3BCModel(
-        cgm_input_dim=cgm_input_dim,
-        other_input_dim=other_input_dim,
+    cgm_feature_names = effective_feature_config.get('cgm_features', [])
+    # 'other_features' de get_feature_groups excluye explícitamente CONTEXT_FEATURE_ORDER
+    other_non_context_feature_names = effective_feature_config.get('other_features', [])
+    context_feature_names = effective_feature_config.get('explicit_context_features', CONTEXT_FEATURE_ORDER)
+
+    # Dimensiones para el modelo TD3BCModel
+    cgm_dim_for_model = (len(cgm_feature_names), 1) if cgm_feature_names else (0, 0)
+    
+    # 'other_input_dim' para TD3BCModel debe incluir tanto 'other_non_context_feature_names' como 'context_feature_names'
+    total_other_features_len_for_model = len(other_non_context_feature_names) + len(context_feature_names)
+    other_dim_for_model = (total_other_features_len_for_model,) if total_other_features_len_for_model > 0 else (0,)
+
+    # Instanciar el modelo TD3BCModel con las dimensiones derivadas
+    # Asegurarse que TD3BCModel internamente use estas dimensiones para sus actor/critic
+    model_instance = TD3BCModel(
+        cgm_input_dim=cgm_dim_for_model,
+        other_input_dim=other_dim_for_model, # Esta es la dimensión combinada de otras y de contexto
         config=TD3_BC_CONFIG,
         rewards_function=compute_reward
     )
     
-    print_critical(f"Tipo de modelo creado: {type(model)}")
+    print_info(f"TD3BCModel instanciado con cgm_input_dim={cgm_dim_for_model}, other_input_dim={other_dim_for_model}")
     
-    wrapper = DRLModelWrapperPyTorch(model, algorithm="TD3+BC")
-    print_critical(f"Tipo de wrapper: {type(wrapper)}")
-    print_critical(f"Tipo de modelo en wrapper: {type(wrapper.model)}")
-    
+    # Pasar la instancia del modelo y feature_config al wrapper
+    # feature_config es usado por el wrapper para construir el estado completo, tamaño del buffer, etc.
+    # El wrapper usará sus propias self.cgm_cols, self.other_cols, self.context_cols para construir el estado aplanado.
+    # La consistencia se mantiene porque TD3BCModel ahora espera other_input_dim que coincida con la suma de
+    # las longitudes de self.other_cols y self.context_cols del wrapper.
+    wrapper = DRLModelWrapperPyTorch(
+        model_instance,
+        algorithm="TD3+BC",
+        feature_config=effective_feature_config # El wrapper usará esto para definir su state_dim
+    )
     return wrapper

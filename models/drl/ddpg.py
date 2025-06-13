@@ -1,24 +1,18 @@
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+import numpy as np
 import copy
 from typing import Tuple, Dict, Any, Optional, List, Union
-
 from custom.DeepReinforcementLearning.drl_pt import DRLModelWrapperPyTorch
+from custom.printer import print_critical, print_warning
 from models.utils.replay_buffer import ReplayBuffer
-from config.models_config import DDPG_CONFIG, BUFFER_CONFIG
-from constants.constants import (
-    IDEAL_LOWER_BOUND, IDEAL_UPPER_BOUND, CONST_DEFAULT_SEED,
-    CONST_ACTOR_LOSS, CONST_CRITIC_LOSS, CONTEXT_FEATURE_ORDER
-)
-from custom.printer import print_info, print_warning
+from config.models_config import DDPG_CONFIG
+from constants.constants import CONST_ACTOR_LOSS, CONST_CRITIC_LOSS, CONTEXT_FEATURE_ORDER
 
-
+# Actor y Critic
 class Actor(nn.Module):
-    """
-    Red Actor para DDPG. Mapea estados a acciones.
-    """
     def __init__(self, state_dim: int, action_dim: int, max_action: float, hidden_dim: int = 256):
         super(Actor, self).__init__()
         self.layer_1 = nn.Linear(state_dim, hidden_dim)
@@ -27,377 +21,333 @@ class Actor(nn.Module):
         self.max_action = max_action
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        """
-        Pase hacia adelante para el Actor.
-
-        Parámetros:
-        -----------
-        state : torch.Tensor
-            Tensor de estado de entrada.
-
-        Retorna:
-        --------
-        torch.Tensor
-            Tensor de acción, escalado por max_action.
-        """
-        x = torch.relu(self.layer_1(state))
-        x = torch.relu(self.layer_2(x))
-        # Salida tanh para acotar entre -1 y 1, luego escalar por max_action
-        return self.max_action * torch.tanh(self.layer_3(x))
+        x = F.relu(self.layer_1(state))
+        x = F.relu(self.layer_2(x))
+        action = torch.tanh(self.layer_3(x)) * self.max_action
+        return action
 
 class Critic(nn.Module):
-    """
-    Red Crítico para DDPG. Mapea pares (estado, acción) a valores Q.
-    """
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
         super(Critic, self).__init__()
-        # Q1 architecture
         self.layer_1 = nn.Linear(state_dim + action_dim, hidden_dim)
         self.layer_2 = nn.Linear(hidden_dim, hidden_dim)
         self.layer_3 = nn.Linear(hidden_dim, 1)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """
-        Pase hacia adelante para el Crítico.
-
-        Parámetros:
-        -----------
-        state : torch.Tensor
-            Tensor de estado de entrada.
-        action : torch.Tensor
-            Tensor de acción de entrada.
-
-        Retorna:
-        --------
-        torch.Tensor
-            Valor Q estimado.
-        """
         sa = torch.cat([state, action], 1)
-        q1 = torch.relu(self.layer_1(sa))
-        q1 = torch.relu(self.layer_2(q1))
-        q1 = self.layer_3(q1)
-        return q1
+        q_value = F.relu(self.layer_1(sa))
+        q_value = F.relu(self.layer_2(q_value))
+        q_value = self.layer_3(q_value)
+        return q_value
 
 class DDPG(nn.Module):
-    """
-    Implementación del algoritmo Deep Deterministic Policy Gradient (DDPG).
-    """
     def __init__(self,
-                 cgm_input_dim: Tuple[int, int],      # (timesteps, cgm_features)
-                 other_input_dim: Tuple[int],       # (other_features_len,)
-                 context_dim: int,                  # num_context_features
-                 action_dim: int,
-                 max_action: float,
-                 min_action: float = 0.0,
+                 state_dim: int,
+                 action_dim: int = DDPG_CONFIG.get("action_dim",1),
+                 max_action: float = DDPG_CONFIG.get("max_action", 20.0),
+                 min_action: float = DDPG_CONFIG.get("min_action",0.0),
                  config: Optional[Dict[str, Any]] = None):
         super(DDPG, self).__init__()
-
-        self.cgm_input_dim = cgm_input_dim
-        self.other_input_dim = other_input_dim
-        self.context_dim = context_dim
         
-        # Calcular la dimensión total del estado
-        # Estado = CGM aplanado + otras características + características de contexto
-        self.state_dim = (cgm_input_dim[0] * cgm_input_dim[1]) + \
-                         other_input_dim[0] + \
-                         context_dim
-
+        self.state_dim = state_dim
         self.action_dim = action_dim
         self.max_action = max_action
         self.min_action = min_action
 
-        self.config = config if config else DDPG_CONFIG
-        self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.config = config if config else DDPG_CONFIG.copy()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         hidden_dim = self.config.get("hidden_dim", 256)
         self.actor = Actor(self.state_dim, action_dim, max_action, hidden_dim).to(self.device)
-        self.actor_target = copy.deepcopy(self.actor)
+        self.target_actor = copy.deepcopy(self.actor)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.config.get("actor_lr", 1e-4), weight_decay=self.config.get("weight_decay", 1e-5))
 
         self.critic = Critic(self.state_dim, action_dim, hidden_dim).to(self.device)
-        self.critic_target = copy.deepcopy(self.critic)
+        self.target_critic = copy.deepcopy(self.critic)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.config.get("critic_lr", 1e-3), weight_decay=self.config.get("weight_decay", 1e-5))
         
-        self.default_target_glucose = (IDEAL_LOWER_BOUND + IDEAL_UPPER_BOUND) / 2.0
-        self.exploration_noise = self.config.get("exploration_noise", 0.1)
-        
-        # Semilla para reproducibilidad del ruido de exploración
-        seed = self.config.get('seed', CONST_DEFAULT_SEED)
-        self.rng = np.random.default_rng(seed)
+        self.total_it = 0
 
-
-    def _build_state_representation(self,
-                                   x_cgm_sample: np.ndarray,      # (timesteps, cgm_features)
-                                   x_other_sample: np.ndarray,    # (other_features_len,)
-                                   context_dict: Dict[str, float] # Dict de escalares de contexto
-                                   ) -> torch.Tensor:
+    def _build_state_tensor_from_components(self,
+                                x_cgm_sample_np: np.ndarray,      # (batch, timesteps, cgm_features) o (batch, flat_cgm_dim)
+                                x_other_sample_np: np.ndarray,    # (batch, other_features_len)
+                                context_values_np: np.ndarray     # (batch, context_dim)
+                                ) -> torch.Tensor:
         """
-        Construye el tensor de estado completo a partir de las entradas.
-
-        Parámetros:
-        -----------
-        x_cgm_sample : np.ndarray
-            Muestra de datos CGM (ventana).
-        x_other_sample : np.ndarray
-            Muestra de otras características.
-        context_dict : Dict[str, float]
-            Diccionario con valores de contexto.
-
-        Retorna:
-        --------
-        torch.Tensor
-            Tensor de estado concatenado y aplanado.
+        Construye el tensor de estado aplanado a partir de componentes NumPy y lo pasa al dispositivo.
         """
-        # Asegurar que las entradas sean NumPy arrays
-        if not isinstance(x_cgm_sample, np.ndarray):
-            print_warning(f"_build_state_representation: x_cgm_sample no es ndarray ({type(x_cgm_sample)}). Intentando convertir.")
-            x_cgm_sample = np.array(x_cgm_sample)
-        if not isinstance(x_other_sample, np.ndarray):
-            print_warning(f"_build_state_representation: x_other_sample no es ndarray ({type(x_other_sample)}). Intentando convertir.")
-            x_other_sample = np.array(x_other_sample)
+        # NaN/Inf checks for input numpy arrays
+        if np.isnan(x_cgm_sample_np).any() or np.isinf(x_cgm_sample_np).any():
+            print_critical("NaN/Inf detectado en 'x_cgm_sample_np' en _build_state_tensor_from_components")
+        if np.isnan(x_other_sample_np).any() or np.isinf(x_other_sample_np).any():
+            print_critical("NaN/Inf detectado en 'x_other_sample_np' en _build_state_tensor_from_components")
+        if np.isnan(context_values_np).any() or np.isinf(context_values_np).any():
+            print_critical("NaN/Inf detectado en 'context_values_np' en _build_state_tensor_from_components")
 
-        cgm_flat = torch.tensor(x_cgm_sample.flatten(), dtype=torch.float32, device=self.device)
-        other_tensor = torch.tensor(x_other_sample, dtype=torch.float32, device=self.device)
+        x_cgm_flat = x_cgm_sample_np.reshape(x_cgm_sample_np.shape[0], -1)
+        x_other_flat = x_other_sample_np.reshape(x_other_sample_np.shape[0], -1)
         
-        context_values = [context_dict.get(k, 0.0) for k in CONTEXT_FEATURE_ORDER]
-        context_tensor = torch.tensor(context_values, dtype=torch.float32, device=self.device)
-        
-        # Asegurarse que todos los tensores sean 1D antes de concatenar
-        if cgm_flat.ndim == 0: cgm_flat = cgm_flat.unsqueeze(0)
-        if other_tensor.ndim == 0: other_tensor = other_tensor.unsqueeze(0)
-        if context_tensor.ndim == 0: context_tensor = context_tensor.unsqueeze(0)
+        components = []
+        if x_cgm_flat.size > 0:
+            components.append(x_cgm_flat)
+        if x_other_flat.size > 0:
+            components.append(x_other_flat)
+        if context_values_np.size > 0:
+            components.append(context_values_np)
 
-        full_state = torch.cat([cgm_flat, other_tensor, context_tensor], dim=0)
-        return full_state.unsqueeze(0) # Añadir dimensión de batch
+        if not components:
+            print_warning("Todos los componentes del estado están vacíos en _build_state_tensor_from_components.")
+            # Devolver un tensor vacío con la forma correcta si es posible, o manejar el error
+            # Por ahora, esto probablemente llevará a un error más adelante si el estado es fundamental.
+            # Considerar devolver un tensor de ceros de la dimensión esperada si es un caso válido.
+            # return torch.empty(x_cgm_sample_np.shape[0], 0, dtype=torch.float32).to(self.device)
+            # O, si el estado no puede estar vacío:
+            raise ValueError("No se pueden construir estados a partir de componentes vacíos.")
+
+
+        full_state_np = np.concatenate(components, axis=1)
+        if np.isnan(full_state_np).any() or np.isinf(full_state_np).any():
+            print_critical("NaN/Inf detectado en 'full_state_np' después de la concatenación en _build_state_tensor_from_components")
+        return torch.tensor(full_state_np, dtype=torch.float32).to(self.device)
 
     def select_action(self,
-                      state_tuple: Tuple[np.ndarray, np.ndarray], # (x_cgm_sample, x_other_sample)
-                      context_dict: Dict[str, float],
-                      add_noise: bool = True) -> np.ndarray:
-        """
-        Selecciona una acción usando el actor, con ruido opcional para exploración.
+                      x_cgm_np: np.ndarray,      # (1, timesteps, cgm_features) o (1, flat_cgm_dim)
+                      x_other_np: np.ndarray,    # (1, other_features_len)
+                      context_dict: Dict[str, float], # Diccionario con valores de contexto
+                      add_noise: bool = True) -> torch.Tensor:
+        # Convertir context_dict a un array NumPy en el orden correcto
+        context_values_list = [context_dict.get(col, 0.0) for col in CONTEXT_FEATURE_ORDER]
+        context_np = np.array(context_values_list, dtype=np.float32).reshape(1, -1)
 
-        Parámetros:
-        -----------
-        state_tuple : Tuple[np.ndarray, np.ndarray]
-            Tupla con (muestra CGM, muestra otras características).
-        context_dict : Dict[str, float]
-            Diccionario con valores de contexto.
-        add_noise : bool, opcional
-            Si se debe añadir ruido Gaussiano para exploración (default: True).
-
-        Retorna:
-        --------
-        np.ndarray
-            Acción seleccionada (dosis de insulina).
-        """
-        x_cgm_sample, x_other_sample = state_tuple
-        state_tensor = self._build_state_representation(x_cgm_sample, x_other_sample, context_dict)
+        state_tensor = self._build_state_tensor_from_components(x_cgm_np, x_other_np, context_np)
         
-        self.actor.eval() # Modo evaluación para selección de acción determinística
+        if torch.isnan(state_tensor).any() or torch.isinf(state_tensor).any():
+            print_critical(f"NaN/Inf detectado en 'state_tensor' en select_action: {state_tensor}")
+            # Devolver una acción por defecto o manejar el error
+            return torch.zeros(self.action_dim, device=self.device)
+
+
+        self.actor.eval() # Modo evaluación para selección de acción
         with torch.no_grad():
-            action = self.actor(state_tensor).cpu().data.numpy().flatten()
+            action = self.actor(state_tensor)
         self.actor.train() # Volver a modo entrenamiento
 
+        if torch.isnan(action).any() or torch.isinf(action).any():
+            print_critical(f"NaN/Inf detectado en 'action' (salida del actor) en select_action: {action}")
+            action = torch.zeros_like(action) # Fallback
+
         if add_noise:
-            noise = self.rng.normal(0, self.max_action * self.exploration_noise, size=self.action_dim)
-            action = action + noise
-            
-        return np.clip(action, self.min_action, self.max_action)
+            noise = torch.randn_like(action) * self.config.get("exploration_noise", 0.1)
+            action = (action + noise).clamp(self.min_action, self.max_action)
+        
+        if torch.isnan(action).any() or torch.isinf(action).any():
+            print_critical(f"NaN/Inf detectado en 'action' (después de ruido/clamp) en select_action: {action}")
+            # Fallback a una acción segura si es NaN
+            action = torch.full_like(action, self.min_action)
 
-    def run_training_step(self, replay_buffer: ReplayBuffer, batch_size: int) -> Dict[str, float]:
-        """
-        Realiza un paso de actualización de DDPG.
 
-        Parámetros:
-        -----------
-        replay_buffer : ReplayBuffer
-            Buffer de repetición de donde muestrear transiciones.
-        batch_size : int
-            Tamaño del lote para el muestreo.
+        return action
 
-        Retorna:
-        --------
-        Dict[str, float]
-            Diccionario con las pérdidas del actor y el crítico.
-        """
-        if len(replay_buffer) < batch_size:
-            return {CONST_ACTOR_LOSS: 0.0, CONST_CRITIC_LOSS: 0.0} # No hay suficientes muestras
+    def update(self, batch_data: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]) -> Dict[str, float]:
+        self.total_it +=1
+        states, actions, rewards, next_states, dones = batch_data
 
-        # Muestrear transiciones del buffer
-        # Se asume que el buffer almacena (full_state, action, reward, full_next_state, done)
-        # donde full_state y full_next_state ya son tensores preprocesados.
-        state, action, reward, next_state, done = replay_buffer.sample(batch_size)
+        # Chequeo de NaNs en datos de entrada del batch
+        if torch.isnan(states).any() or torch.isinf(states).any():
+            print_critical("NaN/Inf detectado en 'states' en DDPG.update")
+            return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
+        if torch.isnan(actions).any() or torch.isinf(actions).any():
+            print_critical("NaN/Inf detectado en 'actions' en DDPG.update")
+            return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
+        if torch.isnan(rewards).any() or torch.isinf(rewards).any():
+            print_critical("NaN/Inf detectado en 'rewards' en DDPG.update")
+            return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
+        if torch.isnan(next_states).any() or torch.isinf(next_states).any():
+            print_critical("NaN/Inf detectado en 'next_states' en DDPG.update")
+            return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
+        if torch.isnan(dones).any() or torch.isinf(dones).any(): # dones es bool, pero se convierte a float en y_target
+            print_critical("NaN/Inf detectado en 'dones' tensor en DDPG.update") # menos probable
+            return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
 
-        # Convertir a tensores PyTorch
-        state = torch.FloatTensor(state).to(self.device)
-        action = torch.FloatTensor(action).to(self.device)
-        reward = torch.FloatTensor(reward).reshape(-1, 1).to(self.device)
-        next_state = torch.FloatTensor(next_state).to(self.device)
-        done = torch.FloatTensor(done).reshape(-1, 1).to(self.device)
-
-        # Calcular Q objetivo
+        # --- Actualización del Crítico ---
         with torch.no_grad():
-            target_actions = self.actor_target(next_state)
-            target_q = self.critic_target(next_state, target_actions)
-            target_q = reward + (1 - done) * self.config.get("gamma", 0.99) * target_q
-        
-        # Actualizar Crítico
-        current_q = self.critic(state, action)
-        critic_loss = nn.functional.mse_loss(current_q, target_q)
-        
+            next_actions_target = self.target_actor(next_states)
+            if torch.isnan(next_actions_target).any() or torch.isinf(next_actions_target).any():
+                print_critical("NaN/Inf detectado en 'next_actions_target' (target_actor output)")
+                return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
+
+            q_next_target = self.target_critic(next_states, next_actions_target)
+            if torch.isnan(q_next_target).any() or torch.isinf(q_next_target).any():
+                print_critical("NaN/Inf detectado en 'q_next_target' (target_critic output)")
+                return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
+            
+            y_target = rewards + (self.config['gamma'] * q_next_target * (1.0 - dones.float())) # Asegurar que dones sea float
+            if torch.isnan(y_target).any() or torch.isinf(y_target).any():
+                print_critical(f"NaN/Inf detectado en 'y_target'. rewards: {rewards.mean()}, q_next_target: {q_next_target.mean()}, dones: {dones.float().mean()}")
+                return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
+
+        current_q_values = self.critic(states, actions)
+        if torch.isnan(current_q_values).any() or torch.isinf(current_q_values).any():
+            print_critical("NaN/Inf detectado en 'current_q_values' (critic output)")
+            return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
+
+        critic_loss = F.mse_loss(current_q_values, y_target)
+        if torch.isnan(critic_loss).any() or torch.isinf(critic_loss).any():
+            print_critical(f"Critic loss es NaN/Inf. current_Q: {current_q_values.mean()}, y_target: {y_target.mean()}")
+            # Adicionalmente, imprimir algunas muestras de current_q_values y y_target
+            print_critical(f"Sample current_Q: {current_q_values[:5]}")
+            print_critical(f"Sample y_target: {y_target[:5]}")
+            return {CONST_CRITIC_LOSS: float('nan'), CONST_ACTOR_LOSS: float('nan')}
+
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()
 
-        # Actualizar Actor
-        actor_loss = -self.critic(state, self.actor(state)).mean()
+        # --- Actualización del Actor ---
+        # DDPG actualiza el actor con menos frecuencia o igual que el crítico.
+        # Para simplificar y alinear con el algoritmo base, actualizamos en cada paso.
+        # Si se requiere una actualización retrasada como en TD3, se necesitaría un contador `total_it` y `policy_delay`.
         
+        actor_actions = self.actor(states)
+        if torch.isnan(actor_actions).any() or torch.isinf(actor_actions).any():
+            print_critical("NaN/Inf detectado en 'actor_actions' (actor output for loss)")
+            return {CONST_CRITIC_LOSS: critic_loss.item(), CONST_ACTOR_LOSS: float('nan')}
+
+        q_values_for_actor_loss = self.critic(states, actor_actions)
+        if torch.isnan(q_values_for_actor_loss).any() or torch.isinf(q_values_for_actor_loss).any():
+            print_critical("NaN/Inf detectado en 'q_values_for_actor_loss' (critic output for actor loss)")
+            return {CONST_CRITIC_LOSS: critic_loss.item(), CONST_ACTOR_LOSS: float('nan')}
+            
+        actor_loss = -q_values_for_actor_loss.mean()
+        if torch.isnan(actor_loss).any() or torch.isinf(actor_loss).any():
+            print_critical(f"Actor loss es NaN/Inf. q_values_for_actor_loss: {q_values_for_actor_loss.mean()}")
+            return {CONST_CRITIC_LOSS: critic_loss.item(), CONST_ACTOR_LOSS: float('nan')}
+
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_optimizer.step()
 
-        # Actualizar redes objetivo (soft update)
-        tau = self.config.get("tau", 0.001)
-        self._soft_update(self.critic_target, self.critic, tau)
-        self._soft_update(self.actor_target, self.actor, tau)
+        # --- Actualización suave de las redes objetivo ---
+        self._soft_update(self.target_critic, self.critic, self.config['tau'])
+        self._soft_update(self.target_actor, self.actor, self.config['tau'])
 
         return {
-            CONST_ACTOR_LOSS: actor_loss.item(),
-            CONST_CRITIC_LOSS: critic_loss.item()
+            CONST_CRITIC_LOSS: critic_loss.item(),
+            CONST_ACTOR_LOSS: actor_loss.item()
         }
 
     def predict_with_context(self, x_cgm: np.ndarray, x_other: np.ndarray,
                              current_glucose: float, carb_intake: float, iob: float,
-                             exercise_intensity: Optional[float] = None, stress_level: Optional[float] = None,
-                             work_intensity: Optional[float] = None, sleep_quality: Optional[float] = None,
-                             target_glucose: Optional[float] = None # No usado directamente por DDPG, pero parte de la interfaz
+                             exercise_intensity: Optional[float] = None,
+                             work_intensity: Optional[float] = None, 
+                             sleep_quality: Optional[float] = None,
+                             target_glucose: Optional[float] = None # target_glucose no se usa en DDPG directamente para la acción
                              ) -> float:
-        """
-        Predice una dosis de insulina usando el contexto completo.
-
-        Parámetros:
-        -----------
-        x_cgm : np.ndarray
-            Datos CGM (espera forma [1, timesteps, cgm_features]).
-        x_other : np.ndarray
-            Otras características (espera forma [1, other_features_len]).
-        current_glucose, carb_intake, iob, ... : float
-            Valores escalares de contexto.
-
-        Retorna:
-        --------
-        float
-            Dosis de insulina recomendada.
-        """
-        if x_cgm.ndim == 3 and x_cgm.shape[0] == 1:
-            x_cgm_sample = x_cgm[0]
-        elif x_cgm.ndim == 2: # Si se pasa una sola muestra sin la dimensión de batch
-            x_cgm_sample = x_cgm
-        else:
-            raise ValueError(f"Forma de x_cgm inesperada: {x_cgm.shape}. Se esperaba (1, timesteps, features) o (timesteps, features).")
-
-        if x_other.ndim == 2 and x_other.shape[0] == 1:
-            x_other_sample = x_other[0]
-        elif x_other.ndim == 1: # Si se pasa una sola muestra sin la dimensión de batch
-            x_other_sample = x_other
-        else:
-            raise ValueError(f"Forma de x_other inesperada: {x_other.shape}. Se esperaba (1, features) o (features,).")
-
+        # Construir el diccionario de contexto
         context_dict = {
-            'current_glucose': current_glucose,
-            'carb_intake': carb_intake,
-            'iob': iob,
-            'sleep_quality': sleep_quality if sleep_quality is not None else 0.0,
+            'glucose_last': current_glucose,
+            'meal_carbs': carb_intake,
+            'insulin_on_board': iob,
+            'sleep_quality': sleep_quality if sleep_quality is not None else 0.0, # Usar 0 si es None
             'work_intensity': work_intensity if work_intensity is not None else 0.0,
-            'exercise_intensity': exercise_intensity if exercise_intensity is not None else 0.0 # Mapeo activity_level a exercise_intensity
+            'exercise_intensity': exercise_intensity if exercise_intensity is not None else 0.0
         }
         
-        action = self.select_action((x_cgm_sample, x_other_sample), context_dict, add_noise=False)
-        return float(action[0]) # Retorna la dosis como un escalar
+        # x_cgm y x_other deben ser formateados como (1, ...) para select_action
+        # Asegurar que x_cgm y x_other tengan una dimensión de batch
+        if x_cgm.ndim == 2: # (timesteps, features)
+            x_cgm_reshaped = x_cgm[np.newaxis, ...]
+        elif x_cgm.ndim == 1: # (flat_cgm_dim)
+             x_cgm_reshaped = x_cgm[np.newaxis, :]
+        else: # ya tiene batch dim o es incorrecto
+            x_cgm_reshaped = x_cgm
+            if x_cgm.shape[0] != 1:
+                print_warning(f"x_cgm en predict_with_context tiene una forma inesperada: {x_cgm.shape}")
+                # Podría intentar tomar la primera muestra si hay varias, o fallar.
+                # Por ahora, se asume que si tiene más de 1D, la primera es el batch.
+
+        if x_other.ndim == 1: # (other_features_len)
+            x_other_reshaped = x_other[np.newaxis, :]
+        else: # ya tiene batch dim o es incorrecto
+            x_other_reshaped = x_other
+            if x_other.shape[0] != 1:
+                 print_warning(f"x_other en predict_with_context tiene una forma inesperada: {x_other.shape}")
+
+
+        action_tensor = self.select_action(x_cgm_reshaped, x_other_reshaped, context_dict, add_noise=False)
+        return action_tensor.item()
 
     def _soft_update(self, target: nn.Module, source: nn.Module, tau: float) -> None:
-        """
-        Realiza una actualización suave de los parámetros de la red objetivo.
-        θ_target = τ*θ_local + (1 - τ)*θ_target
-        """
-        for target_param, source_param in zip(target.parameters(), source.parameters()):
-            target_param.data.copy_(tau * source_param.data + (1.0 - tau) * target_param.data)
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
     def save_state(self) -> Dict[str, Any]:
-        """Guarda el estado del modelo DDPG (redes y optimizadores)."""
-        return {
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-            'actor_target_state_dict': self.actor_target.state_dict(),
-            'critic_target_state_dict': self.critic_target.state_dict(),
-        }
+         return {
+             'actor_state_dict': self.actor.state_dict(),
+             'critic_state_dict': self.critic.state_dict(),
+             'target_actor_state_dict': self.target_actor.state_dict(),
+             'target_critic_state_dict': self.target_critic.state_dict(),
+             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+             'config': self.config
+         }
 
     def load_state(self, state: Dict[str, Any]) -> None:
-        """Carga el estado del modelo DDPG."""
-        self.actor.load_state_dict(state['actor_state_dict'])
-        self.critic.load_state_dict(state['critic_state_dict'])
-        self.actor_optimizer.load_state_dict(state['actor_optimizer_state_dict'])
-        self.critic_optimizer.load_state_dict(state['critic_optimizer_state_dict'])
-        self.actor_target.load_state_dict(state['actor_target_state_dict'])
-        self.critic_target.load_state_dict(state['critic_target_state_dict'])
+         self.actor.load_state_dict(state['actor_state_dict'])
+         self.critic.load_state_dict(state['critic_state_dict'])
+         self.target_actor.load_state_dict(state['target_actor_state_dict'])
+         self.target_critic.load_state_dict(state['target_critic_state_dict'])
+         self.actor_optimizer.load_state_dict(state['actor_optimizer_state_dict'])
+         self.critic_optimizer.load_state_dict(state['critic_optimizer_state_dict'])
+         self.config = state.get('config', self.config)
+         # Mover a dispositivo después de cargar
+         self.to(self.device)
 
 
 def create_ddpg_model(
-    cgm_input_dim: Tuple[int, int],      # (timesteps, cgm_features)
-    other_input_dim: Tuple[int],       # (other_features_len,)
-    action_dim: int = 1,                 # Dosis de insulina
-    config: Optional[Dict[str, Any]] = None
+    action_dim: int = 1,
+    config: Optional[Dict[str, Any]] = None,
+    feature_config: Optional[Dict[str, List[str]]] = None  # Añadido
 ) -> DRLModelWrapperPyTorch:
     """
-    Crea una instancia de DRLModelWrapperPyTorch con un modelo DDPG.
+    Crea un modelo DDPG envuelto para dosificación de insulina.
 
     Parámetros:
     -----------
-    cgm_input_dim : Tuple[int, int]
-        Dimensiones de la entrada CGM (pasos_tiempo, características_cgm).
-    other_input_dim : Tuple[int]
-        Dimensiones de otras características (num_otras_características,).
     action_dim : int, opcional
-        Dimensión del espacio de acciones (default: 1 para dosis de insulina).
+        Dimensión de la acción (default: 1).
     config : Optional[Dict[str, Any]], opcional
-        Configuración para el modelo DDPG y el wrapper. Si es None, usa DDPG_CONFIG.
+        Configuración específica para DDPG (default: DDPG_CONFIG).
+    feature_config : Optional[Dict[str, List[str]]], opcional
+        Configuración de características para que el wrapper determine las dimensiones del estado.
+        Si es None, se usará get_feature_groups().
 
     Retorna:
     --------
     DRLModelWrapperPyTorch
-        Wrapper del modelo DDPG listo para ser usado en el pipeline de entrenamiento.
+        Modelo DDPG inicializado envuelto en DRLModelWrapperPyTorch.
     """
-    effective_config = config if config is not None else DDPG_CONFIG
-    
-    context_dim = len(CONTEXT_FEATURE_ORDER) # Determinado por el orden definido
-    max_action = effective_config.get("max_action", 20.0) # Dosis máxima de insulina
-    min_action = effective_config.get("min_action", 0.0)   # Dosis mínima de insulina
+    effective_config = config if config is not None else DDPG_CONFIG.copy()
+    effective_feature_config = feature_config
 
-    ddpg_agent = DDPG(
-        cgm_input_dim=cgm_input_dim,
-        other_input_dim=other_input_dim,
-        context_dim=context_dim,
-        action_dim=action_dim,
-        max_action=max_action,
-        min_action=min_action,
-        config=effective_config
-    )
-    
-    # Argumentos para el wrapper, incluyendo los necesarios para la inicialización del modelo DRL
-    wrapper_kwargs = {
-        'algorithm': "DDPG",
-        'cgm_input_dim': cgm_input_dim,
-        'other_input_dim': other_input_dim,
-        'context_dim': context_dim,
+    # model_kwargs para la clase DDPG.
+    # state_dim será inyectado por DRLModelWrapperPyTorch basado en feature_config.
+    model_specific_kwargs = {
         'action_dim': action_dim,
-        'max_action': max_action,
-        'min_action': min_action,
-        **effective_config # Pasar toda la configuración DDPG al wrapper también
+        'max_action': effective_config.get("max_action", 20.0),
+        'min_action': effective_config.get("min_action", 0.0),
+        'config': effective_config
+        # 'state_dim' es manejado por el wrapper
     }
 
-    print_info(f"Creando DDPGModelWrapper con: cgm_dims={cgm_input_dim}, other_dims={other_input_dim}, context_dim={context_dim}")
-    
-    return DRLModelWrapperPyTorch(ddpg_agent, **wrapper_kwargs)
+    # DRLModelWrapperPyTorch usará feature_config para determinar state_dim
+    # y pasarlo en model_kwargs al instanciar DDPG.
+    wrapper = DRLModelWrapperPyTorch(
+        DDPG,
+        algorithm="DDPG",
+        feature_config=effective_feature_config,
+        model_kwargs=model_specific_kwargs
+    )
+    return wrapper

@@ -109,9 +109,9 @@ MODELS = {
 MODELS_USAGE: Dict[str, bool] = {
     ## Modelos de Aprendizaje por Refuerzo Profundo
     "pt_ddpg": True,
-    "pt_dqn": True,
-    "pt_sac": True,
-    "pt_td3_bc": True,
+    "pt_dqn": False,
+    "pt_sac": False,
+    "pt_td3_bc": False,
 }
 
 EVALUATE = {

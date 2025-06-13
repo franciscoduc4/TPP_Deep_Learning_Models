@@ -2,6 +2,8 @@ import polars as pl
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 
+from config.params import CONFIG_PROCESSING
+from constants.constants import CONTEXT_FEATURE_ORDER, GLUCOSE_COL, SUBJECT_ID_COL, TIMESTAMP_COL
 from custom.printer import coloured, print_error, print_info, print_warning
 
 # Constantes para selección de características
@@ -105,14 +107,38 @@ def get_feature_groups() -> Dict[str, List[str]]:
     Dict[str, List[str]]
         Diccionario con grupos de características.
     """
+    all_other_features = (
+        GLUCOSE_AGGREGATED_FEATURES +
+        GLUCOSE_24H_FEATURES +
+        MEAL_INSULIN_FEATURES +
+        CONTEXTUAL_FEATURES + 
+        TEMPORAL_FEATURES +
+        RISK_FEATURES
+    )
+    # La duplicación de nombres de características en la lista all_other_features
+    # es generalmente inofensiva para la selección de columnas (pl.DataFrame.select),
+    # pero si se requiere una lista única, se podría usar list(dict.fromkeys(all_other_features)).
+    # Por ahora, se asume que las listas de características base son disjuntas o que
+    # la duplicación intencional es manejada adecuadamente.
+
     return {
-        'cgm_sequence': CORE_CGM_FEATURES,
+        'cgm_features': CORE_CGM_FEATURES,
         'glucose_current': GLUCOSE_AGGREGATED_FEATURES,
         'glucose_historical': GLUCOSE_24H_FEATURES,
         'nutrition_insulin': MEAL_INSULIN_FEATURES,
-        'context': CONTEXTUAL_FEATURES,
+        'context': CONTEXTUAL_FEATURES, # Estas son las que no están en CONTEXT_FEATURE_ORDER explícitamente para el estado DRL
         'temporal': TEMPORAL_FEATURES,
-        'risk': RISK_FEATURES
+        'risk': RISK_FEATURES,
+        'other_features': list(set( # Crear una lista única de "otras" características no CGM y no de contexto directo
+            GLUCOSE_AGGREGATED_FEATURES + 
+            GLUCOSE_24H_FEATURES +
+            MEAL_INSULIN_FEATURES +
+            CONTEXTUAL_FEATURES + # Incluir estas aquí también para la parte 'x_other' del estado
+            TEMPORAL_FEATURES +
+            RISK_FEATURES
+        ) - set(CONTEXT_FEATURE_ORDER) - set(CORE_CGM_FEATURES)),
+        'explicit_context_features': CONTEXT_FEATURE_ORDER, # Usado para construir parte del estado DRL
+        'target_variable': 'bolus_log1p' # O la columna target que se use
     }
 
 def validate_features_availability(df_columns: List[str], required_features: List[str]) -> Tuple[List[str], List[str]]:
@@ -200,104 +226,224 @@ def _validate_imputation(cgm_data_np: np.ndarray, other_data_np: np.ndarray) -> 
 
 def _impute_and_indicate_missing(df: pl.DataFrame, column_name: str, new_indicator_col_name: str) -> Tuple[pl.Series, pl.Series]:
     """
-    Imputa una columna con 0.0 y crea una columna indicadora para los NaNs originales.
-    """
-    indicator = df[column_name].is_null().cast(pl.Float32).alias(new_indicator_col_name)
-    imputed_column = df[column_name].fill_null(0.0).alias(column_name)
-    return imputed_column, indicator
-
-def prepare_features_for_drl(df: pl.DataFrame, use_essential_only: bool = False) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """
-    Prepara las características para modelos DRL, asegurando la imputación de NaNs
-    e introduciendo variables indicadoras para ciertas características críticas.
-    Para las características CGM, se aplica forward fill, luego backward fill y finalmente se rellenan los NaNs restantes con 0.0.
-    Para otras características, los NaNs se rellenan con 0.0, y para 'insulin_on_board' y 'meal_carbs',
-    se añaden columnas indicadoras de valores faltantes.
+    Imputa valores faltantes en una columna y crea una columna indicadora de faltantes.
+    Si la columna es completamente NaN, se imputa con 0.0.
 
     Parámetros:
     -----------
     df : pl.DataFrame
-        DataFrame con datos procesados que pueden contener NaNs.
-    use_essential_only : bool, opcional
-        Si se deben usar solo las características esenciales (default: False).
-        
+        DataFrame de entrada.
+    column_name : str
+        Nombre de la columna a imputar.
+    new_indicator_col_name : str
+        Nombre para la nueva columna indicadora de faltantes.
+
     Retorna:
     --------
-    Tuple[np.ndarray, np.ndarray, List[str]]
-        Tupla con (cgm_sequence, other_features, other_feature_names), donde
-        cgm_sequence y other_features están imputados y no contienen NaNs.
+    Tuple[pl.Series, pl.Series]
+        Una tupla conteniendo la serie imputada y la serie indicadora.
     """
-    features_to_use = ESSENTIAL_FEATURES if use_essential_only else RECOMMENDED_FEATURES
+    if column_name not in df.columns:
+        print_error(f"La columna '{column_name}' no existe en el DataFrame proporcionado a _impute_and_indicate_missing.")
+        # Retornar series de nulos/ceros del tamaño esperado para evitar fallos posteriores,
+        # aunque esto indica un problema de lógica previo.
+        num_rows = df.height
+        imputed_values = pl.Series(name=column_name, values=[0.0] * num_rows)
+        is_missing_indicator = pl.Series(name=new_indicator_col_name, values=[1] * num_rows, dtype=pl.Int8)
+        return imputed_values, is_missing_indicator
+
+    is_missing_indicator = df[column_name].is_null().cast(pl.Int8)
     
-    available_features, missing_features = validate_features_availability(
-        df.columns, features_to_use
+    imputed_values: pl.Series
+    if df[column_name].null_count() == df.height:
+        # Si todos los valores son nulos, imputar con 0.0
+        imputed_values = pl.lit(0.0).cast(df[column_name].dtype).alias(column_name)
+    elif df[column_name].dtype in [pl.Float32, pl.Float64, pl.Float64]: # Incluye pl.Float64
+        median_val = df[column_name].median()
+        if median_val is None: # Esto puede ocurrir si, a pesar de no ser todos nulos, la mediana no se puede calcular (raro para numéricos) o es nula.
+            imputed_values = df[column_name].fill_null(0.0)
+        else:
+            imputed_values = df[column_name].fill_null(median_val)
+    elif df[column_name].dtype in [pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64]:
+        median_val = df[column_name].median()
+        if median_val is None:
+            imputed_values = df[column_name].fill_null(0) # Imputar con 0 para enteros
+        else:
+            imputed_values = df[column_name].fill_null(median_val) # Imputar con la mediana para enteros
+    else:
+        # Para otros tipos de datos (ej. String, Boolean), la imputación con 0.0 o mediana numérica no es apropiada.
+        # Se podría usar la moda o una categoría específica. Por ahora, se usa un valor por defecto si es posible o error.
+        # Para el contexto actual, se asumen características numéricas o que ya fueron preprocesadas.
+        # Si se llega aquí con un tipo inesperado, es mejor advertir y usar un fallback genérico.
+        print_warning(f"Imputación para el tipo de dato {df[column_name].dtype} de la columna '{column_name}' no manejada específicamente. Usando fill_null(0.0) como fallback.")
+        try:
+            imputed_values = df[column_name].fill_null(0.0) # Fallback genérico, puede fallar si el tipo no es compatible
+        except Exception: # pylint: disable=broad-except
+            print_error(f"No se pudo aplicar fill_null(0.0) a la columna '{column_name}' de tipo {df[column_name].dtype}. La columna se dejará como está para esta imputación.")
+            imputed_values = df[column_name]
+
+
+    # Asegurar que la serie devuelta tenga el nombre correcto
+    if isinstance(imputed_values, pl.Expr):
+        imputed_values_series = df.select(imputed_values.alias(column_name))[column_name]
+    else: # Ya es una pl.Series
+        imputed_values_series = imputed_values.alias(column_name)
+        
+    return imputed_values_series, is_missing_indicator.alias(new_indicator_col_name)
+
+def _handle_empty_dataframe(
+    cgm_feature_cols: List[str], 
+    other_feature_cols: List[str], 
+    context_feature_order: List[str]
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray], np.ndarray]:
+    """Maneja el caso cuando el DataFrame está vacío."""
+    empty_np_array = np.array([])
+    empty_context_dict: Dict[str, np.ndarray] = {key: empty_np_array for key in context_feature_order}
+    
+    if cgm_feature_cols == CORE_CGM_FEATURES:
+        x_cgm_empty = np.empty((0, len(CORE_CGM_FEATURES), 1), dtype=np.float32)
+    else:
+        num_cgm_features = len(cgm_feature_cols) if cgm_feature_cols else 0
+        x_cgm_empty = np.empty((0, num_cgm_features), dtype=np.float32)
+
+    return (
+        x_cgm_empty,
+        np.empty((0, len(other_feature_cols if other_feature_cols else []))),
+        empty_np_array,
+        empty_context_dict,
+        empty_np_array.astype(int)
+    )
+
+def _impute_dataframe_features(
+    df: pl.DataFrame, 
+    cgm_feature_cols: List[str], 
+    other_feature_cols: List[str], 
+    target_col: str
+) -> pl.DataFrame:
+    """
+    Imputa características faltantes en el DataFrame y añade columnas indicadoras.
+    Si una columna de características no existe en df, se añade con 0.0s y se marca como faltante.
+    """
+    df_imputed = df.clone()
+    all_features_to_process = list(set(cgm_feature_cols + other_feature_cols + [target_col])) # Usar set para evitar duplicados
+
+    for col_name in all_features_to_process:
+        indicator_col_name = f"{col_name}_is_missing"
+        if col_name not in df_imputed.columns:
+            # print_warning(f"Columna '{col_name}' no encontrada en DataFrame para imputación. Se creará con ceros y se marcará como faltante.")
+            # Determinar el tipo de dato adecuado, por defecto Float64 para características.
+            # El target_col podría tener un tipo diferente, pero usualmente es numérico para regresión/DRL.
+            default_dtype = pl.Float64
+            default_fill_value = 0.0
+            
+            df_imputed = df_imputed.with_columns(
+                pl.lit(default_fill_value).cast(default_dtype).alias(col_name)
+            )
+            df_imputed = df_imputed.with_columns(
+                pl.lit(1).cast(pl.Int8).alias(indicator_col_name) # Marcar todas las filas como faltantes
+            )
+        else:
+            # La columna existe, imputar sus NaNs y crear indicador
+            imputed_series, indicator_series = _impute_and_indicate_missing(df_imputed, col_name, indicator_col_name)
+            df_imputed = df_imputed.with_columns(imputed_series) # Series ya tienen alias
+            df_imputed = df_imputed.with_columns(indicator_series)
+
+    return df_imputed
+
+def _extract_arrays_from_dataframe(
+    df_imputed: pl.DataFrame, 
+    cgm_feature_cols: List[str], 
+    other_feature_cols: List[str], 
+    target_col: str
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extrae arrays NumPy del DataFrame."""
+    x_cgm = df_imputed.select(cgm_feature_cols).to_numpy().astype(np.float32) if cgm_feature_cols else np.array([], dtype=np.float32)
+    x_other = df_imputed.select(other_feature_cols).to_numpy().astype(np.float32) if other_feature_cols else np.array([], dtype=np.float32)
+    y = df_imputed.select(target_col).to_numpy().astype(np.float32).ravel()
+    
+    if 'SubjectID' in df_imputed.columns:
+        subject_ids = df_imputed['SubjectID'].to_numpy().astype(int)
+    else:
+        print_warning("Columna 'SubjectID' no encontrada. Se retornará un array vacío para subject_ids.")
+        subject_ids = np.array([], dtype=int)
+    
+    return x_cgm, x_other, y, subject_ids
+
+def _reshape_arrays_for_drl(
+    x_cgm: np.ndarray, 
+    x_other: np.ndarray, 
+    cgm_feature_cols: List[str], 
+    other_feature_cols: List[str], 
+    df_height: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Reformatea arrays para DRL."""
+    # Reshape x_cgm
+    if x_cgm.ndim == 2 and x_cgm.shape[1] == len(CORE_CGM_FEATURES) and cgm_feature_cols == CORE_CGM_FEATURES:
+        x_cgm = x_cgm.reshape(x_cgm.shape[0], len(CORE_CGM_FEATURES), 1)
+    elif not cgm_feature_cols:
+        x_cgm = np.empty((df_height, 0, 0), dtype=np.float32)
+
+    # Reshape x_other
+    if not other_feature_cols:
+        x_other = np.empty((df_height, 0), dtype=np.float32)
+    elif x_other.ndim == 1 and len(other_feature_cols) == 1:
+        x_other = x_other.reshape(-1, 1)
+    elif x_other.ndim == 1 and len(other_feature_cols) > 1:
+        print_warning(f"x_other es 1D pero hay {len(other_feature_cols)} columnas. Se intentará reshape.")
+        if x_other.shape[0] == df_height * len(other_feature_cols):
+            x_other = x_other.reshape(df_height, len(other_feature_cols))
+        else:
+            print_error("No se pudo dar forma a x_other correctamente.")
+            x_other = np.empty((df_height, 0), dtype=np.float32)
+
+    return x_cgm, x_other
+
+def prepare_features_for_drl(
+    df: pl.DataFrame, 
+    cgm_feature_cols: List[str], 
+    other_feature_cols: List[str], 
+    target_col: str,
+    context_feature_order: List[str]
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray], np.ndarray]:
+    """
+    Prepara las características de un DataFrame para el entrenamiento DRL.
+    Maneja DataFrames vacíos, imputa características, extrae arrays y los remodela.
+    """
+    if df.is_empty():
+        # print_warning("DataFrame de entrada para prepare_features_for_drl está vacío.")
+        return _handle_empty_dataframe(cgm_feature_cols, other_feature_cols, context_feature_order)
+
+    # 1. Imputar características y crear indicadores de faltantes
+    # Esta función ahora maneja columnas que podrían no estar en df.
+    df_imputed = _impute_dataframe_features(df, cgm_feature_cols, other_feature_cols, target_col)
+
+    # 2. Extraer arrays NumPy del DataFrame imputado
+    x_cgm, x_other, y_target, subject_ids_np = _extract_arrays_from_dataframe(
+        df_imputed, cgm_feature_cols, other_feature_cols, target_col
     )
     
-    if missing_features:
-        print_warning(f"Características faltantes que no se usarán: {missing_features}")
+    # 3. Extraer características de contexto del DataFrame imputado (que ahora tiene todas las columnas)
+    # _extract_context_for_drl espera que las columnas existan.
+    context_features_dict = _extract_context_for_drl(df_imputed, context_feature_order)
 
-    # Remover características constantes conocidas antes de la separación
-    constant_features_to_remove = ['activity_hypo_risk', 'sleep_hypo_risk', 'stress_hyper_risk']
-    available_features = [feat for feat in available_features if feat not in constant_features_to_remove]
-    if any(feat in df.columns for feat in constant_features_to_remove):
-        print_info(f"Removiendo características constantes: {constant_features_to_remove}")
+    # 4. Remodelar arrays CGM y otros para DRL (ej: (muestras, timesteps, features_cgm))
+    # Esta parte asume que x_cgm y x_other tienen el contenido correcto post-imputación.
+    x_cgm_reshaped, x_other_reshaped = _reshape_arrays_for_drl(
+        x_cgm, x_other, cgm_feature_cols, other_feature_cols, df_imputed.height
+    )
     
-    cgm_feature_names, other_feature_names_original = _separate_feature_types(available_features)
-    
-    # Imputación de características CGM
-    cgm_data_np = _impute_cgm_features(df, cgm_feature_names)
-    
-    # Imputación de otras características y creación de indicadores
-    select_expressions = []
-    final_other_feature_names = []
+    # Validar que no haya NaNs después de todo el preprocesamiento
+    if np.isnan(x_cgm_reshaped).any() or np.isinf(x_cgm_reshaped).any():
+        print_error("NaNs o Infs detectados en x_cgm_reshaped después de la preparación.")
+    if np.isnan(x_other_reshaped).any() or np.isinf(x_other_reshaped).any():
+        print_error("NaNs o Infs detectados en x_other_reshaped después de la preparación.")
+    if np.isnan(y_target).any() or np.isinf(y_target).any():
+        print_error("NaNs o Infs detectados en y_target después de la preparación.")
+    for key, arr in context_features_dict.items():
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            print_error(f"NaNs o Infs detectados en context_feature '{key}' después de la preparación.")
 
-    # Características con estrategia de indicador + imputación
-    features_for_indicator = {
-        'insulin_on_board': 'insulin_on_board_is_missing',
-        'meal_carbs': 'meal_carbs_is_missing',
-        # Añadir aquí otras características si es necesario, e.g.:
-        # 'insulin_carb_ratio': 'insulin_carb_ratio_is_missing',
-        # 'insulin_sensitivity_factor': 'insulin_sensitivity_factor_is_missing'
-    }
-
-    for original_col, indicator_col in features_for_indicator.items():
-        if original_col in other_feature_names_original or original_col in available_features:
-            imputed_expr, indicator_expr = _impute_and_indicate_missing(df, original_col, indicator_col)
-            select_expressions.append(imputed_expr)
-            select_expressions.append(indicator_expr)
-            final_other_feature_names.append(original_col)
-            final_other_feature_names.append(indicator_col)
-
-    # Resto de las "otras" características con imputación simple a 0.0
-    for other_col in other_feature_names_original:
-        if other_col not in features_for_indicator:
-            select_expressions.append(df[other_col].fill_null(0.0).alias(other_col))
-            final_other_feature_names.append(other_col)
-    
-    if select_expressions:
-        other_imputed_df = df.select(select_expressions)
-        other_data_np = other_imputed_df.to_numpy()
-    elif df.height > 0 : # Si no hay otras características pero sí filas
-        other_data_np = np.empty((df.height, 0), dtype=np.float32)
-        print_warning("No se seleccionaron 'otras características' o todas fueron manejadas con indicadores y no quedaron más.")
-    else: # No hay filas ni otras características
-        other_data_np = np.empty((0, 0), dtype=np.float32)
-
-
-    # Reshape CGM para formato [samples, timesteps, features]
-    cgm_data_np = _reshape_cgm_data(cgm_data_np, cgm_feature_names, len(df))
-    
-    # Logging de información
-    print_info(f"Características CGM utilizadas: {len(cgm_feature_names)}")
-    print_info(f"Otras características utilizadas (incluyendo indicadoras): {len(final_other_feature_names)}")
-    print_info(f"Nombres finales de otras características: {final_other_feature_names}")
-    print_info(f"Forma CGM (después de imputación): {cgm_data_np.shape}")
-    print_info(f"Forma otras características (después de imputación): {other_data_np.shape}")
-    
-    # Validación final
-    _validate_imputation(cgm_data_np, other_data_np)
-        
-    return cgm_data_np, other_data_np, final_other_feature_names
+    return x_cgm_reshaped, x_other_reshaped, y_target, context_features_dict, subject_ids_np
 
 def create_temporal_splits(df: pl.DataFrame, train_ratio: float = 0.7, val_ratio: float = 0.15) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """
@@ -342,126 +488,172 @@ def create_temporal_splits(df: pl.DataFrame, train_ratio: float = 0.7, val_ratio
     
     return train_df, val_df, test_df
 
-def _extract_context_for_drl(df: pl.DataFrame) -> Dict[str, np.ndarray]:
-    """
-    Extrae características contextuales específicas para DRL de un DataFrame.
-    Asegura que las columnas base para el contexto ('meal_carbs', 'glucose_last', 'insulin_on_board')
-    sean imputadas a 0.0 si son NaN, ya que la estrategia de indicador + imputación
-    se maneja en `prepare_features_for_drl` para el estado principal del modelo.
-    El contexto aquí debe reflejar los valores que el modelo usará (posiblemente imputados).
+def _extract_glucose_feature(df: pl.DataFrame, glucose_fallback_value: float) -> np.ndarray:
+    """Extrae y procesa la característica de glucosa actual."""
+    if 'glucose_last' in df.columns:
+        return df['glucose_last'].fill_null(strategy="forward").fill_null(strategy="backward").fill_null(glucose_fallback_value).to_numpy()
+    else:
+        print_warning("Columna 'glucose_last' no encontrada para 'current_glucose' en _extract_context_for_drl. Usando ceros.")
+        return np.full(len(df), glucose_fallback_value)
 
-    Parámetros:
-    -----------
-    df : pl.DataFrame
-        DataFrame del cual extraer el contexto.
-
-    Retorna:
-    --------
-    Dict[str, np.ndarray]
-        Diccionario con las características contextuales como arrays de NumPy.
+def _extract_single_feature(df: pl.DataFrame, column_name: str, default_value: float = 0.0) -> np.ndarray:
     """
-    context_dict: Dict[str, np.ndarray] = {}
+    Extrae una columna de características como un array NumPy, imputando NaNs con default_value.
+    Si la columna no existe, retorna un array de default_value.
+    """
+    if column_name in df.columns:
+        feature_array = df.select(pl.col(column_name).fill_null(default_value)).to_numpy().flatten()
+    else:
+        print_warning(f"Columna '{column_name}' no encontrada en el DataFrame. Usando valor por defecto {default_value}.")
+        feature_array = np.full(len(df), default_value, dtype=float)
+    return feature_array.astype(np.float32)
+
+def _extract_contextual_features(df: pl.DataFrame) -> Dict[str, np.ndarray]:
+    """Extrae características contextuales (sleep, work, exercise)."""
+    context_data = {}
+    contextual_feature_names = ['sleep_quality', 'work_intensity', 'exercise_intensity']
     
-    # Características contextuales directas (sleep, work, exercise)
-    # Estas ya se asume que 0 es "no data" y NaNs se imputan a 0 en prepare_features_for_drl
-    context_features_direct = {
-        'sleep_quality': 'sleep_quality',
-        'work_intensity': 'work_intensity',
-        'exercise_intensity': 'exercise_intensity'
-    }
-    for key, col_name in context_features_direct.items():
-        if col_name in df.columns:
-            context_dict[key] = df[col_name].fill_null(0.0).to_numpy() # Asegurar imputación a 0 para el contexto
-        else:
-            print_warning(f"Columna contextual '{col_name}' para '{key}' no encontrada. Se usará array de ceros.")
-            context_dict[key] = np.zeros(len(df))
+    for feature_name in contextual_feature_names:
+        context_data[feature_name] = _extract_single_feature(df, feature_name, feature_name)
+    
+    return context_data
 
-    # Características mapeadas que forman parte del contexto principal
-    # (meal_carbs, glucose_last, insulin_on_board)
-    # Estas columnas son imputadas (y tienen indicadores) en `prepare_features_for_drl`.
-    # Para el diccionario de contexto, usamos sus valores (posiblemente imputados a 0).
-    context_features_mapped = {
-        'carb_intake': 'meal_carbs',
-        'current_glucose': 'glucose_last',
-        'iob': 'insulin_on_board'
-    }
-    for key, col_name in context_features_mapped.items():
-        if col_name in df.columns:
-            # Aquí también, fill_null(0.0) para asegurar que el contexto no tenga NaNs
-            # si por alguna razón la columna original no fue procesada por la lógica de indicadores
-            # (aunque debería haberlo sido en prepare_features_for_drl).
-            context_dict[key] = df[col_name].fill_null(0.0).to_numpy()
-        else:
-            print_warning(f"Columna base para contexto '{col_name}' (para '{key}') no encontrada. Se usará array de ceros.")
-            context_dict[key] = np.zeros(len(df))
-            
-    return context_dict
+def _ensure_missing_features(context_data: Dict[str, np.ndarray], df: pl.DataFrame, glucose_fallback_value: float) -> None:
+    """Asegura que todas las características requeridas estén presentes."""
+    for key in CONTEXT_FEATURE_ORDER:
+        if key not in context_data:
+            if key == 'current_glucose':
+                print_warning(f"Característica de contexto DRL '{key}' no fue explícitamente extraída y falta. Se añadirá con {glucose_fallback_value}.")
+                context_data[key] = np.full(len(df), glucose_fallback_value)
+            else:
+                print_warning(f"Característica de contexto DRL '{key}' no fue explícitamente extraída y falta. Se añadirá con ceros.")
+                context_data[key] = np.zeros(len(df))
+
+def _validate_feature_lengths(context_data: Dict[str, np.ndarray], df: pl.DataFrame, glucose_fallback_value: float) -> None:
+    """Valida que todas las características tengan la longitud correcta."""
+    for key in context_data:
+        if len(context_data[key]) != len(df):
+            print_error(f"Error de longitud en la característica de contexto DRL '{key}'. Esperado: {len(df)}, Obtenido: {len(context_data[key])}. Se reemplazará con ceros (o fallback para glucosa).")
+            if key == 'current_glucose':
+                context_data[key] = np.full(len(df), glucose_fallback_value)
+            else:
+                context_data[key] = np.zeros(len(df))
+
+def _extract_context_for_drl(df: pl.DataFrame, context_feature_order: List[str]) -> Dict[str, np.ndarray]:
+    """
+    Extrae características de contexto de un DataFrame y las devuelve como un diccionario de arrays NumPy.
+    Asegura que todas las columnas en context_feature_order existan, imputando con 0.0 si es necesario.
+    """
+    context_data: Dict[str, np.ndarray] = {}
+    df_height = df.height
+    
+    # Clonar para evitar modificar el df original si se añaden columnas temporalmente
+    temp_df = df.clone()
+
+    for feature_name in context_feature_order:
+        if feature_name not in temp_df.columns:
+            # print_warning(f"Característica de contexto '{feature_name}' no encontrada. Se imputará con 0.0.")
+            # Añadir la columna con 0.0s si no existe
+            temp_df = temp_df.with_columns(pl.lit(0.0).cast(pl.Float64).alias(feature_name))
+        
+        # Imputar NaNs restantes en la columna de contexto (si existía y tenía NaNs, o si se acaba de añadir)
+        # Usar una imputación simple de 0.0 para el contexto si hay nulos.
+        # Esto es crucial porque CONTEXT_FEATURE_ORDER puede incluir columnas que son parte de other_features
+        # y ya fueron imputadas por _impute_dataframe_features.
+        # Sin embargo, si una columna de CONTEXT_FEATURE_ORDER no estaba en other_features, necesita imputación aquí.
+        if temp_df[feature_name].is_null().any():
+             temp_df = temp_df.with_columns(
+                 temp_df[feature_name].fill_null(0.0).alias(feature_name)
+             )
+        context_data[feature_name] = temp_df[feature_name].to_numpy()
+
+    # Validar longitudes (opcional, pero bueno para la robustez)
+    for feature_name, arr in context_data.items():
+        if len(arr) != df_height:
+            print_error(f"Error de longitud para la característica de contexto '{feature_name}'. Esperado: {df_height}, Obtenido: {len(arr)}")
+            # Manejar el error, ej: rellenar o lanzar excepción
+            context_data[feature_name] = np.full(df_height, 0.0) # Fallback
+
+    return context_data
 
 def prepare_data_for_drl_training(df: pl.DataFrame) -> Tuple[
-    np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray],      # Train
-    np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray],      # Validation
-    np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray]       # Test
+    # Train
+    np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray], np.ndarray,
+    # Validation
+    np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray], np.ndarray,
+    # Test
+    np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray], np.ndarray
 ]:
     """
-    Prepara los datos para entrenamiento de modelos DRL con división temporal apropiada
-    y extrae diccionarios de contexto.
-    
-    Parámetros:
-    -----------
-    df : pl.DataFrame
-        DataFrame con datos procesados.
-        
-    Retorna:
-    --------
-    Tuple[
-        np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray],  # x_cgm_train, x_other_train, y_train, context_train
-        np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray],  # x_cgm_val, x_other_val, y_val, context_val
-        np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray]   # x_cgm_test, x_other_test, y_test, context_test
-    ]
-        Tupla con datos de entrenamiento, validación y prueba, incluyendo características CGM,
-        otras características, objetivos (target) y diccionarios de contexto.
+    Prepara los datos completos para el entrenamiento DRL, dividiéndolos en conjuntos
+    de entrenamiento, validación y prueba, y extrayendo todas las características necesarias.
     """
-    # División temporal por sujeto
-    coloured("Creando divisiones temporales por sujeto...", 'blue')
-    train_df, val_df, test_df = create_temporal_splits(df)
-    
-    coloured(f"División temporal - Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}", 'green')
-    
-    # Preparar características para cada conjunto
-    x_cgm_train, x_other_train, _feature_names_train = prepare_features_for_drl(train_df, use_essential_only=False)
-    x_cgm_val, x_other_val, _ = prepare_features_for_drl(val_df, use_essential_only=False)
-    x_cgm_test, x_other_test, _ = prepare_features_for_drl(test_df, use_essential_only=False)
-    
-    # Extraer targets
-    y_train = train_df['bolus'].to_numpy()
-    y_val = val_df['bolus'].to_numpy()
-    y_test = test_df['bolus'].to_numpy()
+    coloured("Iniciando preparación de datos para DRL...", 'magenta')
 
-    # Extraer contexto para cada conjunto
-    coloured("Extrayendo datos de contexto para DRL...", 'blue')
-    context_train = _extract_context_for_drl(train_df)
-    context_val = _extract_context_for_drl(val_df)
-    context_test = _extract_context_for_drl(test_df)
-    
-    # Verificar que no hay divisiones vacías
-    if len(y_train) == 0 or len(y_val) == 0 or len(y_test) == 0:
-        raise ValueError("Una o más divisiones de datos (train, val, test) están vacías. Ajusta las proporciones de división o verifica los datos de entrada.")
-    
-    coloured("Características por conjunto:", 'blue')
-    coloured(f"  Train - CGM: {x_cgm_train.shape}, Other: {x_other_train.shape}, Target: {y_train.shape}", 'green')
-    coloured(f"  Val   - CGM: {x_cgm_val.shape}, Other: {x_other_val.shape}, Target: {y_val.shape}", 'green')
-    coloured(f"  Test  - CGM: {x_cgm_test.shape}, Other: {x_other_test.shape}, Target: {y_test.shape}", 'green')
-    
-    coloured("Contexto por conjunto (muestra de claves):", 'blue')
-    coloured(f"  Train - Claves: {list(context_train.keys())}", 'green')
-    coloured(f"  Val   - Claves: {list(context_val.keys())}", 'green')
-    coloured(f"  Test  - Claves: {list(context_test.keys())}", 'green')
+    # 1. Definir características CGM, otras y objetivo
+    feature_groups = get_feature_groups()
+    cgm_feature_cols = feature_groups['cgm_features']
+    other_feature_cols = feature_groups['other_features'] # Usar todas las otras características definidas
+    target_col = feature_groups['target_variable'] # ej: 'bolus_log1p' o 'bolus'
 
-    return (
-        x_cgm_train, x_other_train, y_train, context_train,
-        x_cgm_val, x_other_val, y_val, context_val,
-        x_cgm_test, x_other_test, y_test, context_test
-    )
+    # Validar disponibilidad de características
+    available_cgm, missing_cgm = validate_features_availability(df.columns, cgm_feature_cols)
+    available_other, missing_other = validate_features_availability(df.columns, other_feature_cols)
+
+    if missing_cgm:
+        print_warning(f"Características CGM faltantes: {missing_cgm}. Se usarán las disponibles: {available_cgm}")
+    if missing_other:
+        print_warning(f"Otras características faltantes: {missing_other}. Se usarán las disponibles: {available_other}")
+    if target_col not in df.columns:
+        print_error(f"Columna objetivo '{target_col}' no encontrada en el DataFrame. No se puede continuar.")
+        raise ValueError(f"Columna objetivo '{target_col}' faltante.")
+
+    cgm_feature_cols = available_cgm
+    other_feature_cols = available_other
+    
+    # Filtrar columnas que no existen del DataFrame antes de la división
+    existing_cols_for_split = [col for col in df.columns if col in cgm_feature_cols or col in other_feature_cols or col == target_col or col == SUBJECT_ID_COL or col == TIMESTAMP_COL]
+    # Añadir columnas de contexto directamente si no están en other_feature_cols pero sí en CONTEXT_FEATURE_ORDER
+    for _ctx_key in CONTEXT_FEATURE_ORDER:
+        # El mapeo de feature_map en _extract_context_for_drl usa los nombres de columna reales
+        # Aquí necesitamos asegurar que esas columnas estén en df_filtered_for_split
+        # Esto es un poco redundante si other_feature_cols ya las incluye.
+        # Por simplicidad, asumimos que las columnas de contexto están en other_feature_cols o se manejarán.
+        pass
+
+
+    df_filtered_for_split = df.select(existing_cols_for_split)
+
+
+    # 2. Dividir datos temporalmente
+    df_train, df_val, df_test = create_temporal_splits(df_filtered_for_split)
+    coloured(f"Datos divididos: Train {df_train.shape}, Val {df_val.shape}, Test {df_test.shape}", 'green')
+
+    data_splits = {}
+    for split_name, split_df in zip(['train', 'val', 'test'], [df_train, df_val, df_test]):
+        coloured(f"Procesando split: {split_name}", 'yellow')
+        if split_df.is_empty():
+            print_warning(f"El split '{split_name}' está vacío. Se generarán arrays vacíos.")
+            num_cgm_feats = len(cgm_feature_cols) if cgm_feature_cols else 1 # Evitar 0 si no hay cgm_cols
+            num_other_feats = len(other_feature_cols) if other_feature_cols else 0
+
+            x_cgm = np.empty((0, CONFIG_PROCESSING.get("window_steps", 24), num_cgm_feats if num_cgm_feats > 0 else 1)) # (0, timesteps, features)
+            x_other = np.empty((0, num_other_feats if num_other_feats > 0 else 1)) # (0, features)
+            y = np.empty((0,))
+            context_data = {feat: np.empty((0,)) for feat in CONTEXT_FEATURE_ORDER}
+            subject_id = np.empty((0,))
+        else:
+            x_cgm, x_other, y, context_data, subject_id = prepare_features_for_drl(
+                split_df, cgm_feature_cols, other_feature_cols, target_col, CONTEXT_FEATURE_ORDER
+            )
+        data_splits[split_name] = (x_cgm, x_other, y, context_data, subject_id)
+        coloured(f"  {split_name} - CGM: {x_cgm.shape}, Otros: {x_other.shape}, Target: {y.shape}, SubjectID: {subject_id.shape}", "cyan")
+        if context_data:
+            for k, v_arr in context_data.items():
+                coloured(f"    Contexto {k}: {v_arr.shape}", "magenta")
+
+
+    return (*data_splits['train'], *data_splits['val'], *data_splits['test'])
 
 def validate_contextual_data_coverage(df: pl.DataFrame) -> Dict[str, Dict[str, float]]:
     """

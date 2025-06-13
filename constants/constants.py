@@ -56,6 +56,23 @@ HYPER_PENALTY_BASE = -3.0    # Penalización base para hiperglucemia
 SEVERE_HYPER_PENALTY = -7.0  # Penalización para hiperglucemia grave
 MAX_REWARD = 1.0             # Recompensa máxima para nivel óptimo
 
+# Nuevas constantes para métricas clínicas
+CONST_METRIC_TIME_SEVERE_BELOW = "time_severe_below"
+CONST_METRIC_TIME_BELOW_RANGE = "time_below_range"
+CONST_METRIC_TIME_IN_RANGE_LOW = "time_in_range_low"
+CONST_METRIC_TIME_IN_IDEAL_RANGE = "time_in_ideal_range"
+CONST_METRIC_TIME_IN_RANGE_HIGH = "time_in_range_high"
+CONST_METRIC_TIME_ABOVE_RANGE = "time_above_range"
+CONST_METRIC_TIME_SEVERE_ABOVE = "time_severe_above"
+CONST_METRIC_TIME_TOTAL_IN_RANGE = "time_total_in_range" # TIR 70-180
+CONST_METRIC_AVG_BG = "mean_glucose"
+CONST_METRIC_LBGI = "lbgi"
+CONST_METRIC_HBGI = "hbgi"
+CONST_METRIC_BGRI = "bgri"
+CONST_METRIC_MAGE = "mage"
+CONST_METRIC_CV_GLUCOSE = "cv_glucose"
+CONST_METRIC_STD_GLUCOSE = "std_glucose"
+
 # Configuración para simulación
 SIMULATION_HOURS = 6         # Horas de simulación para métricas clínicas
 DEFAULT_CARB_INTAKE = 50.0   # Ingesta de carbohidratos predeterminada
@@ -73,8 +90,12 @@ CONST_CONFIDENCE_LEVEL: float = 0.95  # Nivel de confianza para intervalos
 
 # Orden de características de contexto
 CONTEXT_FEATURE_ORDER = [
-    'current_glucose', 'carb_intake', 'iob', 
-    'sleep_quality', 'work_intensity', 'exercise_intensity'
+    'glucose_last',      # Corresponde a current_glucose
+    'meal_carbs',        # Corresponde a carb_intake
+    'insulin_on_board',  # Corresponde a iob
+    'sleep_quality', 
+    'work_intensity', 
+    'exercise_intensity'
 ]
 
 ## Constantes de texto
